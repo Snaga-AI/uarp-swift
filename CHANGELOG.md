@@ -6,6 +6,49 @@ All five SDKs share one version, cut from one tag. Set it with
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0 — 2026-08-16
+
+### Changed — breaking (Swift only)
+
+- **The Swift package's module is now `UARPSDK`.** It was `UARP`, the same name
+  as the iOS app target that is its first consumer — a Swift app cannot `import`
+  a module with the same name as its own module, so the two could not coexist.
+  Renaming the SDK module (rather than the app) is the cheaper fix and aligns
+  Swift with the other four SDKs, which all ship as `uarp-sdk` / `uarp_sdk` /
+  `ai.snaga:uarp-sdk`. `import UARP` becomes `import UARPSDK`. There were no
+  Swift consumers before this release, so nothing breaks. The package directory
+  (`Sources/UARP`), the generated output and the request wire are unchanged; the
+  rename is compile-time only.
+
+The TypeScript, Rust, Kotlin and Ada packages are re-versioned to 0.5.0 to keep
+the single shared version, with no code change.
+
+## 0.4.0 — 2026-08-16
+
+Every SDK now reads the platform's real event stream. Until this release only
+the Kotlin parser handled the three wire shapes the platform emits; the other
+four silently dropped everything that was not a standard `text/event-stream`
+frame, so a run that looked complete on Kotlin was empty on TypeScript, Rust,
+Swift and Ada.
+
+### Added
+
+- **SSE parser parity across all five SDKs.** The TypeScript, Rust, Swift and
+  Ada parsers now handle the three wire shapes the platform emits — standard
+  `text/event-stream`; a JSON object carried in an SSE comment
+  (`:{"type":"…","event_id":"…"}`); and bare NDJSON (`{"type":"…","event_id":"…"}`)
+  — plus the `data: [DONE]` hard terminal. A shared decode-parity fixture
+  (`contract/sse-fixtures/`) is replayed field-by-field by every SDK and locked
+  against the Kotlin reference, so the five cannot drift apart again.
+- **Reconnect loop, opt-in.** `StreamOptions` (each language's idiomatic name)
+  adds: terminal events that stop the stream without reconnect; an inactivity
+  watchdog that reconnects on a silent-but-open socket; HTTP 401 surfacing
+  without retry; `Last-Event-ID` resume that replaces a caller-supplied id only
+  once an event has been delivered; a stability reset of the reconnect attempt
+  counter; and a `Connecting → Connected → Reconnecting → Disconnected` state
+  callback. Defaults preserve standard-SSE behaviour, so existing callers see
+  no change.
+
 ## 0.3.0 — 2026-08-14
 
 Regenerated from a corrected API document, and one fix that matters more
@@ -71,7 +114,8 @@ Every SDK covers the whole API surface and shares the same behaviour:
 - Bearer authentication, falling back to `UARP_API_KEY` / `SNAGA_API_KEY`.
 - An `Idempotency-Key` on every mutating `/api/v1/*` request, which is also
   what makes a write safe to retry.
-- Retries for `408`, `409`, `429`, `5xx` and dropped connections, with
+- Retries for `408`, `409`, `429`, `500`, `502`, `503`, `504` and dropped
+  connections, with
   full-jitter backoff honouring `Retry-After` and `X-Should-Retry: false`.
 - RFC 9457 problem documents parsed into typed errors carrying the status,
   detail, `correlationId` and field-level validation failures.

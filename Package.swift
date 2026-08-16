@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "UARP",
+    name: "UARPSDK",
     platforms: [
         .macOS(.v12),
         .iOS(.v15),
@@ -11,22 +11,22 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
-        .library(name: "UARP", targets: ["UARP"]),
+        .library(name: "UARPSDK", targets: ["UARPSDK"]),
         .executable(name: "uarp-example", targets: ["UARPExample"]),
     ],
     targets: [
         .target(
-            name: "UARP",
+            name: "UARPSDK",
             path: "Sources/UARP"
         ),
         .executableTarget(
             name: "UARPExample",
-            dependencies: ["UARP"],
+            dependencies: ["UARPSDK"],
             path: "Sources/UARPExample"
         ),
         .testTarget(
             name: "UARPTests",
-            dependencies: ["UARP"],
+            dependencies: ["UARPSDK"],
             path: "Tests/UARPTests"
         ),
     ]

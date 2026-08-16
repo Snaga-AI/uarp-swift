@@ -1,4 +1,4 @@
-# UARP (Swift)
+# UARPSDK (Swift)
 
 Swift client for the **UARP — Universal Agent Runtime Platform** API. Full
 coverage of all 557 endpoints, `async`/`await` throughout, no dependencies
@@ -7,10 +7,10 @@ beyond Foundation.
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/Snaga-AI/uarp-sdks", from: "0.2.0"),
+    .package(url: "https://github.com/Snaga-AI/uarp-swift", from: "0.5.0"),
 ],
 targets: [
-    .target(name: "App", dependencies: [.product(name: "UARP", package: "uarp-sdks")]),
+    .target(name: "App", dependencies: [.product(name: "UARPSDK", package: "uarp-swift")]),
 ]
 ```
 
@@ -31,20 +31,22 @@ never happens on a stream that stays open. Calling one on Linux throws
 ## Quick start
 
 ```swift
-import UARP
+import UARPSDK
 
 let client = try UARPClient.fromEnvironment()   // UARP_API_KEY, UARP_BASE_URL
 // or: UARPClient(apiKey: "uarp_...")
 
-let agent = try await client.agents.create(
-    body: CreateAgentRequest(
-        name: "demo",
-        model: AgentModelConfig(provider: .openaiCompat, modelRef: "gpt-4o-mini", capabilities: [:])
-    )
-)
+// The platform selects the model itself, so a create is just a name.
+let agent = try await client.agents.create(body: CreateAgentRequest(name: "demo"))
 
 let page = try await client.agents.list(limit: 20)
 ```
+
+**Getting a key.** Sign in at <https://snaga.ai> and create one in your tenant's
+settings. A key looks like `uarp_<prefix>_<secret>`; the secret half is shown
+once and never again. With a key that carries `tenants:write` you can mint more
+through `POST /api/v1/tenants/me/keys`. Give each one the narrowest set of
+scopes that does its job.
 
 Resource groups are computed properties on the client: `client.agents`,
 `client.runs`, `client.sessions`, … 43 in all. Parameters are flattened into
@@ -56,9 +58,16 @@ SSE endpoints return an `EventStream`, an `AsyncSequence` that reconnects with
 `Last-Event-ID`:
 
 ```swift
+// The text arrives as `payload.delta`; the rest of the envelope is
+// platform bookkeeping.
+struct Chunk: Decodable {
+    struct Payload: Decodable { let delta: String }
+    let payload: Payload
+}
+
 for try await event in client.runs.streamRunEvents(runId: id) {
     if event.event == "llm.chunk" {
-        print(try event.json(as: Chunk.self).text, terminator: "")
+        print(try event.json(as: Chunk.self).payload.delta, terminator: "")
     }
     if event.event == "run.completed" { break }   // leaving the loop cancels the request
 }
@@ -76,6 +85,11 @@ for try await agent in client.agents.listAll(limit: 100) {
 
 let firstPage = try await client.agents.listAll().collect(limit: 50)
 ```
+
+An empty page does **not** end the walk. This API applies the page limit before
+filtering, so a page can come back with no items and more behind it — reading
+one as the end of the collection is what made 0.2.0 report empty lists. Three
+empty pages in a row do stop it, as does a repeated cursor.
 
 ## Errors
 
@@ -116,7 +130,7 @@ try await client.agents.create(
 )
 ```
 
-**Retries.** `408`, `409`, `429` and `5xx`, plus connection errors, retry with
+**Retries.** `408`, `409`, `429`, `500`, `502`, `503` and `504`, plus connection errors, retry with
 full-jitter backoff (0.5 s → 8 s) and honour `Retry-After`. Reads always retry;
 writes only when they carry an idempotency key, which every mutating
 `/api/v1/*` call sends automatically.

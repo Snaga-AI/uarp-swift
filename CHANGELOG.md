@@ -6,6 +6,22 @@ All five SDKs share one version, cut from one tag. Set it with
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.2 — 2026-08-16
+
+### Fixed — Swift only
+
+- **`UARPClient.buildRequest` no longer SIGILLs when `spec.path` carries a
+  query string inline.** `joinPaths` used to assign the caller-supplied path
+  verbatim to `URLComponents.percentEncodedPath`; if the path was something
+  like `"runs?limit=50"`, the setter saw a `?` inside it and tripped
+  Foundation's precondition → `EXC_BAD_INSTRUCTION (SIGILL)` at boot. `joinPaths`
+  now strips everything from the first `?` onward before joining, so a
+  malformed input degrades to "the request is sent without the query" rather
+  than killing the process. The right way to pass a query is still
+  `RequestSpec.query` (or `RequestOptions.query`); two regression tests pin
+  both paths. Discovered from the iOS app's `MissionControlStore.pollLoop`
+  and `DataStore.refreshActiveRuns`, both of which used the inline form.
+
 ## 0.5.1 — 2026-08-16
 
 ### Added — Swift only

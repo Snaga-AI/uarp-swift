@@ -6,21 +6,68 @@ All five SDKs share one version, cut from one tag. Set it with
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.5.2 — 2026-08-16
+## 0.5.3 — 2026-08-17
 
 ### Fixed — Swift only
 
-- **`UARPClient.buildRequest` no longer SIGILLs when `spec.path` carries a
-  query string inline.** `joinPaths` used to assign the caller-supplied path
-  verbatim to `URLComponents.percentEncodedPath`; if the path was something
-  like `"runs?limit=50"`, the setter saw a `?` inside it and tripped
-  Foundation's precondition → `EXC_BAD_INSTRUCTION (SIGILL)` at boot. `joinPaths`
-  now strips everything from the first `?` onward before joining, so a
-  malformed input degrades to "the request is sent without the query" rather
-  than killing the process. The right way to pass a query is still
-  `RequestSpec.query` (or `RequestOptions.query`); two regression tests pin
-  both paths. Discovered from the iOS app's `MissionControlStore.pollLoop`
-  and `DataStore.refreshActiveRuns`, both of which used the inline form.
+- **A path carrying an inline query no longer crashes the process.**
+  `UARPClient.buildRequest` assigned `spec.path` straight to
+  `URLComponents.percentEncodedPath`. A caller passing the query inline
+  (`"runs?limit=50"`) tripped Foundation's precondition and raised
+  `EXC_BAD_INSTRUCTION` — the iOS app died at boot. `joinPaths` now strips
+  everything from the first `?`, so malformed input degrades to "the request is
+  sent without the query" instead of killing the process. `spec.query` (or
+  `spec.options.query`) remains the correct way to pass one.
+
+### Notes
+
+This fix reached the published Swift package in 0.5.2 but not this repository:
+it had been committed directly to the generated `Snaga-AI/uarp-swift` mirror,
+which is rebuilt from here on every release and would have silently dropped it.
+0.5.3 restores the invariant that the tag, the source and the mirror describe
+the same code. The 0.5.2 tag is left exactly as published.
+
+The TypeScript, Rust, Kotlin and Ada packages are re-versioned to 0.5.3 to keep
+the single shared version, with no code change.
+
+## 0.5.2 — 2026-08-17
+
+Swift drew a line in 0.5.1: an empty `apiKey` means "this client carries no
+credentials", and sending `Bearer ` with nothing after it is not the same as
+sending no header — a server that validates the value can refuse it, and in a
+browser it overrides the cookie that would otherwise be attached. This release
+brings TypeScript, Rust and Kotlin to that same behaviour.
+
+The immediate consumer is the browser app, which is authenticated by an HttpOnly
+`uarp_auth_token` cookie: it never sees an API key, so it could not construct a
+client at all.
+
+### Added — TypeScript, Rust, Kotlin
+
+- **A client whose credentials travel another way.** An *explicitly empty*
+  `apiKey` (`apiKey: ""`, `.api_key("")`, `.apiKey("")`) is now a statement
+  rather than a mistake: no `Authorization` header is sent, and no `?token=` is
+  appended on the SSE query. An *omitted* key still throws — "forgot to set
+  `UARP_API_KEY`" is the common mistake and a 401 is a much worse way to learn
+  about it. The TypeScript error message now names the alternative.
+
+### Changed — Rust, Kotlin
+
+- **`from_env` / `fromEnvironment` refuse a set-but-empty variable.**
+  `UARP_API_KEY=""` is a variable that *exists*, so both previously built a
+  credential-less client from it. That used to surface as a visible 401; with
+  the guard above it would have become a silent unauthenticated request
+  instead. Going keyless stays a deliberate act on the builder.
+
+### Notes
+
+Ada is deliberately unchanged: its constructor already refuses an empty key
+outright ("the API key must not be empty"), so neither `Bearer ` nor an empty
+`?token=` is reachable there. A guard for a state that cannot occur would be
+dead code.
+
+No existing caller changes behaviour — a real key is sent exactly as before,
+and every path that previously threw still throws.
 
 ## 0.5.1 — 2026-08-16
 

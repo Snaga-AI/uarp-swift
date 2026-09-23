@@ -10,6 +10,15 @@ public struct WebhooksAPI: Sendable {
 
     /// Create a webhook subscription
     ///
+    /// Registers a receiver for platform events. `url` and a non-empty `events` array are required,
+    /// and every event name must be one of the fixed enumeration (`run.completed`,
+    /// `quota.exceeded`, `company.budget_alert` and the rest); anything else fails body validation.
+    /// The URL is screened for SSRF before registration — with DNS resolution when the admin
+    /// webhooks policy enables the subscription-time check, with static checks plus the admin
+    /// denylist otherwise — and HTTPS is required when the deployment configures it. The tenant's
+    /// subscription cap is enforced. The signing secret is minted server-side and returned in full
+    /// only on this 201 response; every later read redacts it.
+    ///
     /// `POST /api/v1/webhooks`
     ///
     /// Required scopes: `webhooks:write`.
@@ -25,10 +34,14 @@ public struct WebhooksAPI: Sendable {
 
     /// Delete a webhook subscription
     ///
+    /// Removes the subscription so it stops receiving events. The delete is unconditional — no
+    /// existence check runs first — so it is idempotent and answers 200 with `deleted: true` even
+    /// for an id the tenant never had. Past deliveries are not removed.
+    ///
     /// `DELETE /api/v1/webhooks/{webhookId}`
     ///
     /// Required scopes: `webhooks:write`.
-    public func delete(webhookId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func delete(webhookId: String, options: RequestOptions = .init()) async throws -> DeleteWebhookResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/webhooks/\(encodePathSegment(webhookId))",
@@ -39,10 +52,13 @@ public struct WebhooksAPI: Sendable {
 
     /// Get a webhook subscription
     ///
+    /// Returns one subscription, found by scanning the tenant's list, with its signing secret
+    /// redacted. 404 when the tenant has no subscription with that id.
+    ///
     /// `GET /api/v1/webhooks/{webhookId}`
     ///
     /// Required scopes: `webhooks:read`.
-    public func get(webhookId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func get(webhookId: String, options: RequestOptions = .init()) async throws -> WebhookSubscription {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/webhooks/\(encodePathSegment(webhookId))",
@@ -51,6 +67,10 @@ public struct WebhooksAPI: Sendable {
     }
 
     /// List webhook subscriptions
+    ///
+    /// Lists the tenant's webhook subscriptions with their URL, event list, status and failure
+    /// count. Each subscription's signing secret comes back as the literal `[redacted]` — the real
+    /// value is only ever returned by the create call.
     ///
     /// `GET /api/v1/webhooks`
     ///
@@ -64,6 +84,13 @@ public struct WebhooksAPI: Sendable {
     }
 
     /// List webhook deliveries
+    ///
+    /// The delivery log for one subscription, newest first. Delivery rows are stored per tenant
+    /// rather than per webhook, so the read is a bounded reverse scan — up to 5 000 rows walked —
+    /// filtered to this webhook and capped at 100 in the response. `truncated` is true when the
+    /// scan bound or the page cap was reached, which is what distinguishes "this webhook has no
+    /// more deliveries" from "the scan stopped"; `total` counts only the rows in this response.
+    /// Rows carry a 7-day TTL, so older deliveries are simply gone.
     ///
     /// `GET /api/v1/webhooks/{webhookId}/deliveries`
     ///
@@ -92,30 +119,6 @@ public struct WebhooksAPI: Sendable {
             path: "/api/v1/webhooks/sensor/\(encodePathSegment(webhookId))",
             headers: headers,
             body: encodedBody,
-            idempotent: true,
-            options: options
-        ))
-    }
-
-    /// Shopify webhook
-    ///
-    /// Shopify webhook receiver. Bypasses normal auth — `X-Shopify-Hmac-Sha256` header is
-    /// HMAC-verified against the per-shop secret.
-    ///
-    /// `POST /api/v1/webhooks/shopify`
-    public func shopifyWebhook(xShopifyHmacSha256: String, xShopifyTopic: String? = nil, xShopifyShopDomain: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
-        var headers: [String: String] = [:]
-        headers["X-Shopify-Hmac-Sha256"] = xShopifyHmacSha256
-        if let xShopifyTopic {
-            headers["X-Shopify-Topic"] = xShopifyTopic
-        }
-        if let xShopifyShopDomain {
-            headers["X-Shopify-Shop-Domain"] = xShopifyShopDomain
-        }
-        return try await client.send(RequestSpec(
-            method: "POST",
-            path: "/api/v1/webhooks/shopify",
-            headers: headers,
             idempotent: true,
             options: options
         ))

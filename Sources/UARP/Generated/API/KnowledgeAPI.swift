@@ -10,6 +10,14 @@ public struct KnowledgeAPI: Sendable {
 
     /// Create a knowledge base
     ///
+    /// Creates a knowledge base. Refused with 403 when the plan includes no knowledge bases or the
+    /// tenant is at its limit; the slot is then claimed atomically, and contention on that claim
+    /// answers 503 rather than a limit the server did not establish. `chunk_size` must be 64..65536
+    /// and `chunk_overlap` at most half of it — a larger overlap multiplies stored chunks by
+    /// `chunk_size / (chunk_size - chunk_overlap)`. `embedding_model` defaults to the model the
+    /// deployment's embedding adapter actually uses rather than a fixed vendor string. Answers 201
+    /// with the new base.
+    ///
     /// `POST /api/v1/knowledge-bases`
     ///
     /// Required scopes: `memory:write`.
@@ -25,13 +33,19 @@ public struct KnowledgeAPI: Sendable {
 
     /// Delete document
     ///
-    /// `DELETE /api/v1/knowledge-bases/{id}/documents/{docId}`
+    /// Deletes one document and its chunks, then recomputes the base's `document_count` and
+    /// `total_chunks` from the documents that remain in `ready` state and stamps `updated_at`. 404
+    /// when either the base or the document is unknown. Audit-logged as
+    /// `knowledge_base.document_deleted`; answers 204. The chunks and their embeddings are gone —
+    /// re-adding the document means re-embedding it.
+    ///
+    /// `DELETE /api/v1/knowledge-bases/{knowledgeBaseId}/documents/{docId}`
     ///
     /// Required scopes: `memory:write`.
-    public func deleteKbDocument(id: String, docId: String, options: RequestOptions = .init()) async throws {
+    public func deleteKbDocument(knowledgeBaseId: String, docId: String, options: RequestOptions = .init()) async throws {
         try await client.sendVoid(RequestSpec(
             method: "DELETE",
-            path: "/api/v1/knowledge-bases/\(encodePathSegment(id))/documents/\(encodePathSegment(docId))",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(knowledgeBaseId))/documents/\(encodePathSegment(docId))",
             idempotent: true,
             options: options
         ))
@@ -39,13 +53,20 @@ public struct KnowledgeAPI: Sendable {
 
     /// Delete knowledge base
     ///
-    /// `DELETE /api/v1/knowledge-bases/{id}`
+    /// Deletes the knowledge base with every document and chunk in it. First every agent in the
+    /// tenant that references the base has it removed from `knowledge_base_ids` (and the legacy
+    /// singular field), so no agent is left pointing at a base that is gone; then the base is
+    /// deleted, the plan slot released and a `knowledge_base.deleted` audit row written. Answers
+    /// 204, or 404 when the base is unknown. The embeddings are not recoverable — re-ingesting
+    /// means re-embedding.
+    ///
+    /// `DELETE /api/v1/knowledge-bases/{knowledgeBaseId}`
     ///
     /// Required scopes: `memory:write`.
-    public func deleteKnowledgeBase(id: String, options: RequestOptions = .init()) async throws {
+    public func deleteKnowledgeBase(knowledgeBaseId: String, options: RequestOptions = .init()) async throws {
         try await client.sendVoid(RequestSpec(
             method: "DELETE",
-            path: "/api/v1/knowledge-bases/\(encodePathSegment(id))",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(knowledgeBaseId))",
             idempotent: true,
             options: options
         ))
@@ -53,18 +74,44 @@ public struct KnowledgeAPI: Sendable {
 
     /// Get knowledge base
     ///
-    /// `GET /api/v1/knowledge-bases/{id}`
+    /// Returns one knowledge base with its chunk settings, document and chunk counts, and the
+    /// agents attached to it (`attached_agents`, capped at 50 names, plus `attached_agent_count`),
+    /// computed by walking the tenant's agents on this read. 404 when the tenant has no such base.
+    ///
+    /// `GET /api/v1/knowledge-bases/{knowledgeBaseId}`
     ///
     /// Required scopes: `memory:read`.
-    public func getKnowledgeBase(id: String, options: RequestOptions = .init()) async throws -> KnowledgeBase {
+    public func getKnowledgeBase(knowledgeBaseId: String, options: RequestOptions = .init()) async throws -> KnowledgeBase {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/knowledge-bases/\(encodePathSegment(id))",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(knowledgeBaseId))",
             options: options
         ))
     }
 
     /// Ingest document into knowledge base
+    ///
+    /// Ingests one document: send exactly one of `file_id` (an already-uploaded file, whose text is
+    /// extracted server-side) or `content` (inline text), with an optional `filename`; sending both
+    /// or neither is 400, and a file no text can be extracted from is 422. Inline content counts
+    /// against the tenant's storage quota (403 when full) while a file was already charged at
+    /// upload; oversized text answers 413, as does a chunk count the base's own
+    /// `chunk_size`/`chunk_overlap` would blow up. The text is chunked with the base's settings and
+    /// embedded when the deployment has an embeddings backend — otherwise the document is stored
+    /// keyword-only, which the response reports as `embedding_status`. Answers 201 with the
+    /// document id and `chunks_created`. The base must exist (404).
+    ///
+    /// Every refusal on this route carries a machine-readable `code` beside the sentence, and the
+    /// numbers as FIELDS rather than only inside the prose — nothing on this platform honours
+    /// `Accept-Language`, so a client that renders `detail` is rendering English.
+    /// `kb_document_body_invalid` (400) adds `reason` (`both` | `missing` | `empty_content`) and
+    /// `fields`. `NOT_FOUND` (404) adds `resource` (`file` | `file_data`) and `file_id`.
+    /// `kb_text_extraction_failed` (422) adds `filename` and `mime_type`. `kb_document_too_large`
+    /// (413) adds `chars`, `limit` and `source` (`content` | `extracted_text`). `kb_chunk_limit`
+    /// (413) adds `limit`, `chunk_size` and `chunk_overlap`. `kb_storage_limit` (403) adds
+    /// `current_bytes`, `incoming_bytes`, `limit` and `plan` — and is the code that separates a
+    /// full tenant from a forbidden knowledge base, which both answered `FORBIDDEN` until
+    /// 2026-09-21.
     ///
     /// `POST /api/v1/knowledge-bases/{kbId}/documents`
     ///
@@ -81,6 +128,12 @@ public struct KnowledgeAPI: Sendable {
 
     /// List documents in knowledge base
     ///
+    /// Lists the documents ingested into the base, each with a `chunk_preview` of the first 300
+    /// characters of its first chunk so text extraction can be verified. `embedding_status` is
+    /// derived from the stored vectors rather than a stored flag; the chunk read behind it is
+    /// capped at 500 chunks, so a document whose chunks fall outside that window reports no status
+    /// at all rather than falsely claiming `keyword_only`.
+    ///
     /// `GET /api/v1/knowledge-bases/{kbId}/documents`
     ///
     /// Required scopes: `memory:read`.
@@ -94,6 +147,13 @@ public struct KnowledgeAPI: Sendable {
 
     /// List knowledge bases
     ///
+    /// Lists the tenant's knowledge bases, each enriched with the agents that actually read it: the
+    /// tenant's agents are walked and their `knowledge_base_ids` folded into per-base
+    /// `attached_agents` (at most 50 named) and `attached_agent_count`, so a base attached to
+    /// nothing is visibly attached to nothing. The same array is returned as `items` and as the
+    /// `knowledge_bases` alias. Callers need `memory:read` (`knowledge_base:read` is accepted
+    /// beside it).
+    ///
     /// `GET /api/v1/knowledge-bases`
     ///
     /// Required scopes: `memory:read`.
@@ -105,15 +165,59 @@ public struct KnowledgeAPI: Sendable {
         ))
     }
 
-    /// Update knowledge base
+    /// Re-embed every chunk with the current model
     ///
-    /// `PUT /api/v1/knowledge-bases/{id}`
+    /// Recovers a knowledge base that was indexed without embeddings (keyword-only) and clears
+    /// embedding drift after a model change. Requires an embeddings backend: without one the answer
+    /// is 503 and nothing is written.
+    ///
+    /// `POST /api/v1/knowledge-bases/{kbId}/reindex`
     ///
     /// Required scopes: `memory:write`.
-    public func updateKnowledgeBase(id: String, body: KnowledgeBaseUpdate, options: RequestOptions = .init()) async throws -> KnowledgeBase {
+    public func reindexKnowledgeBase(kbId: String, options: RequestOptions = .init()) async throws -> ReindexKnowledgeBaseResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(kbId))/reindex",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Retrieve chunks from one knowledge base
+    ///
+    /// Vector search when an embeddings backend is configured, keyword scoring when it is not —
+    /// `mode` says which ran, and a vector pass that matches nothing falls back to keyword rather
+    /// than answering empty. `status` distinguishes the three outcomes a caller must render
+    /// differently: `KB_EMPTY` (nothing indexed yet), `NO_MATCHES` (indexed, nothing matched) and
+    /// `RESULTS_FOUND`. All three are 200: an empty result is an answer here, not a failure.
+    ///
+    /// `POST /api/v1/knowledge-bases/{kbId}/search`
+    ///
+    /// Required scopes: `memory:write`.
+    public func searchKnowledgeBase(kbId: String, body: SearchKnowledgeBaseRequest, options: RequestOptions = .init()) async throws -> KnowledgeBaseSearchResult {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(kbId))/search",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Update knowledge base
+    ///
+    /// WRITE SEMANTICS: merges. Measured 2026-08-31 on the wire: `{name}` left `description` intact
+    /// and vice versa, and `chunk_size` and `embedding_model` survived both. Note this is the
+    /// OPPOSITE of `PUT /agents/{id}/schedule`, which replaces — the verb decides nothing here, see
+    /// docs/WRITE_SEMANTICS.md.
+    ///
+    /// `PUT /api/v1/knowledge-bases/{knowledgeBaseId}`
+    ///
+    /// Required scopes: `memory:write`.
+    public func updateKnowledgeBase(knowledgeBaseId: String, body: KnowledgeBaseUpdate, options: RequestOptions = .init()) async throws -> KnowledgeBase {
         return try await client.send(RequestSpec(
             method: "PUT",
-            path: "/api/v1/knowledge-bases/\(encodePathSegment(id))",
+            path: "/api/v1/knowledge-bases/\(encodePathSegment(knowledgeBaseId))",
             body: try client.encode(body),
             idempotent: true,
             options: options

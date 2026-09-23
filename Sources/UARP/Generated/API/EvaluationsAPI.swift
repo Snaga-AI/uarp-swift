@@ -10,10 +10,18 @@ public struct EvaluationsAPI: Sendable {
 
     /// Create custom webhook scorer
     ///
+    /// Registers a custom scorer for this agent and returns it with `201`. Only `config.type:
+    /// "webhook"` is accepted; `config.url` is validated at registration against a DNS-aware SSRF
+    /// guard — public scheme, no private or link-local address, resolution must succeed, and the
+    /// admin-configured webhook denylist applies — and a URL that fails is refused `422`. The gate
+    /// exists because the evaluator round-trips the scorer's `score` and `reason` back into the
+    /// eval results, which would otherwise carry whatever an internal endpoint returned.
+    /// `config.timeout_ms` bounds each call.
+    ///
     /// `POST /api/v1/agents/{agentId}/scorers`
     ///
     /// Required scopes: `evaluations:write`.
-    public func createAgentScorer(agentId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createAgentScorer(agentId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> AgentScorer {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/scorers",
@@ -25,10 +33,15 @@ public struct EvaluationsAPI: Sendable {
 
     /// Create an evaluation dataset
     ///
+    /// Creates a named evaluation dataset for the agent from the `cases` in the body — at least one
+    /// is required — and returns it with `201`, each case stamped with a generated id. Requires the
+    /// `evaluations:write` scope and the `evaluations.write` permission. Datasets are the input
+    /// `POST /api/v1/agents/{agentId}/evaluations` runs against; creating one executes nothing.
+    ///
     /// `POST /api/v1/agents/{agentId}/datasets`
     ///
     /// Required scopes: `evaluations:write`.
-    public func createDataset(agentId: String, body: CreateDatasetRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func createDataset(agentId: String, body: CreateDatasetRequest, options: RequestOptions = .init()) async throws -> EvalDataset {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/datasets",
@@ -57,10 +70,13 @@ public struct EvaluationsAPI: Sendable {
 
     /// Get evaluation dataset details
     ///
+    /// Returns one evaluation dataset with its cases, or `404` when this agent has no dataset with
+    /// that id.
+    ///
     /// `GET /api/v1/agents/{agentId}/datasets/{datasetId}`
     ///
     /// Required scopes: `evaluations:read`.
-    public func getDataset(agentId: String, datasetId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getDataset(agentId: String, datasetId: String, options: RequestOptions = .init()) async throws -> EvalDataset {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/datasets/\(encodePathSegment(datasetId))",
@@ -70,10 +86,13 @@ public struct EvaluationsAPI: Sendable {
 
     /// Get evaluation run results
     ///
+    /// Returns one evaluation run with its per-case results and scores, or `404` when this agent
+    /// has no eval run with that id.
+    ///
     /// `GET /api/v1/agents/{agentId}/evaluations/{evalRunId}`
     ///
     /// Required scopes: `evaluations:read`.
-    public func getEvalRun(agentId: String, evalRunId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getEvalRun(agentId: String, evalRunId: String, options: RequestOptions = .init()) async throws -> EvalRun {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/evaluations/\(encodePathSegment(evalRunId))",
@@ -82,6 +101,10 @@ public struct EvaluationsAPI: Sendable {
     }
 
     /// Get experiment details
+    ///
+    /// Returns an A/B experiment — its variants and their per-variant results — or `404` when no
+    /// experiment with that id exists. The lookup is by tenant and experiment id; the `agentId` in
+    /// the path is not part of the key, so it selects the route rather than narrowing the result.
     ///
     /// `GET /api/v1/agents/{agentId}/experiments/{experimentId}`
     ///
@@ -96,6 +119,10 @@ public struct EvaluationsAPI: Sendable {
 
     /// List custom evaluation scorers
     ///
+    /// Lists the custom scorers registered for this agent, with `total`. These are the extra
+    /// scorers `POST /api/v1/agents/{agentId}/evaluations` can be asked to apply by name alongside
+    /// the built-in ones.
+    ///
     /// `GET /api/v1/agents/{agentId}/scorers`
     ///
     /// Required scopes: `evaluations:read`.
@@ -109,10 +136,13 @@ public struct EvaluationsAPI: Sendable {
 
     /// List evaluation datasets for an agent
     ///
+    /// Lists the evaluation datasets belonging to this agent, with `total`. No filtering or paging
+    /// — the whole set comes back. Requires the `evaluations:read` scope.
+    ///
     /// `GET /api/v1/agents/{agentId}/datasets`
     ///
     /// Required scopes: `evaluations:read`.
-    public func listDatasets(agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listDatasets(agentId: String, options: RequestOptions = .init()) async throws -> ListDatasetsResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/datasets",
@@ -122,10 +152,14 @@ public struct EvaluationsAPI: Sendable {
 
     /// List evaluation runs for an agent
     ///
+    /// Lists this agent's evaluation runs as `eval_runs`, with `total`. No filtering or paging.
+    /// Each entry carries the run's aggregate outcome; the per-case detail is in the single-run
+    /// read.
+    ///
     /// `GET /api/v1/agents/{agentId}/evaluations`
     ///
     /// Required scopes: `evaluations:read`.
-    public func listEvalRuns(agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listEvalRuns(agentId: String, options: RequestOptions = .init()) async throws -> ListEvalRunsResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/evaluations",
@@ -133,12 +167,37 @@ public struct EvaluationsAPI: Sendable {
         ))
     }
 
+    /// List an agent's evaluation experiments
+    ///
+    /// This agent's experiments, newest first (at most 100). Added 2026-09-23: before it an
+    /// experiment could only be read back by an id the client had kept.
+    ///
+    /// `GET /api/v1/agents/{agentId}/experiments`
+    ///
+    /// Required scopes: `evaluations:read`.
+    public func listExperiments(agentId: String, options: RequestOptions = .init()) async throws -> ListExperimentsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/experiments",
+            options: options
+        ))
+    }
+
     /// Run an evaluation suite against an agent
+    ///
+    /// Starts an evaluation of the agent against the dataset named by `dataset_id` and returns the
+    /// eval run with `201`. This executes the agent once per case, so it passes the same quota gate
+    /// a normal run does — monthly run quota, budget and payment state — and is refused `429` when
+    /// it does not pass, before any case executes. `scorers` names the scorers to apply, custom
+    /// ones included, and `auto_rollback_on_regression` lets the evaluator roll the agent back to
+    /// its previous version when the suite regresses — an automated write to the agent with no
+    /// human in the loop. Results are read back through `GET
+    /// /api/v1/agents/{agentId}/evaluations/{evalRunId}`.
     ///
     /// `POST /api/v1/agents/{agentId}/evaluations`
     ///
     /// Required scopes: `evaluations:write`.
-    public func run(agentId: String, body: RunEvaluationRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func run(agentId: String, body: RunEvaluationRequest, options: RequestOptions = .init()) async throws -> EvalRun {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/evaluations",

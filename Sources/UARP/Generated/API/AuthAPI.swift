@@ -37,7 +37,7 @@ public struct AuthAPI: Sendable {
     /// (Guideline-style separation: super-admin must use OTP).
     ///
     /// `GET /api/v1/auth/oauth/{provider}/callback`
-    public func completeOAuthLogin(provider: OAuthLoginProviderItemId, code: String, state: String, error: String? = nil, options: RequestOptions = .init()) async throws -> CompleteOAuthLoginResponse {
+    public func completeOAuthLogin(provider: OAuthLoginProviderConfigStatusProvider, code: String, state: String, error: String? = nil, options: RequestOptions = .init()) async throws -> CompleteOAuthLoginResponse {
         var query: [URLQueryItem] = []
         query.append(URLQueryItem(name: "code", value: code))
         query.append(URLQueryItem(name: "state", value: state))
@@ -53,6 +53,12 @@ public struct AuthAPI: Sendable {
     }
 
     /// Remove MFA enrolment for the calling user
+    ///
+    /// Removes the calling user's TOTP enrolment and clears their MFA freshness marker. Possession
+    /// of a current second factor must be proven in the body: either a valid `code` or a
+    /// `recovery_code`, which is burned on use — without one the request is refused with **401**
+    /// even though the session is otherwise valid, so a stolen session cannot drop the second
+    /// factor on its own. A user who is not enrolled gets **404**.
     ///
     /// `POST /api/v1/auth/mfa/disable`
     public func disableMfa(options: RequestOptions = .init()) async throws -> DisableMfaResponse {
@@ -71,7 +77,7 @@ public struct AuthAPI: Sendable {
     /// issuer?, algorithm? }`.
     ///
     /// `POST /api/v1/auth/mfa/enrol`
-    public func enrolMfa(body: EnrolMfaRequest? = nil, options: RequestOptions = .init()) async throws -> EnrolMfaResponse {
+    public func enrolMfa(body: EnrolMfaRequest? = nil, options: RequestOptions = .init()) async throws -> MfaEnrolment {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -107,6 +113,19 @@ public struct AuthAPI: Sendable {
     /// header. Resolves the user via api-key.user_id, then JWT `sub` claim, then
     /// tenant_primary_email lookup.
     ///
+    /// **Read `role` from the top level, never from `user.role`.** The top-level field is required
+    /// and always present; it resolves as `user?.role ?? extractRole(auth)`, so it answers for
+    /// every caller. `user` is nullable and NOT required — it is null whenever the caller
+    /// authenticated with an api key rather than a signed-in session, and the nested `role` exists
+    /// only in the other case.
+    ///
+    /// Spelled out because the schema alone did not prevent it: two mobile clients independently
+    /// modelled the response as `{user, tenant}`, read `user.role`, and so could not tell an owner
+    /// from a viewer for any key-authed caller — one of them had gated no settings on role at all
+    /// as a result. A client tested only against a JWT session sees `user.role` work perfectly and
+    /// ships. `scopes` and `auth_method` are required for the same reason and answer for every
+    /// caller too.
+    ///
     /// `GET /api/v1/me`
     public func getMe(options: RequestOptions = .init()) async throws -> GetMeResponse {
         return try await client.send(RequestSpec(
@@ -117,6 +136,11 @@ public struct AuthAPI: Sendable {
     }
 
     /// MFA enrolment status for the calling user
+    ///
+    /// Reports whether the calling subject is enrolled in TOTP and how many unused recovery codes
+    /// remain (`0` when not enrolled). The subject is the stable user id (`auth.userId`), falling
+    /// back to the credential id for service keys that carry no user, so enrolment is shared across
+    /// a user's credentials rather than tied to one key.
     ///
     /// `GET /api/v1/auth/mfa/status`
     public func getMfaStatus(options: RequestOptions = .init()) async throws -> GetMfaStatusResponse {
@@ -185,7 +209,7 @@ public struct AuthAPI: Sendable {
     /// client_id+client_secret.
     ///
     /// `GET /api/v1/auth/oauth/providers`
-    public func listOAuthLoginProviders(options: RequestOptions = .init()) async throws -> ListOAuthLoginProvidersResponse {
+    public func listOAuthLoginProviders(options: RequestOptions = .init()) async throws -> OAuthLoginProvidersList {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/auth/oauth/providers",
@@ -209,6 +233,31 @@ public struct AuthAPI: Sendable {
         ))
     }
 
+    /// Mint a single-use login nonce
+    ///
+    /// Returns a nonce to embed in the next Google One Tap or Apple native sign-in, so the id_token
+    /// that comes back can be tied to THIS attempt. Anonymous by necessity — it is used before
+    /// there is a session — and rate-limited per IP.
+    ///
+    /// A nonce the caller invents is not protection: whoever replays a captured id_token replays
+    /// the nonce with it. Only a nonce this platform issued and has not yet seen used counts, which
+    /// is why it is minted here rather than chosen by the client.
+    ///
+    /// Not required yet. A token that carries no `nonce` claim is accepted exactly as before, so a
+    /// client adopts this on its own schedule; a token that DOES carry one must name an unconsumed
+    /// nonce from this endpoint or the sign-in is refused. Single use: the nonce is consumed when
+    /// the token is verified, so the same token cannot be posted twice.
+    ///
+    /// `POST /api/v1/auth/oauth/nonce`
+    public func mintLoginNonce(options: RequestOptions = .init()) async throws -> MintLoginNonceResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/auth/oauth/nonce",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Mint a 60-second SSE token scoped to events:read
     ///
     /// Mints a short-lived (60 s) API key carrying only `events:read` scope, for use as the
@@ -227,8 +276,16 @@ public struct AuthAPI: Sendable {
 
     /// Register new user
     ///
+    /// Starts self-service registration: validates the email and that both `accept_terms` and
+    /// `accept_privacy` are `true`, then stores a pending verification under a random token with a
+    /// 24-hour TTL (or `auth.verification_ttl_ms`) and emails a `/api/v1/verify-email` link. No
+    /// tenant and no API key exist until that link is followed. An email that already owns a tenant
+    /// answers **409**, which makes this endpoint an accepted account-existence oracle — so it is
+    /// rate limited twice: 5 requests per minute per IP in the router and 10 per hour per IP in the
+    /// handler (**429**). Anonymous.
+    ///
     /// `POST /api/v1/register`
-    public func register(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func register(body: JSONObject, options: RequestOptions = .init()) async throws -> RegisterResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/register",
@@ -240,8 +297,17 @@ public struct AuthAPI: Sendable {
 
     /// Request OTP code
     ///
+    /// Sends a six-digit one-time login code to the given email, storing only its SHA-256 hash with
+    /// a 10-minute TTL (or `auth.otp_ttl_ms`) together with the `accept_terms` / `accept_privacy`
+    /// flags for a first-time sign-up, and records an `otp_requested` analytics event against the
+    /// optional `visitor_id`. The reply is always the same generic message whether or not the
+    /// address is known, and stays 200 even when the mail send fails, so the endpoint cannot be
+    /// used to enumerate accounts. Rate limited three ways: 20 per minute per IP at the router, 10
+    /// per 10 minutes per IP in the handler, and a per-email cooldown that answers **429** if a
+    /// code was requested too recently. Anonymous.
+    ///
     /// `POST /api/v1/auth/request-code`
-    public func requestOtpCode(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func requestOtpCode(body: JSONObject, options: RequestOptions = .init()) async throws -> RequestOtpCodeResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/auth/request-code",
@@ -275,7 +341,7 @@ public struct AuthAPI: Sendable {
     /// `device_label` is captured here and surfaces on the minted `api_key` for `/me/sessions`.
     ///
     /// `GET /api/v1/auth/oauth/{provider}/start`
-    public func startOAuthLogin(provider: OAuthLoginProviderItemId, returnTo: String? = nil, deviceLabel: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func startOAuthLogin(provider: OAuthLoginProviderConfigStatusProvider, returnTo: String? = nil, deviceLabel: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
         var query: [URLQueryItem] = []
         if let returnTo {
             query.append(URLQueryItem(name: "return_to", value: returnTo))
@@ -293,12 +359,13 @@ public struct AuthAPI: Sendable {
 
     /// Unlink an OAuth provider from the user
     ///
-    /// Refuses to drop the user's last sign-in factor (counts other linked providers + OTP recovery
-    /// email). Idempotent — unlinking an already-unlinked provider returns 200 with
-    /// `already_unlinked: true`.
+    /// Removes only the link between the user and this provider; the user record and every other
+    /// sign-in method stay. Refuses to drop the user's last sign-in factor (counts other linked
+    /// providers + OTP recovery email). Idempotent — unlinking an already-unlinked provider returns
+    /// 200 with `already_unlinked: true`. Signing in with the provider again re-links it.
     ///
     /// `DELETE /api/v1/me/auth-providers/{provider}`
-    public func unlinkAuthProvider(provider: ListOAuthLoginProvidersResponseProviderId, options: RequestOptions = .init()) async throws -> UnlinkAuthProviderResponse {
+    public func unlinkAuthProvider(provider: OAuthLoginProviderItemId, options: RequestOptions = .init()) async throws -> UnlinkAuthProviderResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/me/auth-providers/\(encodePathSegment(String(describing: provider)))",
@@ -309,8 +376,20 @@ public struct AuthAPI: Sendable {
 
     /// Verify email link
     ///
+    /// Completes registration from the link mailed by `POST /api/v1/register`: it consumes the
+    /// one-time `token` query parameter and, under a per-email lock, creates the tenant, its
+    /// registry and email-index rows, the consent record, the owner user row and a `Default` API
+    /// key scoped `*`, then mails that key to the address and deletes the token. New tenants start
+    /// on a seven-day trial with `plan: "free"` as the post-trial fallback, and the key is a 90-day
+    /// session key rather than a permanent credential; the address configured as super-admin is
+    /// provisioned `enterprise` outright, but only while the super-admin slot is still unclaimed. A
+    /// missing, unknown or expired token answers **400**, an address that already owns a tenant
+    /// **409**, and a failure to send the key email **503** with the tenant id, since the key is
+    /// only ever shown by mail. Anonymous; also registers the tenant for cron, bootstraps Stripe
+    /// billing, increments the public user counter and writes a `tenant.created` audit entry.
+    ///
     /// `GET /api/v1/verify-email`
-    public func verifyEmail(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func verifyEmail(options: RequestOptions = .init()) async throws -> VerifyEmailResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/verify-email",
@@ -335,6 +414,11 @@ public struct AuthAPI: Sendable {
     }
 
     /// Verify a one-time recovery code (burns it on success)
+    ///
+    /// Verifies one of the calling user's one-time recovery codes and burns it on success,
+    /// recording a fresh MFA verification and returning how many codes are left. A missing or empty
+    /// `code` is a validation error; a code that does not match answers **401**, a user with no
+    /// enrolment **404**, and a deployment with no identity-encryption key configured **501**.
     ///
     /// `POST /api/v1/auth/mfa/recovery`
     public func verifyMfaRecovery(body: VerifyMfaRecoveryRequest, options: RequestOptions = .init()) async throws -> VerifyMfaRecoveryResponse {

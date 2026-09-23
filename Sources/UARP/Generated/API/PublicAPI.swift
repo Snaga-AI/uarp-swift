@@ -8,7 +8,35 @@ public struct PublicAPI: Sendable {
 
     init(client: UARPClient) { self.client = client }
 
+    /// Cancel a run of this chat
+    ///
+    /// Cancels a run that belongs to this public session. No body. A run id from outside the
+    /// session is 404; a run of this session that was not started publicly is 409. Forms measured
+    /// through the router with a seeded session (public-served-forms_test.ts, 2026-09-10).
+    ///
+    /// `POST /api/v1/public/sessions/{sessionId}/runs/{runId}/cancel`
+    public func cancelPublicSessionRun(sessionId: String, runId: String, options: RequestOptions = .init()) async throws -> CancelPublicSessionRunResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))/runs/\(encodePathSegment(runId))/cancel",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Create public session
+    ///
+    /// Opens an anonymous chat session against the public agent named by `agent_id` and returns the
+    /// session id, a signed session token (also set as an HttpOnly cookie) and the agent's name,
+    /// greeting and description; the session lives two hours and its public lookup 24 hours. Repeat
+    /// POSTs from the same IP, agent and browser fingerprint within three seconds return the
+    /// existing session with **200** rather than minting a new one, but only for a caller who
+    /// already holds that session's token, so two visitors behind one address never share a
+    /// conversation — a deliberate new chat sends `fresh: true` to bypass the dedup and always get
+    /// **201**. `agent_id` is required (**400**) and an agent that is not public is **404**. Per-IP
+    /// session creation is capped at 300 an hour and concurrent sessions per agent at 100 (both
+    /// **429**, both waived for the configured landing hero agent), on top of the router's
+    /// 30-creations-per-minute per-IP limit.
     ///
     /// `POST /api/v1/public/sessions`
     public func createPublicSession(body: CreatePublicSessionRequest, options: RequestOptions = .init()) async throws -> CreatePublicSessionResponse {
@@ -40,10 +68,121 @@ public struct PublicAPI: Sendable {
         ))
     }
 
+    /// Has THIS browser already signed up?
+    ///
+    /// Deliberately not an address oracle. The answer is `registered: true` only when the caller
+    /// carries the sign-up cookie this browser was given AND it matches the address asked about;
+    /// any other address, or the same address from a browser that did not sign up, answers
+    /// `registered: false`. So the route cannot be used to test whether an address is on the
+    /// roster.
+    ///
+    /// `GET /api/v1/public/testing/android/status`
+    public func getAndroidTestingStatus(email: String, options: RequestOptions = .init()) async throws -> GetAndroidTestingStatusResponse {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "email", value: email))
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/testing/android/status",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Public landing overrides
+    ///
+    /// No authentication. Text overrides and partner logos for the landing page.
+    ///
+    /// `GET /api/v1/public/landing/overrides`
+    public func getLandingOverrides(options: RequestOptions = .init()) async throws -> LandingOverrides {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/landing/overrides",
+            options: options
+        ))
+    }
+
+    /// Unfurl a cited link into card metadata
+    ///
+    /// Open Graph metadata for a URL an agent cited, so the client renders a card instead of a bare
+    /// link. SSRF-guarded: a private or loopback address is refused with 403 rather than fetched.
+    /// Every member of `preview` except `url` and `site` may be null.
+    ///
+    /// `GET /api/v1/public/link-preview`
+    public func getLinkPreview(url: String, options: RequestOptions = .init()) async throws -> GetLinkPreviewResponse {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "url", value: url))
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/link-preview",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Proxy the og:image
+    ///
+    /// Serves the preview image through this origin so the visitor never connects to the
+    /// third-party host. Answers the image bytes with the upstream content type, `Cache-Control:
+    /// public, max-age=86400, immutable`, `nosniff` and a `default-src 'none'` CSP. A target that
+    /// is not an image, or that the fetch could not complete, is 404 rather than a broken picture;
+    /// one over the size cap is 413, including when the responder simply had more to send — half an
+    /// image renders as our bug rather than their oversized file.
+    ///
+    /// `GET /api/v1/public/link-preview/image`
+    public func getLinkPreviewImage(url: String, options: RequestOptions = .init()) async throws -> Data {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "url", value: url))
+        return try await client.sendData(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/link-preview/image",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Maintenance state
+    ///
+    /// No authentication, by design: during maintenance the authenticated surface is exactly what a
+    /// client cannot reach, so asking “is it me or is it you” must not itself require a session.
+    ///
+    /// A read failure answers `enabled: false` — the platform is assumed open unless it is known to
+    /// be closed.
+    ///
+    /// `GET /api/v1/maintenance/status`
+    public func getMaintenanceStatus(options: RequestOptions = .init()) async throws -> MaintenanceStatus {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/maintenance/status",
+            options: options
+        ))
+    }
+
+    /// Public deployment info
+    ///
+    /// No authentication. Contact addresses and the public base URL as the operator configured
+    /// them, plus enough setup state to render a “being set up” banner.
+    ///
+    /// `GET /api/v1/public/platform-info`
+    public func getPlatformInfo(options: RequestOptions = .init()) async throws -> PlatformInfo {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/platform-info",
+            options: options
+        ))
+    }
+
     /// Get public agent card
     ///
+    /// Returns the anonymous-facing card for one agent: name, description, icon, the
+    /// owner-configured greeting, a human sentence counting its available tools, its enabled SPECs
+    /// by id and short name, the admin-chosen avatar and genome taken from the live agent record
+    /// rather than the public index, and the owning tenant's slug and name so a client can build
+    /// its own way back to the right storefront. An agent that does not exist or is not public
+    /// answers **404** — the two are not distinguished. Anonymous; soft-disabled SPECs are
+    /// excluded, and the model reference is deliberately not disclosed.
+    ///
     /// `GET /api/v1/public/agents/{agentId}`
-    public func getPublicAgentCard(agentId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getPublicAgentCard(agentId: String, options: RequestOptions = .init()) async throws -> PublicAgentCard {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/public/agents/\(encodePathSegment(agentId))",
@@ -51,7 +190,41 @@ public struct PublicAPI: Sendable {
         ))
     }
 
+    /// One published post, with its body
+    ///
+    /// A post that exists but is not published is 404, the same as one that does not exist — a
+    /// draft must not be discoverable by its status.
+    ///
+    /// `GET /api/v1/public/blog/posts/{slug}`
+    public func getPublicBlogPost(slug: String, options: RequestOptions = .init()) async throws -> GetPublicBlogPostResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/blog/posts/\(encodePathSegment(slug))",
+            options: options
+        ))
+    }
+
+    /// RSS 2.0 feed of published posts
+    ///
+    /// `/api/v1/public/blog/rss.xml` is the same feed under the extension readers expect; both
+    /// paths answer identically.
+    ///
+    /// `GET /api/v1/public/blog/rss`
+    public func getPublicBlogRss(options: RequestOptions = .init()) async throws -> String {
+        return try await client.sendText(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/blog/rss",
+            options: options
+        ))
+    }
+
     /// Get the public featured agent for the landing-page hero
+    ///
+    /// Returns the agent the platform operator has pinned to the landing hero, chosen in the admin
+    /// landing configuration. Always **200**: `agent` is `null` when nothing is configured or when
+    /// the configured agent is no longer public, which is the case the landing page falls back to a
+    /// static mock for. The card carries the agent's id, name, description, icon and greeting only
+    /// — the model reference is deliberately withheld on this anonymous surface. Anonymous.
     ///
     /// `GET /api/v1/public/landing/featured-agent`
     public func getPublicFeaturedAgent(options: RequestOptions = .init()) async throws -> GetPublicFeaturedAgentResponse {
@@ -64,6 +237,14 @@ public struct PublicAPI: Sendable {
 
     /// Get public file content
     ///
+    /// Serves the bytes of a file published to the public file index, resolving the owning tenant
+    /// from that index. Only images are served: a file whose MIME type is not `image/*` answers
+    /// **403**, and a file absent from the index, missing from the artifact store, or holding no
+    /// bytes answers **404**. SVG is served as an `attachment` while every other image type is
+    /// `inline`, because an SVG executes script in this origin when rendered. Responses carry the
+    /// content's sha256 as an `ETag` and `Cache-Control: public, max-age=86400, immutable`, a
+    /// matching `If-None-Match` answers **304**, and no authentication is required.
+    ///
     /// `GET /api/v1/public/files/{fileId}/content`
     public func getPublicFileContent(fileId: String, options: RequestOptions = .init()) async throws -> Data {
         return try await client.sendData(RequestSpec(
@@ -75,8 +256,16 @@ public struct PublicAPI: Sendable {
 
     /// Get public session
     ///
+    /// Returns the transcript of an anonymous session to the holder of its token: the agent's name,
+    /// greeting and description, every non-compacted message with its stable `message_id`, `role`,
+    /// `content`, timestamp and originating `run_id`, the message count and how many messages
+    /// remain against the per-session cap, and the session status. The transcript stays readable
+    /// after the session's own expiry — expiry is enforced on the write path, not here — but an
+    /// agent that has since been made private or had its public surface disabled answers **410**. A
+    /// missing or invalid token is **401**, an unknown session **404**.
+    ///
     /// `GET /api/v1/public/sessions/{sessionId}`
-    public func getPublicSession(sessionId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getPublicSession(sessionId: String, options: RequestOptions = .init()) async throws -> PublicSessionView {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))",
@@ -86,8 +275,15 @@ public struct PublicAPI: Sendable {
 
     /// Get public state detail
     ///
+    /// Returns one public storefront by slug: the tenant's profile and branding, its full
+    /// marketplace listing, its public agents, the tenant's plan, and a governance summary carrying
+    /// the number of rules in its constitution. The path parameter is the tenant slug. A slug with
+    /// no public profile, or one whose profile exists but was never published to the marketplace,
+    /// answers **404** — the two cases are distinguished by the detail text. Anonymous, drawing on
+    /// the shared 120-per-minute public-read bucket.
+    ///
     /// `GET /api/v1/public/states/{stateId}`
-    public func getPublicState(stateId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getPublicState(stateId: String, options: RequestOptions = .init()) async throws -> GetPublicStateResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/public/states/\(encodePathSegment(stateId))",
@@ -97,8 +293,17 @@ public struct PublicAPI: Sendable {
 
     /// Get public tenant profile
     ///
+    /// Returns one tenant's public profile by slug: name, description, logo, branding, custom
+    /// domain, social links, its marketplace listing when published, and the agents it shows. An
+    /// agent appears only if it is both present in the public agent index (that is, its
+    /// `public_config` is enabled) and — when the tenant has defined `published_agent_ids` — named
+    /// in that allow-list; an undefined allow-list means every public-capable agent is shown.
+    /// `primary_agent_id` is returned only when the tenant's chosen public agent passes those same
+    /// gates, so the page never auto-greets with an agent missing from its own grid. An unknown
+    /// slug answers **404**; anonymous.
+    ///
     /// `GET /api/v1/public/tenants/{slug}`
-    public func getPublicTenantProfile(slug: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getPublicTenantProfile(slug: String, options: RequestOptions = .init()) async throws -> PublicTenant {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/public/tenants/\(encodePathSegment(slug))",
@@ -120,7 +325,88 @@ public struct PublicAPI: Sendable {
         ))
     }
 
+    /// Is sign-up open
+    ///
+    /// No authentication; cached for 30 seconds.
+    ///
+    /// **Fails open.** If the setting cannot be read the answer is `registration_open: true`,
+    /// because the worst case of guessing open is a missing notice, while guessing closed would
+    /// turn a storage blip into a closed front door. A client cannot distinguish the two — this
+    /// endpoint is the state, not a health check.
+    ///
+    /// `GET /api/v1/public/registration-status`
+    public func getRegistrationStatus(options: RequestOptions = .init()) async throws -> GetRegistrationStatusResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/registration-status",
+            options: options
+        ))
+    }
+
+    /// List published blog posts
+    ///
+    /// Published posts only, newest first, paged. `all_tags` is the distinct tag set across every
+    /// published post — the whole set, not just this page — so a filter UI can be built from one
+    /// call. `excerpt` is the body with its leading heading and markdown punctuation stripped, cut
+    /// to 240 characters. `total` and `total_pages` count posts AFTER `tag` and `q` are applied.
+    ///
+    /// `GET /api/v1/public/blog`
+    public func listPublicBlogPosts(tag: String? = nil, q: String? = nil, page: Int? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> ListPublicBlogPostsResponse {
+        var query: [URLQueryItem] = []
+        if let tag {
+            query.append(URLQueryItem(name: "tag", value: tag))
+        }
+        if let q {
+            query.append(URLQueryItem(name: "q", value: q))
+        }
+        if let page {
+            query.append(URLQueryItem(name: "page", value: String(page)))
+        }
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/blog",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// List the integrations a visitor could connect
+    ///
+    /// The connectors the platform offers today: the registry MINUS anything an admin has switched
+    /// off, which is the same answer `GET /integrations/catalog` gives a signed-in tenant — both
+    /// call one function, so a page rendered from this cannot advertise what the product refuses.
+    ///
+    /// It exists because a hand-kept list drifted: a marketing page counted the connector registry
+    /// and said twenty, naming three integrations that are not in the catalogue at all, while a
+    /// tenant was served seven. A number a page keeps by hand is a number that can be wrong; this
+    /// one cannot.
+    ///
+    /// Deliberately thinner than the tenant catalogue — no `config_schema`, because a visitor
+    /// deciding whether to sign up does not need to know which credential fields a connector wants.
+    /// Anonymous, and it says nothing about any tenant.
+    ///
+    /// `GET /api/v1/public/integrations`
+    public func listPublicIntegrations(options: RequestOptions = .init()) async throws -> ListPublicIntegrationsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/public/integrations",
+            options: options
+        ))
+    }
+
     /// List public plans
+    ///
+    /// Lists the plans as the landing page shows them: for each built-in plan the merged name and
+    /// price (falling back to the platform bootstrap price so the page never renders a null), the
+    /// queue tier the plan buys, `effective_concurrent_runs` clamped to the live platform ceiling
+    /// so the page cannot promise more width than the scheduler will run, the reset period, the
+    /// quota set including the monthly image and video allowances, and the overage terms priced per
+    /// million tokens at the configured default model's billed rate. Active custom catalog plans
+    /// marked public are appended, ordered by price; hidden and inactive definitions never appear.
+    /// Anonymous, drawing on the shared 120-per-minute public-read bucket.
     ///
     /// `GET /api/v1/public/plans`
     public func listPublicPlans(options: RequestOptions = .init()) async throws -> ListPublicPlansResponse {
@@ -133,6 +419,12 @@ public struct PublicAPI: Sendable {
 
     /// List public states
     ///
+    /// Lists the published tenant storefronts in the public marketplace, each with its slug, name,
+    /// description, logo, category, tags, social links, branding and aggregate stats. `category`
+    /// filters, `sort` orders by `recent` (the default, newest `published_at` first), `rating` or
+    /// `popular`, and `limit` caps the page at 50 by default and 100 at most. Anonymous, and capped
+    /// at 30 requests per minute per IP because each call reads and sorts the whole listing table.
+    ///
     /// `GET /api/v1/public/states`
     public func listPublicStates(options: RequestOptions = .init()) async throws -> ListPublicStatesResponse {
         return try await client.send(RequestSpec(
@@ -143,6 +435,15 @@ public struct PublicAPI: Sendable {
     }
 
     /// List public tenants
+    ///
+    /// Lists the public tenant directory — every tenant with a public profile, its published agents
+    /// and its marketplace listing row. `category` and `search` filter (search matches name and
+    /// description, case-insensitively), `sort` orders by `recent`, `popular`, `rating` or
+    /// `agents`, and `limit` caps the page at 50 by default and 100 at most. Paging is by opaque
+    /// `cursor`; the response carries `items`, the next `cursor` or null, `has_more` and the
+    /// filtered `total`. The directory is built by a fan-out over the public index and cached
+    /// process-wide for a short window, and the response is sent anonymously with `Cache-Control:
+    /// public, max-age=60`.
     ///
     /// `GET /api/v1/public/tenants`
     public func listPublicTenants(category: String? = nil, sort: String? = nil, search: String? = nil, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) async throws -> ListPublicTenantsResponse {
@@ -183,6 +484,15 @@ public struct PublicAPI: Sendable {
 
     /// Domain lookup
     ///
+    /// Resolves a custom domain to the tenant `slug` that serves it, so an anonymous visitor
+    /// arriving on a vanity host can be routed to the right public profile; the `domain` query
+    /// parameter is required and must look like a hostname of at most 253 characters (**400**).
+    /// Only a domain whose tenant record still reads `verified` is disclosed; anything else is
+    /// **404**. On an index miss the handler walks the tenant registry once and rebuilds the
+    /// missing `domain_map` row when it finds a matching verified record, so the next call takes
+    /// the fast path. Anonymous, and capped at 20 requests per minute per IP because a miss fans
+    /// out across the registry.
+    ///
     /// `GET /api/v1/public/domain-lookup`
     public func publicDomainLookup(domain: String, options: RequestOptions = .init()) async throws -> PublicDomainLookupResponse {
         var query: [URLQueryItem] = []
@@ -213,8 +523,18 @@ public struct PublicAPI: Sendable {
 
     /// Respond to public HITL
     ///
+    /// Supplies the visitor's answer to an agent that has paused for input, storing `response` and
+    /// flipping the session's latest run from `awaiting_input` back to `queued` and scheduling it;
+    /// the flip is a CAS, so of two concurrent calls only one wins and the loser gets **409**,
+    /// which is also the answer when the latest run is not awaiting input or was not created on the
+    /// public path. A missing or invalid token is **401**, as is a token whose tenant and agent
+    /// disagree with the session lookup; an unknown session or no run at all is **404**, and an
+    /// empty `response` **400**. The per-session message cap, the global anonymous gate and the
+    /// landing agent's daily ceiling are charged only to the winner of the flip, each **429** with
+    /// the run rolled back to `awaiting_input`. Appends a `run.input_received` event.
+    ///
     /// `POST /api/v1/public/sessions/{sessionId}/respond`
-    public func respondToPublicHitl(sessionId: String, body: RespondToPublicHitlRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func respondToPublicHitl(sessionId: String, body: RespondToPublicHitlRequest, options: RequestOptions = .init()) async throws -> RespondToPublicHitlResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))/respond",
@@ -225,6 +545,17 @@ public struct PublicAPI: Sendable {
     }
 
     /// Send public message
+    ///
+    /// Appends a visitor message to an anonymous session and schedules a run, answering **202**
+    /// with the new `run_id` and the messages remaining; subscribe to the session's SSE stream for
+    /// the output. `content` is required and capped at 10 000 characters (**400**), and because the
+    /// session runs one run at a time, sending while a run is still active answers **409**. Several
+    /// ceilings apply before anything is scheduled, each **429**: the per-session message cap
+    /// (default 50), a per-session rate of six messages a minute, the owner tenant's run and token
+    /// quota, a global anonymous-throughput gate, and — for the configured landing hero agent,
+    /// which is exempt from the per-session cap — a per-visitor daily message ceiling. An expired
+    /// session answers **401** and a closed one **404**; the message count is claimed by CAS before
+    /// the run is scheduled, and a run that loses that race is deleted rather than left orphaned.
     ///
     /// `POST /api/v1/public/sessions/{sessionId}/messages`
     public func sendPublicMessage(sessionId: String, body: SendPublicMessageRequest, options: RequestOptions = .init()) async throws -> SendPublicMessageResponse {
@@ -237,7 +568,53 @@ public struct PublicAPI: Sendable {
         ))
     }
 
+    /// Publish a read-only copy of this chat
+    ///
+    /// Snapshots the last 60 user/assistant turns of the session into a share record that
+    /// `getPublicSharedChat` serves for a limited time, and returns its token. No body. A session
+    /// with no turns yet is 400 `Nothing to share yet`. Sharing the SAME conversation again returns
+    /// the token that already exists rather than a second copy, so a repeated press or a client
+    /// retry is free and never counts against the ceiling; a session may publish 20 DISTINCT
+    /// snapshots, after which further ones are 429. Forms measured through the router with a seeded
+    /// session (public-served-forms_test.ts, 2026-09-10).
+    ///
+    /// `POST /api/v1/public/sessions/{sessionId}/share`
+    public func sharePublicSession(sessionId: String, options: RequestOptions = .init()) async throws -> SharePublicSessionResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))/share",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Sign up for Android closed testing
+    ///
+    /// Records the address and, when a testing URL is configured, mails the join link. A repeat
+    /// submit is NOT an error: the same address answers 200 with `already_registered: true` instead
+    /// of 201, and no second letter goes out.
+    ///
+    /// `POST /api/v1/public/testing/android`
+    public func signUpForAndroidTesting(body: SignUpForAndroidTestingRequest, options: RequestOptions = .init()) async throws -> AndroidTesterSignupResult {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/public/testing/android",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// SSE stream for public session
+    ///
+    /// Server-Sent Events for an anonymous session: the run events of every run in the session,
+    /// each with an id of `<runId>:<seq>`, so a client can resume by sending the last one as
+    /// `Last-Event-ID`. The session token is required (**401** when absent) and is verified inside
+    /// the stream — an invalid token arrives as an `error` event on an otherwise open stream rather
+    /// than an HTTP status. Each open stream takes a slot against the platform's concurrent-SSE
+    /// ceiling, keyed by public session rather than tenant, and exceeding it answers **429**.
+    /// Anonymous, and limited to 240 requests per minute per IP by the router so reconnect storms
+    /// do not trip the ordinary public cap.
     ///
     /// `GET /api/v1/public/sessions/{sessionId}/events`
     ///
@@ -246,6 +623,26 @@ public struct PublicAPI: Sendable {
         return client.sendStream(RequestSpec(
             method: "GET",
             path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))/events",
+            options: options
+        ))
+    }
+
+    /// Attach an image to this chat
+    ///
+    /// The body is the raw image bytes — not multipart, not JSON — with its media type in
+    /// `Content-Type` (`image/*` only; anything else is 415). Empty is 400; over 8 MB is 413; more
+    /// uploads than the session allows is 429; a tenant whose storage quota is full gets 403. The
+    /// image is stored as one of the agent tenant's files and the returned `file_id` is what
+    /// `sendPublicMessage` attaches. Forms measured through the router with a seeded session
+    /// (public-served-forms_test.ts, 2026-09-10).
+    ///
+    /// `POST /api/v1/public/sessions/{sessionId}/upload`
+    public func uploadPublicSessionImage(sessionId: String, body: FilePart, options: RequestOptions = .init()) async throws -> UploadPublicSessionImageResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/public/sessions/\(encodePathSegment(sessionId))/upload",
+            body: try client.encode(body),
+            idempotent: true,
             options: options
         ))
     }

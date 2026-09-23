@@ -8,7 +8,33 @@ public struct AdminAPI: Sendable {
 
     init(client: UARPClient) { self.client = client }
 
+    /// Add addresses to the roster by hand
+    ///
+    /// **Super-admin only.** Addresses reach the owner from the Play console and from people who
+    /// write directly, so the landing form is not the only door. Partial success is normal: each
+    /// address lands in exactly one of the three lists and the call is still 200.
+    ///
+    /// `POST /api/v1/admin/testers/android`
+    ///
+    /// Required scopes: `admin`.
+    public func addAndroidTesters(body: AddAndroidTestersRequest, options: RequestOptions = .init()) async throws -> AddAndroidTestersResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/testers/android",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Platform-wide agent analytics
+    ///
+    /// Cross-tenant agent roster for the super-admin analytics page: it walks the tenant registry
+    /// and joins each tenant's agents with their bridge connections and per-agent usage, then
+    /// summarises how the platform's agents split between cloud and bridge execution, which bridge
+    /// agents are online, stale or offline, and which agents ran, spent and consumed most over the
+    /// window. `days` defaults to 30 and is capped at 90. Requires the `admin` scope and
+    /// super-admin identity.
     ///
     /// `GET /api/v1/admin/analytics/agents`
     ///
@@ -27,6 +53,11 @@ public struct AdminAPI: Sendable {
     }
 
     /// Platform-wide event analytics
+    ///
+    /// Returns recent raw analytics events newest day first, stopping as soon as `limit` is
+    /// reached. `days` defaults to 7 and is clamped to 1..30, `limit` defaults to 100 and is
+    /// clamped to 1..500, and `type` filters to one event type. Requires the `admin` scope and
+    /// super-admin identity.
     ///
     /// `GET /api/v1/admin/analytics/events`
     ///
@@ -51,6 +82,13 @@ public struct AdminAPI: Sendable {
     }
 
     /// Platform-wide analytics overview
+    ///
+    /// Platform-wide funnel and traffic overview over the last `days` days (default 30, capped at
+    /// 90): per-event-type totals, a daily timeseries, the signup and revenue funnel with its
+    /// conversion percentages, and the top countries, devices, browsers, referrers and UTM sources.
+    /// Unique visitors are counted over a fixed 30-day window regardless of `days`, because that
+    /// section scans raw events rather than the daily counters. Requires the `admin` scope and
+    /// super-admin identity.
     ///
     /// `GET /api/v1/admin/analytics/overview`
     ///
@@ -111,10 +149,17 @@ public struct AdminAPI: Sendable {
 
     /// Remove OAuth login provider (super-admin)
     ///
+    /// Deletes the stored client id and secret for one login OAuth provider, which turns that
+    /// sign-in method off platform-wide. Idempotent: a provider with no stored record still answers
+    /// 200 with `configured: false`, and an unsupported provider id is 404. DELETE is accepted for
+    /// `apple` even though GET and PUT refuse it, because a record written by an older build is
+    /// inert but still holds a secret and this is the only route that removes it. Writes an
+    /// `admin.config_updated` audit entry. Super-admin only.
+    ///
     /// `DELETE /api/v1/admin/oauth-login-providers/{provider}`
     ///
     /// Required scopes: `admin`.
-    public func adminDeleteOAuthProvider(provider: OAuthLoginProviderItemId, options: RequestOptions = .init()) async throws -> AdminDeleteOAuthProviderResponse {
+    public func adminDeleteOAuthProvider(provider: OAuthLoginProviderConfigStatusProvider, options: RequestOptions = .init()) async throws -> OAuthLoginProviderConfigDeleted {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/admin/oauth-login-providers/\(encodePathSegment(String(describing: provider)))",
@@ -125,10 +170,17 @@ public struct AdminAPI: Sendable {
 
     /// Admin: get landing-page featured-agent config
     ///
+    /// Returns the landing-page configuration as a fully-shaped record even when the stored row
+    /// predates some of its fields: the featured public agent id, the per-path text overrides, the
+    /// multilingual switch and default locale, and the partner list with its switch. It also
+    /// returns the KV `version` (a versionstamp) so the admin UI can send it back as
+    /// `expected_version` and detect a concurrent edit, and a `source` of `kv` or `none`.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/landing`
     ///
     /// Required scopes: `admin`.
-    public func adminGetLandingConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetLandingConfig(options: RequestOptions = .init()) async throws -> AdminGetLandingConfigResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/landing",
@@ -138,10 +190,18 @@ public struct AdminAPI: Sendable {
 
     /// Admin: get curated model catalog
     ///
+    /// Returns the curated model catalogue with each row's effective economics projected in — what
+    /// the platform would charge for that model and which plan tier may select it, computed the
+    /// same way the proxy computes it. When no operator override has been stored it falls back to
+    /// the built-in `MODEL_REGISTRY` seed with `source: "seed"` and a null `version`, so the admin
+    /// sees the same list the runtime will use. The `version` versionstamp is meant to be echoed
+    /// back as `expected_version` on the next save. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/model-catalog`
     ///
     /// Required scopes: `admin`.
-    public func adminGetModelCatalog(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetModelCatalog(options: RequestOptions = .init()) async throws -> AdminModelCatalog {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/model-catalog",
@@ -151,10 +211,17 @@ public struct AdminAPI: Sendable {
 
     /// Admin: model catalog default seed
     ///
+    /// Returns the catalogue an operator would start from: the built-in `MODEL_REGISTRY` seed
+    /// merged with the live models of every configured provider, so a freshly registered provider's
+    /// current lineup appears without anyone editing source. The live merge is best-effort and
+    /// additive — a provider whose endpoint is unreachable simply contributes nothing, and an id
+    /// already in the seed is not duplicated. It reads nothing from and writes nothing to the
+    /// stored catalogue. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/model-catalog/seed`
     ///
     /// Required scopes: `admin`.
-    public func adminGetModelCatalogSeed(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetModelCatalogSeed(options: RequestOptions = .init()) async throws -> AdminModelCatalogSeed {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/model-catalog/seed",
@@ -164,10 +231,16 @@ public struct AdminAPI: Sendable {
 
     /// Admin: live per-model pricing (synced from the configured provider)
     ///
+    /// Returns the live per-model pricing the cost estimator holds — the provider `/v1/models`
+    /// sync, the admin per-model overrides and the catalogue rates already resolved into one list —
+    /// with a count and a `source` of `provider_sync`. Read-only; this is what the platform will
+    /// actually charge on, not a stored document. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/model-pricing`
     ///
     /// Required scopes: `admin`.
-    public func adminGetModelPricing(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetModelPricing(options: RequestOptions = .init()) async throws -> AdminModelPricingList {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/model-pricing",
@@ -183,7 +256,7 @@ public struct AdminAPI: Sendable {
     /// `GET /api/v1/admin/oauth-login-providers/{provider}`
     ///
     /// Required scopes: `admin`.
-    public func adminGetOAuthProvider(provider: OAuthLoginProviderItemId, options: RequestOptions = .init()) async throws -> AdminGetOAuthProviderResponse {
+    public func adminGetOAuthProvider(provider: OAuthLoginProviderConfigStatusProvider, options: RequestOptions = .init()) async throws -> OAuthLoginProviderConfigStatus {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/oauth-login-providers/\(encodePathSegment(String(describing: provider)))",
@@ -192,6 +265,11 @@ public struct AdminAPI: Sendable {
     }
 
     /// Get last stored cost-reconciliation result for a tenant
+    ///
+    /// Returns the most recent stored cost-reconciliation result for the named tenant, chosen by
+    /// sorting the last twelve period rows descending. 404 when that tenant has no reconciliation
+    /// result at all, 400 without a tenant id, and 403 for a caller who is not a super admin.
+    /// Read-only.
     ///
     /// `GET /api/v1/admin/reconciliation/{tenantId}`
     ///
@@ -206,10 +284,15 @@ public struct AdminAPI: Sendable {
 
     /// Admin: get default voice (STT/TTS) config
     ///
+    /// Returns the platform's default voice configuration — the STT provider and model, and the TTS
+    /// provider, model and voice — with a `source` of `kv` or `none`. A platform that has never
+    /// been configured answers `voice: null` rather than a guessed vendor default. Super-admin
+    /// only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/voice`
     ///
     /// Required scopes: `admin`.
-    public func adminGetVoiceConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetVoiceConfig(options: RequestOptions = .init()) async throws -> AdminGetVoiceConfigResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/voice",
@@ -219,10 +302,16 @@ public struct AdminAPI: Sendable {
 
     /// Admin: get per-model voice presets
     ///
+    /// Returns the admin-managed map of model id to the list of TTS voice names that model accepts,
+    /// as `override` and `effective` (identical) alongside an empty `defaults` — there is no
+    /// built-in preset list, the admin owns it entirely. A model absent from the map means the
+    /// provider is assumed to accept any voice string. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/voice-presets`
     ///
     /// Required scopes: `admin`.
-    public func adminGetVoicePresets(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminGetVoicePresets(options: RequestOptions = .init()) async throws -> AdminVoicePresets {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/voice-presets",
@@ -231,6 +320,13 @@ public struct AdminAPI: Sendable {
     }
 
     /// Admin: enumerate available built-in tools
+    ///
+    /// Returns the canonical built-in tool definitions the runtime actually serves — id,
+    /// description and JSON parameter schema — so a client renders an always-current list instead
+    /// of a hardcoded one. Platform-level overrides are merged in, so each row also carries an
+    /// effective category and description (admin override, then the tool catalogue, then the
+    /// definition, then the `system` default) and a `hidden` flag where one is set. SPEC-installed
+    /// tools are not included; those are tenant-scoped and listed per agent. Super-admin only.
     ///
     /// `GET /api/v1/admin/tools`
     ///
@@ -245,6 +341,11 @@ public struct AdminAPI: Sendable {
 
     /// List dead-lettered webhook deliveries
     ///
+    /// Lists every dead-lettered Stripe webhook event — the events whose handler failed and that
+    /// were parked instead of dropped — newest first by timestamp, each entry carrying the Stripe
+    /// event id, type, payload, the error that parked it and the tenant it was aimed at. Requires
+    /// the `admin` scope and super-admin identity.
+    ///
     /// `GET /api/v1/admin/webhooks/dlq`
     ///
     /// Required scopes: `admin`.
@@ -258,10 +359,21 @@ public struct AdminAPI: Sendable {
 
     /// Admin: set landing-page featured-agent config
     ///
+    /// Writes the landing-page configuration. An omitted field means no change and is read back
+    /// from the stored record — it used to mean "reset to default", and one partial PUT erased the
+    /// featured agent, nine partners and the locale lock in a single write — while an explicit
+    /// `null` still clears `public_agent_id` and `partners`. Text values and partner names and
+    /// taglines are sanitised at write time and empty strings are dropped rather than stored as
+    /// blanks. Passing `expected_version` makes the write a compare-and-set that answers 409 when
+    /// another admin saved first; omitting it keeps last-write-wins. A save that actually carries
+    /// identity — an agent, a text override or partners — marks the `platform_identity` setup step
+    /// complete. Writes an `admin.config_updated` audit entry and returns the new version.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/landing`
     ///
     /// Required scopes: `admin`.
-    public func adminPutLandingConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminPutLandingConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> AdminPutLandingConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/landing",
@@ -273,10 +385,18 @@ public struct AdminAPI: Sendable {
 
     /// Admin: replace curated model catalog
     ///
+    /// Replaces the curated model catalogue with the body's `models` array. A duplicate model id is
+    /// refused 422, because the downstream lookup map would drop it silently and leave a phantom
+    /// row. Passing `expected_version` makes the write a compare-and-set that answers 409 when
+    /// another admin saved first; omitting it keeps last-write-wins for scripts. On success the
+    /// runtime's catalogue cache is push-invalidated so the next run sees the new capabilities
+    /// rather than waiting out the TTL, an `admin.config_updated` audit entry is written, and the
+    /// new version is returned. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/model-catalog`
     ///
     /// Required scopes: `admin`.
-    public func adminPutModelCatalog(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminPutModelCatalog(body: JSONObject, options: RequestOptions = .init()) async throws -> AdminPutModelCatalogResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/model-catalog",
@@ -295,7 +415,7 @@ public struct AdminAPI: Sendable {
     /// `PUT /api/v1/admin/oauth-login-providers/{provider}`
     ///
     /// Required scopes: `admin`.
-    public func adminPutOAuthProvider(provider: OAuthLoginProviderItemId, body: AdminPutOAuthProviderRequest, options: RequestOptions = .init()) async throws -> AdminPutOAuthProviderResponse {
+    public func adminPutOAuthProvider(provider: OAuthLoginProviderConfigStatusProvider, body: OAuthLoginProviderConfigUpdate, options: RequestOptions = .init()) async throws -> OAuthLoginProviderConfigUpdateResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/oauth-login-providers/\(encodePathSegment(String(describing: provider)))",
@@ -307,10 +427,20 @@ public struct AdminAPI: Sendable {
 
     /// Admin: set default voice config
     ///
+    /// Sets the platform's default STT and TTS provider, model and voice, replacing the stored
+    /// record whole. Both providers must be registered or the call is refused. After the KV write
+    /// the values are mirrored into the live `container.config.runtime` — including the TTS
+    /// endpoint resolved from the provider record and the TTS price resolved from voice pricing —
+    /// because the synthesis tool reads that in-memory snapshot and would otherwise keep using the
+    /// previous model until the next restart; the mirror is best-effort and its failure does not
+    /// fail the save. This endpoint is the only way to set these settings: `PUT
+    /// /admin/config/runtime` refuses them. Writes an `admin.config_updated` audit entry.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/voice`
     ///
     /// Required scopes: `admin`.
-    public func adminPutVoiceConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminPutVoiceConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> AdminPutVoiceConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/voice",
@@ -322,10 +452,15 @@ public struct AdminAPI: Sendable {
 
     /// Admin: set per-model voice presets
     ///
+    /// Replaces the whole voice-preset map with the body; a model id the body omits loses its
+    /// presets rather than keeping them. Writes an `admin.config_updated` audit entry naming the
+    /// model ids and responds with the same view the GET returns. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/voice-presets`
     ///
     /// Required scopes: `admin`.
-    public func adminPutVoicePresets(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func adminPutVoicePresets(body: JSONObject, options: RequestOptions = .init()) async throws -> AdminVoicePresets {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/voice-presets",
@@ -336,6 +471,16 @@ public struct AdminAPI: Sendable {
     }
 
     /// Replay a dead-lettered webhook event
+    ///
+    /// Re-applies one dead-lettered Stripe event through the billing manager. The whole replay runs
+    /// under a per-event lock and the DLQ row is read inside it, so two concurrent replays cannot
+    /// both apply the same mutation. On success the event claims the same dedup key the live
+    /// webhook path uses, with its ten-day TTL, so a later Stripe re-delivery is not processed a
+    /// second time, and the DLQ row is deleted. An event the manager still cannot handle answers
+    /// 422 and a thrown handler 500, both updating the DLQ row's error and timestamp rather than
+    /// removing it; an unknown event id is 404 and a deployment with no billing configured is 501.
+    /// Every outcome writes a `billing.event` audit entry. Requires the `admin` scope and
+    /// super-admin identity.
     ///
     /// `POST /api/v1/admin/webhooks/dlq/{eventId}/replay`
     ///
@@ -349,12 +494,39 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Write a post by hand
+    ///
+    /// `source` is stamped `manual` and cannot be set by the caller. The slug is derived from the
+    /// title and made unique; `status` defaults to `draft`.
+    ///
+    /// `POST /api/v1/admin/blog/posts`
+    ///
+    /// Required scopes: `admin`.
+    public func createAdminBlogPost(body: CreateAdminBlogPostRequest, options: RequestOptions = .init()) async throws -> CreateAdminBlogPostResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/blog/posts",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Create custom provider
+    ///
+    /// Registers a custom provider: `id`, `name`, `default_endpoint` and optionally `canonical`,
+    /// `requires_api_key` and `default_capabilities`. When the provider requires a key, `api_key`
+    /// must be supplied in the same call — this platform has no per-tenant BYO tier, so a provider
+    /// registered without one would 404 on its first model call — and the key is stored on the same
+    /// path `PUT /admin/llm-defaults/{providerId}` writes. A duplicate id or a reserved id such as
+    /// `openai_compat` is 400. On success the model-catalogue and provider model caches are
+    /// invalidated, a `provider.created` audit entry is written, and the answer is 201. Super-admin
+    /// only.
     ///
     /// `POST /api/v1/admin/providers`
     ///
     /// Required scopes: `admin`.
-    public func createAdminProvider(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createAdminProvider(body: JSONObject, options: RequestOptions = .init()) async throws -> CreateAdminProviderResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/admin/providers",
@@ -365,6 +537,13 @@ public struct AdminAPI: Sendable {
     }
 
     /// Create new tenant
+    ///
+    /// Creates a tenant with a generated UUIDv7 id, writing the canonical `tenant` record and its
+    /// registry entry and registering it with the cron scheduler. `slug` defaults to a slugified
+    /// `name`, `status` to `active`, `plan` to `free`, and `quotas` and `settings` to the platform
+    /// defaults when omitted. Deliberately writes only the canonical record and not the
+    /// `tenant_meta` overlay, because suspend and reactivate act on the canonical row alone.
+    /// Answers 201 with the new tenant and writes a `tenant.created` audit entry. Super-admin only.
     ///
     /// `POST /api/v1/admin/tenants`
     ///
@@ -379,7 +558,196 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Delete a post
+    ///
+    /// Deletes one blog post and the slug index row that resolves it publicly. 404 when the post id
+    /// does not exist — the record is loaded before the method is dispatched — and 405 for a verb
+    /// other than PATCH or DELETE on this path. The delete is unconditional and leaves nothing to
+    /// restore from. Requires the `admin` scope and super-admin identity.
+    ///
+    /// `DELETE /api/v1/admin/blog/posts/{postId}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteAdminBlogPost(postId: String, options: RequestOptions = .init()) async throws -> DeleteAdminBlogPostResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/blog/posts/\(encodePathSegment(postId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Remove one provider's stored OAuth credentials
+    ///
+    /// Deletes the record outright — this is the only way to clear a stored credential, since the
+    /// PUT treats a blank value as "keep". Idempotent: deleting a provider that has nothing stored
+    /// is still 200.
+    ///
+    /// `DELETE /api/v1/admin/integration-oauth-providers/{provider}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteAdminIntegrationOAuthProvider(provider: GetAdminIntegrationOAuthProviderProvider, options: RequestOptions = .init()) async throws -> DeleteAdminIntegrationOAuthProviderResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/integration-oauth-providers/\(encodePathSegment(String(describing: provider)))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Remove the platform API key for a provider
+    ///
+    /// Drops the stored platform key. The PROVIDER survives — this is the key, not the definition;
+    /// `DELETE /api/v1/admin/providers/{providerId}` is the other one, and it removes a custom
+    /// provider outright.
+    ///
+    /// Answers `configured: false` for the provider, which is the same field `GET
+    /// /api/v1/admin/llm-defaults` reports per provider, so the caller can apply the answer without
+    /// a re-read.
+    ///
+    /// `DELETE /api/v1/admin/llm-defaults/{providerId}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteAdminLLMDefault(providerId: String, options: RequestOptions = .init()) async throws -> DeleteAdminLLMDefaultResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/llm-defaults/\(encodePathSegment(providerId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Remove a custom provider (super-admin, fresh MFA)
+    ///
+    /// Removes a CUSTOM provider and its settings. A built-in provider is not deletable and answers
+    /// 404 here — that 404 means "no such CUSTOM provider", not "no such provider", which is worth
+    /// knowing before reading it as a routing mistake.
+    ///
+    /// Gated on a fresh MFA challenge because it is irreversible: the definition and its settings
+    /// are deleted outright, not disabled. To stop using a provider without losing it, PATCH
+    /// `enabled: false` instead. To drop the platform API KEY while keeping the provider, use
+    /// `DELETE /api/v1/admin/llm-defaults/{providerId}` — a different route with a different
+    /// subject.
+    ///
+    /// `DELETE /api/v1/admin/providers/{providerId}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteAdminProvider(providerId: String, options: RequestOptions = .init()) async throws -> DeleteAdminProviderResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/providers/\(encodePathSegment(providerId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Take one address off the roster
+    ///
+    /// **Super-admin only.** The address is a path segment, so it arrives percent-encoded.
+    ///
+    /// `DELETE /api/v1/admin/testers/android/{email}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteAndroidTester(email: String, options: RequestOptions = .init()) async throws {
+        try await client.sendVoid(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/testers/android/\(encodePathSegment(email))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Stream the KV store as NDJSON
+    ///
+    /// Super-admin only. Streams one JSON object per line — `{key, value}` — and ends with a single
+    /// `{_meta: {...}}` line. Sensitive rows are WITHHELD unless `include_sensitive=1`, and the
+    /// footer's `withheld_sensitive_keys` says how many, so an operator sees that something was
+    /// held back rather than concluding the store is smaller than it is.
+    ///
+    /// `GET /api/v1/admin/data-explorer/export`
+    ///
+    /// Required scopes: `admin`.
+    public func exportDataExplorer(namespace: String? = nil, includeSensitive: ExportDataExplorerIncludeSensitive? = nil, options: RequestOptions = .init()) async throws -> String {
+        var query: [URLQueryItem] = []
+        if let namespace {
+            query.append(URLQueryItem(name: "namespace", value: namespace))
+        }
+        if let includeSensitive {
+            query.append(URLQueryItem(name: "include_sensitive", value: includeSensitive.rawValue))
+        }
+        return try await client.sendText(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/data-explorer/export",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Run the authoring agent now and create a post
+    ///
+    /// Generates immediately, ignoring `frequency` — this is the operator's manual trigger, not a
+    /// schedule nudge. Whether the result lands published or as a draft follows the stored
+    /// `auto_publish`.
+    ///
+    /// A generation that FAILS is **422**, not a 200 carrying an error field, so a client reads the
+    /// status. Success is **201**.
+    ///
+    /// `POST /api/v1/admin/blog/generate`
+    ///
+    /// Required scopes: `admin`.
+    public func generateAdminBlogPost(options: RequestOptions = .init()) async throws -> GenerateAdminBlogPostResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/blog/generate",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Get the blog's authoring configuration
+    ///
+    /// Super-admin only. Wrapped in `{config}` rather than returned bare — the whole blog surface
+    /// uses envelopes.
+    ///
+    /// `GET /api/v1/admin/blog/config`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminBlogConfig(options: RequestOptions = .init()) async throws -> GetAdminBlogConfigResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/blog/config",
+            options: options
+        ))
+    }
+
+    /// Read one provider's stored OAuth credentials (secret masked)
+    ///
+    /// **The response has two shapes and a client must handle both.** With nothing stored it is the
+    /// three-field form — `{provider, enabled: false, configured: false}` — and `client_id`,
+    /// `client_secret_hint` and `scopes` are ABSENT, not null. With a record stored, all six are
+    /// present.
+    ///
+    /// The secret is never echoed. `client_secret_hint` is the last four characters behind dots,
+    /// enough for an operator to confirm which credential is stored without seeing it, and it is
+    /// null when the stored secret is empty.
+    ///
+    /// `GET /api/v1/admin/integration-oauth-providers/{provider}`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminIntegrationOAuthProvider(provider: GetAdminIntegrationOAuthProviderProvider, options: RequestOptions = .init()) async throws -> GetAdminIntegrationOAuthProviderResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/integration-oauth-providers/\(encodePathSegment(String(describing: provider)))",
+            options: options
+        ))
+    }
+
     /// List platform API keys (masked)
+    ///
+    /// Lists the providers that have a platform-level API key configured, each with a masked
+    /// `key_hint` and `configured: true` — a provider with no key is simply absent. The response
+    /// also carries the platform's default and fallback provider, model and endpoint. Keys are
+    /// never returned in full. Super-admin only.
     ///
     /// `GET /api/v1/admin/llm-defaults`
     ///
@@ -394,10 +762,15 @@ public struct AdminAPI: Sendable {
 
     /// Get pricing configuration
     ///
+    /// Returns the effective billing pricing block — the stored KV override when one exists,
+    /// otherwise the boot config — with a `source` field saying which of the two answered. Values
+    /// are served from a short in-process cache. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/pricing`
     ///
     /// Required scopes: `admin`.
-    public func getAdminPricing(options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getAdminPricing(options: RequestOptions = .init()) async throws -> AdminPricingConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/pricing",
@@ -407,10 +780,15 @@ public struct AdminAPI: Sendable {
 
     /// Get single provider
     ///
+    /// Returns one registered provider with its admin settings, plus a catalogue status best-effort
+    /// read: how many of its models the agent-facing catalogue currently carries, their ids, and
+    /// the last sync timestamp when one exists. A KV failure on that status read degrades the field
+    /// rather than failing the request. 404 for an unknown provider id. Super-admin only.
+    ///
     /// `GET /api/v1/admin/providers/{providerId}`
     ///
     /// Required scopes: `admin`.
-    public func getAdminProvider(providerId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminProvider(providerId: String, options: RequestOptions = .init()) async throws -> AdminProvider {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/providers/\(encodePathSegment(providerId))",
@@ -419,6 +797,13 @@ public struct AdminAPI: Sendable {
     }
 
     /// Aggregate usage stats
+    ///
+    /// Aggregates usage across every tenant in the platform registry for one billing period:
+    /// tokens, runs, tool calls, cost and agent count, both totalled and broken down per tenant.
+    /// `period` is a `YYYY-MM` string and defaults to the current month. The response also carries
+    /// the scheduler's own capacity view — the concurrency ceiling it enforces now, the active run
+    /// count, and the persisted high-water mark with the ceiling that applied when that peak was
+    /// recorded. Super-admin only.
     ///
     /// `GET /api/v1/admin/stats`
     ///
@@ -433,6 +818,14 @@ public struct AdminAPI: Sendable {
 
     /// Trace delegation chain
     ///
+    /// Follows one delegation chain by scanning the caller's tenant for runs carrying that
+    /// `trace_id`, and returns each run's id, agent, status, parent run, timestamps, duration and a
+    /// truncated error. The scan pages the whole run prefix rather than reading a fixed window,
+    /// because runs list oldest-first and a windowed read answered an empty trace for anything
+    /// recent; a `truncated` flag says when the 50,000-row scan cap bound first, so an empty result
+    /// can be told apart from a capped one. The tenant comes from the auth context. Super-admin
+    /// only.
+    ///
     /// `GET /api/v1/admin/trace/{traceId}`
     ///
     /// Required scopes: `admin`.
@@ -446,10 +839,15 @@ public struct AdminAPI: Sendable {
 
     /// Get audit entries for a specific target
     ///
+    /// Returns every audit entry recorded against one target object. The target type comes from the
+    /// `type` query parameter and defaults to the literal `unknown`, so a caller that omits it
+    /// generally matches nothing rather than every type. Read-only; requires the `admin` role and
+    /// super-admin identity.
+    ///
     /// `GET /api/v1/admin/audit/{targetId}`
     ///
     /// Required scopes: `admin`.
-    public func getAuditForTarget(targetId: String, type: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getAuditForTarget(targetId: String, type: String? = nil, options: RequestOptions = .init()) async throws -> AdminAuditList {
         var query: [URLQueryItem] = []
         if let type {
             query.append(URLQueryItem(name: "type", value: type))
@@ -464,10 +862,15 @@ public struct AdminAPI: Sendable {
 
     /// EU AI Act conformity report
     ///
+    /// Generates the EU AI Act Annex VI conformity report for the calling admin's own tenant, taken
+    /// from the auth context rather than a parameter, and returns it as `sections` plus a rendered
+    /// `markdown` string. `?format=markdown` returns the markdown alone as `text/markdown` instead
+    /// of JSON. The report is computed on the fly; nothing is written. Super-admin only.
+    ///
     /// `GET /api/v1/admin/conformity-report`
     ///
     /// Required scopes: `admin`.
-    public func getConformityReport(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getConformityReport(options: RequestOptions = .init()) async throws -> ConformityReport {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/conformity-report",
@@ -477,11 +880,20 @@ public struct AdminAPI: Sendable {
 
     /// Immutable audit log
     ///
+    /// Queries the append-only, HMAC-chained audit log of agent-lifecycle and security events.
+    /// `tenant_id` is required and is 400 when absent; `limit` defaults to 100 and is capped at
+    /// 500, and a malformed value falls back to the default rather than returning an empty page.
+    /// `event_type` and `actor_agent_id` narrow the query. Reading another tenant's trail is itself
+    /// recorded: a cross-tenant query writes an `audit.cross_tenant_read` entry naming the actor,
+    /// the filters and the result count, while a query against the actor's own tenant does not.
+    /// Super-admin only.
+    ///
     /// `GET /api/v1/admin/immutable-audit`
     ///
     /// Required scopes: `admin`.
-    public func getImmutableAudit(agentId: String? = nil, event: String? = nil, from: String? = nil, to: String? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> GetImmutableAuditResponse {
+    public func getImmutableAudit(tenantId: String, agentId: String? = nil, event: String? = nil, from: String? = nil, to: String? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> GetImmutableAuditResponse {
         var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "tenant_id", value: tenantId))
         if let agentId {
             query.append(URLQueryItem(name: "agent_id", value: agentId))
         }
@@ -505,7 +917,54 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Full maintenance record
+    ///
+    /// The whole record, including who turned it on and when — the audit trail the public status
+    /// deliberately omits. **Super-admin only**, and a caller on the synthetic default tenant is
+    /// 401 rather than 403.
+    ///
+    /// `GET /api/v1/admin/maintenance`
+    ///
+    /// Required scopes: `admin`.
+    public func getMaintenanceState(options: RequestOptions = .init()) async throws -> MaintenanceState {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/maintenance",
+            options: options
+        ))
+    }
+
+    /// Platform revenue, host cost and margin
+    ///
+    /// Stripe subscriptions against real DigitalOcean spend, with the computed margin.
+    /// **Super-admin only.**
+    ///
+    /// Served from a short-lived cache; `cache` says whether this response was a hit, a miss, or a
+    /// forced recomputation. A Stripe or provider outage does not fail the call — the affected
+    /// block carries `error` and the rest is still served, so a partial answer is never mistaken
+    /// for zeros.
+    ///
+    /// `GET /api/v1/admin/economics`
+    ///
+    /// Required scopes: `admin`.
+    public func getPlatformEconomics(refresh: ExportDataExplorerIncludeSensitive? = nil, options: RequestOptions = .init()) async throws -> PlatformEconomics {
+        var query: [URLQueryItem] = []
+        if let refresh {
+            query.append(URLQueryItem(name: "refresh", value: refresh.rawValue))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/economics",
+            query: query,
+            options: options
+        ))
+    }
+
     /// Get tenant details
+    ///
+    /// Returns one tenant record — the `tenant_meta` overlay when present, otherwise the canonical
+    /// `tenant` row — with the live platform model defaults projected in and `primary_email` from
+    /// the owner index. 404 when neither record exists. Super-admin only.
     ///
     /// `GET /api/v1/admin/tenants/{tenantId}`
     ///
@@ -518,7 +977,32 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// One tenant's mission-framework overrides, and what they resolve to
+    ///
+    /// Answers both layers at once: `mef_config` is what an operator stored for this tenant,
+    /// `effective` is what the runtime will actually do. They differ whenever the platform is the
+    /// deciding factor — with the mission service absent, every effective flag is false no matter
+    /// what the tenant record says, so an operator reading only `mef_config` sees settings that do
+    /// nothing.
+    ///
+    /// `mef_config` is `null` when nothing is overridden, not an empty object.
+    ///
+    /// `GET /api/v1/admin/tenants/{tenantId}/mef-config`
+    ///
+    /// Required scopes: `admin`.
+    public func getTenantMefConfig(tenantId: String, options: RequestOptions = .init()) async throws -> TenantMefConfigResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/tenants/\(encodePathSegment(tenantId))/mef-config",
+            options: options
+        ))
+    }
+
     /// Get tenant usage metrics
+    ///
+    /// Returns one tenant's tracked usage for a billing period — tokens, runs, tool calls and cost.
+    /// `period` is a `YYYY-MM` string and defaults to the current month. A tenant with no recorded
+    /// usage answers 200 with zeroed counters rather than 404. Super-admin only.
     ///
     /// `GET /api/v1/admin/tenants/{tenantId}/usage`
     ///
@@ -536,10 +1020,42 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Restore an NDJSON dump into the KV store
+    ///
+    /// Super-admin only. Accepts the export's own format, either as a raw body or as
+    /// `multipart/form-data` with a `file` part. Rows the matching READ path refuses are refused
+    /// here too and counted in `refused_sensitive` — an import that wrote any key at all could
+    /// forge an `api_key_hash` row and mint a credential for any tenant from a pasted file. `_meta`
+    /// lines and rows without an array `key` are skipped. The response is 200 even when nothing was
+    /// imported: read `imported`, `skipped` and `errors`, never the status alone.
+    ///
+    /// `POST /api/v1/admin/data-explorer/import`
+    ///
+    /// Required scopes: `admin`.
+    public func importDataExplorer(body: ImportDataExplorerRequest, options: RequestOptions = .init()) async throws -> ImportDataExplorerResponse {
+        var parts: [MultipartPart] = []
+        parts.append(MultipartPart(name: "file", value: .file(body.file)))
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/data-explorer/import",
+            body: .multipart(parts),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Internal domain verification
     ///
+    /// Answers Caddy's on-demand TLS question — may a certificate be issued for this SNI. It is
+    /// dispatched before the authentication layer and is instead gated by a shared secret passed as
+    /// `?secret=` and compared in constant time: without `UARP_CADDY_INTERNAL_SECRET` configured
+    /// the endpoint answers 501 and names the missing switch, and a wrong or absent secret is 403.
+    /// A missing `domain` is 400. A bare IP, a known infrastructure host, a domain absent from the
+    /// public domain map, or one whose tenant's custom domain is not `verified` all answer 404; a
+    /// verified mapping answers `{"ok": true}`. Read-only.
+    ///
     /// `GET /api/v1/internal/verify-domain`
-    public func internalVerifyDomain(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func internalVerifyDomain(options: RequestOptions = .init()) async throws -> InternalVerifyDomainResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/internal/verify-domain",
@@ -547,7 +1063,75 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// List every post, drafts included
+    ///
+    /// The admin view: unlike the public blog read, drafts are included. Unpaged.
+    ///
+    /// `GET /api/v1/admin/blog/posts`
+    ///
+    /// Required scopes: `admin`.
+    public func listAdminBlogPosts(options: RequestOptions = .init()) async throws -> ListAdminBlogPostsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/blog/posts",
+            options: options
+        ))
+    }
+
+    /// Every tenant's custom domain, worst first
+    ///
+    /// **The order is the product.** Rows are sorted by problem severity — failed, then drift, then
+    /// renewal_due, then pending, then healthy — so an operator's eye lands on what is broken. A
+    /// client that re-sorts alphabetically throws that away and should sort back, or not sort at
+    /// all.
+    ///
+    /// Tenants with no custom domain are omitted entirely, so `count` is the number of configured
+    /// domains and not the number of tenants.
+    ///
+    /// Bounded: the tenant registry scan takes at most 5000 entries in one pass and is not paged,
+    /// so on a platform past that size this list is silently partial.
+    ///
+    /// `GET /api/v1/admin/domains/health`
+    ///
+    /// Required scopes: `admin`.
+    public func listAdminDomainHealth(options: RequestOptions = .init()) async throws -> ListAdminDomainHealthResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/domains/health",
+            options: options
+        ))
+    }
+
+    /// Which integration providers an operator has configured
+    ///
+    /// Super-admin only, and never returns a secret — provider id, an enabled bit, and whether
+    /// credentials exist at all. The dashboard uses it to decide which connector rows need a
+    /// "Configure" call to action.
+    ///
+    /// Distinct from `/api/v1/integrations/catalog`, which is tenant-facing and lists every known
+    /// connector regardless of OAuth-readiness.
+    ///
+    /// The list is the SUPPORTED set, not the stored set: every supported provider appears, with
+    /// `configured: false` where nothing is stored. So an empty result means the supported set is
+    /// empty, never that nothing is configured.
+    ///
+    /// `GET /api/v1/admin/integration-oauth-providers`
+    ///
+    /// Required scopes: `admin`.
+    public func listAdminIntegrationOAuthProviders(options: RequestOptions = .init()) async throws -> ListAdminIntegrationOAuthProvidersResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/integration-oauth-providers",
+            options: options
+        ))
+    }
+
     /// List providers with admin settings
+    ///
+    /// Lists every provider registered on the platform with its admin-side settings: name,
+    /// canonical adapter family, default endpoint, whether it is enabled, its `model_allowlist`,
+    /// and whether it requires an API key. Every provider is an admin-registered record — there are
+    /// no built-ins — so a fresh platform answers with an empty list. Super-admin only.
     ///
     /// `GET /api/v1/admin/providers`
     ///
@@ -560,7 +1144,76 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// The Android closed-testing roster
+    ///
+    /// **Super-admin only.** The addresses the owner works from when adding people to the Play
+    /// group. `count`, `not_yet_emailed` and `given_up` describe THIS PAGE, not the whole roster:
+    /// all three are computed over the rows returned, so a roster longer than `limit` under-reports
+    /// until every page is walked with `cursor`. `not_yet_emailed` counts rows no letter has gone
+    /// to; `given_up` counts the ones the backfill has stopped retrying after repeated refusals,
+    /// which need an eye rather than another pass.
+    ///
+    /// `GET /api/v1/admin/testers/android`
+    ///
+    /// Required scopes: `admin`.
+    public func listAndroidTesters(limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) async throws -> ListAndroidTestersResponse {
+        var query: [URLQueryItem] = []
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let cursor {
+            query.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/testers/android",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Stream every item returned by `listAndroidTesters`, following the `cursor` cursor until the
+    /// server reports no further pages.
+    public func listAndroidTestersAll(limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<AndroidTester, Error> {
+        autoPaginate(
+            fetch: { cursor in try await self.listAndroidTesters(limit: limit, cursor: cursor, options: options) },
+            items: { $0.testers },
+            cursor: { $0.cursor },
+            hasMore: { _ in nil }
+        )
+    }
+
+    /// The reports inbox
+    ///
+    /// Every report from every tenant, newest first. **Super-admin only.** `new_count` counts the
+    /// unresolved reports in the returned set, so a filtered list does not silently under-report
+    /// the backlog.
+    ///
+    /// `GET /api/v1/admin/feedback`
+    ///
+    /// Required scopes: `admin`.
+    public func listFeedback(status: ErrorReportStatus? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> ListFeedbackResponse {
+        var query: [URLQueryItem] = []
+        if let status {
+            query.append(URLQueryItem(name: "status", value: status.rawValue))
+        }
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/feedback",
+            query: query,
+            options: options
+        ))
+    }
+
     /// List all tenants (super admin only)
+    ///
+    /// Lists every tenant in the platform registry, up to 5000, each record enriched with the owner
+    /// address from the `tenant_primary_email` index. A record is read from the `tenant_meta`
+    /// overlay first and falls back to the canonical `tenant` row. When the registry is empty the
+    /// caller's own tenant is returned so the console is never blank. Super-admin only.
     ///
     /// `GET /api/v1/admin/tenants`
     ///
@@ -574,6 +1227,14 @@ public struct AdminAPI: Sendable {
     }
 
     /// Purge tenant
+    ///
+    /// Irreversibly deletes every KV row belonging to the tenant; there is no inverse anywhere in
+    /// the platform. The body must carry `confirm` equal to the tenant's id, name or slug or the
+    /// call is refused 422 naming the tenant, and `{"dry_run": true}` instead counts what would be
+    /// deleted without touching anything. A reserved platform namespace — any `__…__` id — is
+    /// refused 403, the shared destructive guard refuses a tenant under legal hold or in a
+    /// suspended or deleted status, and an admin who has enrolled MFA must present a fresh
+    /// challenge first. Super-admin only.
     ///
     /// `DELETE /api/v1/admin/tenants/{tenantId}`
     ///
@@ -589,10 +1250,16 @@ public struct AdminAPI: Sendable {
 
     /// Query admin audit log
     ///
+    /// Queries the operator audit trail `AuditLogger` writes. `limit` defaults to 50 and is clamped
+    /// to 1..500, `action` filters by audit action in the query, and `actor_id` filters the
+    /// returned page by `actor_key_id` afterwards. The path is matched exactly so that an unknown
+    /// `/admin/*` path 404s instead of falling through to this feed. Requires the `admin` role and
+    /// super-admin identity, as every `/admin` route does.
+    ///
     /// `GET /api/v1/admin/audit`
     ///
     /// Required scopes: `admin`.
-    public func queryAuditLog(limit: Int? = nil, action: String? = nil, actorId: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func queryAuditLog(limit: Int? = nil, action: String? = nil, actorId: String? = nil, options: RequestOptions = .init()) async throws -> AdminAuditList {
         var query: [URLQueryItem] = []
         if let limit {
             query.append(URLQueryItem(name: "limit", value: String(limit)))
@@ -613,10 +1280,14 @@ public struct AdminAPI: Sendable {
 
     /// Reactivate a suspended tenant
     ///
+    /// Clears the suspension on the tenant record and re-registers the tenant with the cron
+    /// scheduler. Takes no body and is idempotent for an already-active tenant; 404 when no tenant
+    /// record exists. Writes a `tenant.updated` audit entry. Super-admin only.
+    ///
     /// `PUT /api/v1/admin/tenants/{tenantId}/reactivate`
     ///
     /// Required scopes: `admin`.
-    public func reactivateTenant(tenantId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func reactivateTenant(tenantId: String, options: RequestOptions = .init()) async throws -> ReactivateTenantResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/tenants/\(encodePathSegment(tenantId))/reactivate",
@@ -625,7 +1296,44 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Store or update one provider's OAuth credentials
+    ///
+    /// WRITE SEMANTICS: merges, and the merge is what makes the route usable. An omitted or blank
+    /// `client_id` or `client_secret` keeps the stored one, so an operator can flip `enabled` or
+    /// rotate `scopes` WITHOUT re-pasting a secret they cannot read back. Blank counts as omitted
+    /// here: a whitespace-only value does not clear anything.
+    ///
+    /// The consequence is that there is no way to clear a credential through this route — DELETE
+    /// the provider instead.
+    ///
+    /// A FIRST write still needs both: with no stored record and either missing, the answer is 400.
+    /// `enabled` defaults to true on a first write and otherwise keeps its stored value. A present
+    /// `scopes` REPLACES the stored list.
+    ///
+    /// The response is the short form, not the record: `{provider, enabled, configured: true}`,
+    /// with no echo of the credentials just written.
+    ///
+    /// `PUT /api/v1/admin/integration-oauth-providers/{provider}`
+    ///
+    /// Required scopes: `admin`.
+    public func setAdminIntegrationOAuthProvider(provider: GetAdminIntegrationOAuthProviderProvider, body: SetAdminIntegrationOAuthProviderRequest, options: RequestOptions = .init()) async throws -> SetAdminIntegrationOAuthProviderResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/integration-oauth-providers/\(encodePathSegment(String(describing: provider)))",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Set platform API key
+    ///
+    /// Stores the platform-level API key for one provider — the key the runtime resolves for every
+    /// tenant that has none of its own — writing it to KV and into the in-memory key pool so the
+    /// next request picks it up without a restart. `api_key` must be 10 to 500 characters; anything
+    /// outside that is 400. Because rotating the key changes which account answers `/v1/models`,
+    /// the cached provider model metadata is dropped. Writes a `platform.llm_defaults.set` audit
+    /// entry naming the provider but never the key. Super-admin only.
     ///
     /// `PUT /api/v1/admin/llm-defaults/{providerId}`
     ///
@@ -642,10 +1350,19 @@ public struct AdminAPI: Sendable {
 
     /// Set default model config
     ///
+    /// Sets the platform's default and fallback provider, model and endpoint. Each named provider
+    /// must already be registered or the call is 400, and when the provider declares a model
+    /// allowlist the chosen model must be in it; an endpoint must be a public absolute URL, so
+    /// loopback, private-range and cloud-metadata hosts are refused because
+    /// `/providers/platform-defaults` republishes these values unauthenticated. An omitted endpoint
+    /// is backfilled from the provider's registered endpoint. Setting both a default provider and
+    /// model marks the `llm_provider` step of the setup wizard complete, and a
+    /// `platform.llm_defaults.set` audit entry is written. Super-admin only.
+    ///
     /// `PUT /api/v1/admin/llm-defaults/model-config`
     ///
     /// Required scopes: `admin`.
-    public func setAdminModelConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setAdminModelConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> SetAdminModelConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/llm-defaults/model-config",
@@ -655,12 +1372,46 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Turn maintenance mode on or off (super-admin)
+    ///
+    /// Undocumented until now, while the GET beside it was described in full — so a generated
+    /// client could READ the maintenance state and had no way to change it. The web has been
+    /// calling this all along (`lib/hooks/use-maintenance-mode.ts`).
+    ///
+    /// Answers the whole record back, the same shape the GET serves, so a client need not re-read
+    /// to learn `enabled_at` and `enabled_by_email`.
+    ///
+    /// WRITE SEMANTICS: replaces. The record is rebuilt from this body and written whole; nothing
+    /// is read first. Turning maintenance ON without a `message` DROPS the message a previous ON
+    /// had set, and turning it OFF wipes the message unconditionally, keeping only the timestamp
+    /// and the actor so the audit trail still shows who closed the window. `enabled_at` and
+    /// `enabled_by_email` are stamped on EVERY call, including one that changes nothing.
+    ///
+    /// `PUT /api/v1/admin/maintenance`
+    ///
+    /// Required scopes: `admin`.
+    public func setMaintenanceState(body: SetMaintenanceStateRequest, options: RequestOptions = .init()) async throws -> MaintenanceState {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/maintenance",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Suspend a tenant
+    ///
+    /// Marks the tenant suspended, unregisters it from the cron scheduler so its schedules stop
+    /// firing, and deletes its custom-domain row from the `__public__` domain index so the public
+    /// site stops resolving. The optional body field `reason` is stored and recorded in the
+    /// `tenant.suspended` audit entry; an absent or unparseable body defaults it. 404 when the
+    /// tenant record does not exist. Super-admin only.
     ///
     /// `PUT /api/v1/admin/tenants/{tenantId}/suspend`
     ///
     /// Required scopes: `admin`.
-    public func suspendTenant(tenantId: String, body: SuspendTenantRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func suspendTenant(tenantId: String, body: SuspendTenantRequest? = nil, options: RequestOptions = .init()) async throws -> SuspendTenantResponse {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "PUT",
@@ -671,12 +1422,90 @@ public struct AdminAPI: Sendable {
         ))
     }
 
+    /// Pull one provider's model list into the catalogue
+    ///
+    /// Asks the provider what models it offers and MERGES the result into the platform catalogue.
+    /// Additive only — nothing is removed, so a model the provider has withdrawn stays in the
+    /// catalogue until it is deleted deliberately.
+    ///
+    /// CUSTOM providers only: the 404 means "no custom provider with that id", so a built-in
+    /// provider id is also 404 here. `added` counts new entries, `scanned` is the provider's
+    /// reported inventory, and `total` is the catalogue size after the merge — so `added` is zero
+    /// on a run that changed nothing, which is the normal result of a second run.
+    ///
+    /// `POST /api/v1/admin/providers/{providerId}/sync-models`
+    ///
+    /// Required scopes: `admin`.
+    public func syncProviderModels(providerId: String, options: RequestOptions = .init()) async throws -> SyncProviderModelsResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/providers/\(encodePathSegment(providerId))/sync-models",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Update the blog's authoring configuration
+    ///
+    /// WRITE SEMANTICS: merges. The body is spread over the stored record, so an omitted field
+    /// keeps its value.
+    ///
+    /// One field is not a plain merge: setting `agent_id` also pins `agent_tenant_id` to the
+    /// CALLING tenant, because the cron that auto-writes posts runs without a request context and
+    /// would otherwise have no tenant to run the agent in. Clearing `agent_id` to `null` nulls
+    /// both. `agent_tenant_id` is therefore never sent by a client and never has to be — it is
+    /// derived.
+    ///
+    /// Answers the stored record, so a client sees what took effect.
+    ///
+    /// `PUT /api/v1/admin/blog/config`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminBlogConfig(body: UpdateAdminBlogConfigRequest, options: RequestOptions = .init()) async throws -> UpdateAdminBlogConfigResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/blog/config",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Edit a post
+    ///
+    /// WRITE SEMANTICS: merges. An omitted field keeps its value; `tags` present REPLACES the list.
+    ///
+    /// Three things move on their own and a client should not try to send them. Editing the `title`
+    /// or the `body` re-stamps `source` to `manual`, even on a post the agent wrote — the record
+    /// then says who last shaped it rather than who started it. Changing the `title` mints a new
+    /// unique `slug`, so a published post's URL changes under it. And `published_at` follows
+    /// `status`: it is stamped on the first transition to `published` and set back to null on
+    /// `draft`, so a republished post carries a NEW timestamp rather than its original one.
+    ///
+    /// `PATCH /api/v1/admin/blog/posts/{postId}`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminBlogPost(postId: String, body: UpdateAdminBlogPostRequest, options: RequestOptions = .init()) async throws -> UpdateAdminBlogPostResponse {
+        return try await client.send(RequestSpec(
+            method: "PATCH",
+            path: "/api/v1/admin/blog/posts/\(encodePathSegment(postId))",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update pricing configuration
+    ///
+    /// Replaces the stored pricing override with the current effective pricing merged field by
+    /// field with the body, so a rate the body omits keeps its current value. The write refreshes
+    /// the in-process cache and fans out to `ConfigStore` subscribers; a fan-out failure is logged
+    /// and does not undo the KV write. Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/pricing`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminPricing(body: JSONObject? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func updateAdminPricing(body: JSONObject? = nil, options: RequestOptions = .init()) async throws -> UpdateAdminPricingResponse {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "PUT",
@@ -689,10 +1518,19 @@ public struct AdminAPI: Sendable {
 
     /// Update provider
     ///
+    /// Updates one provider's admin settings: `enabled` and `model_allowlist` are merged into the
+    /// provider-settings row, while `requires_api_key` and `canonical` are written onto the
+    /// provider record itself and invalidate the model-catalogue cache. Supplying `api_key` rotates
+    /// the platform key for this provider and refreshes the in-memory pool; there is no way to
+    /// clear a key here — that is `DELETE /admin/llm-defaults/{providerId}` — so an omitted
+    /// `api_key` never means "remove it". 404 for an unknown provider. Writes a `provider.updated`
+    /// audit entry, and a separate `platform.llm_defaults.set` entry when a key was rotated.
+    /// Super-admin only.
+    ///
     /// `PATCH /api/v1/admin/providers/{providerId}`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminProvider(providerId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminProvider(providerId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminProviderResponse {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/admin/providers/\(encodePathSegment(providerId))",
@@ -704,10 +1542,17 @@ public struct AdminAPI: Sendable {
 
     /// Update tenant settings
     ///
+    /// Updates the narrow slice of tenant settings an operator may change directly:
+    /// `egress_allowlist`, `max_retention_days` and the `legal_hold` flag. An omitted field is left
+    /// as it was. The canonical `tenant` record is updated through a compare-and-set so a
+    /// concurrent suspend or plan sync cannot clobber it from a stale snapshot, and the
+    /// `tenant_meta` overlay is kept in step only when it already exists. 404 when neither record
+    /// exists. Writes a `tenant.updated` audit entry naming the changed keys. Super-admin only.
+    ///
     /// `PATCH /api/v1/admin/tenants/{tenantId}/settings`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminTenantSettings(tenantId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminTenantSettings(tenantId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminTenantSettingsResponse {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/admin/tenants/\(encodePathSegment(tenantId))/settings",
@@ -717,14 +1562,87 @@ public struct AdminAPI: Sendable {
         ))
     }
 
-    /// Update tenant
+    /// Mark one feedback report resolved, or reopen it
     ///
-    /// `PATCH /api/v1/admin/tenants/{tenantId}`
+    /// **Only the exact string `resolved` resolves a report; every other value sets it to `new`.**
+    /// There is no validation and no error path: `"Resolved"`, `"closed"`, a typo, a missing
+    /// `status`, or a body that is not JSON at all are each accepted with 200 and REOPEN a resolved
+    /// report. A client must send the literal value and must not rely on being told when it did
+    /// not.
+    ///
+    /// WRITE SEMANTICS: replaces the status field only; nothing else on the report is touched.
+    ///
+    /// `PATCH /api/v1/admin/feedback/{reportId}`
     ///
     /// Required scopes: `admin`.
-    public func updateTenant(tenantId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> Tenant {
+    public func updateFeedbackReportStatus(reportId: String, body: UpdateFeedbackReportStatusRequest? = nil, options: RequestOptions = .init()) async throws -> UpdateFeedbackReportStatusResponse {
+        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "PATCH",
+            path: "/api/v1/admin/feedback/\(encodePathSegment(reportId))",
+            body: encodedBody,
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Set or clear one tenant's mission-framework overrides
+    ///
+    /// WRITE SEMANTICS: merges, per key. Only the four known keys are read; a key the body omits
+    /// keeps its stored value, and a key sent as `null` CLEARS that override so the flag falls back
+    /// to the platform default. Unknown keys are ignored silently rather than rejected.
+    ///
+    /// A non-boolean, non-null value for a known key is **422**. Note the title on that one is
+    /// `ValidationError` without a space, unlike the `Validation Error` used elsewhere on this
+    /// surface.
+    ///
+    /// When clearing the last override leaves nothing set, the whole `mef_config` is dropped rather
+    /// than stored as `{}` — a later read answers `null`. And every accepted request writes: even a
+    /// body that changes nothing stamps a new `updated_at` on the tenant record.
+    ///
+    /// Answers the same body as the GET, so a client sees both the stored overrides and what they
+    /// now resolve to.
+    ///
+    /// `PATCH /api/v1/admin/tenants/{tenantId}/mef-config`
+    ///
+    /// Required scopes: `admin`.
+    public func updateTenantMefConfig(tenantId: String, body: UpdateTenantMefConfigRequest, options: RequestOptions = .init()) async throws -> TenantMefConfigResponse {
+        return try await client.send(RequestSpec(
+            method: "PATCH",
+            path: "/api/v1/admin/tenants/\(encodePathSegment(tenantId))/mef-config",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Set a tenant's plan (super-admin)
+    ///
+    /// The operator's manual plan grant, undocumented while GET, PATCH and DELETE on this same path
+    /// were described. It is not a general tenant update: `plan` is required and it is what the
+    /// route is for.
+    ///
+    /// WRITE SEMANTICS: mixed. The write is a compare-and-set MERGE onto the current record, so
+    /// `name`, `slug` and `quota_overrides` keep their stored values when omitted. `plan` and
+    /// `quotas` do not: both are written on every call, and omitting `quotas` REPLACES the tenant
+    /// quotas with the resolved plan defaults rather than leaving them alone. A caller raising one
+    /// dimension must send `quota_overrides`, not `quotas`.
+    ///
+    /// `quotas` REPLACES the plan's quotas for this tenant. `quota_overrides` is the durable one —
+    /// a partial grant that survives a later Stripe subscription change, where a plain `quotas`
+    /// write does not. When a tenant's plan keeps reverting, the override is the field that makes
+    /// it stick, and it must be set BEFORE the plan is put back, not after.
+    ///
+    /// Granting any paid plan clears a stale `billing_status` (a "cancelled" left over from an
+    /// earlier Stripe cancellation becomes "active"); a downgrade to free leaves the status alone,
+    /// since free is never gated.
+    ///
+    /// `PUT /api/v1/admin/tenants/{tenantId}`
+    ///
+    /// Required scopes: `admin`.
+    public func updateTenantPlan(tenantId: String, body: UpdateTenantPlanRequest, options: RequestOptions = .init()) async throws -> UpdateTenantPlanResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
             path: "/api/v1/admin/tenants/\(encodePathSegment(tenantId))",
             body: try client.encode(body),
             idempotent: true,

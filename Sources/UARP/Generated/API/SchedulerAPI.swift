@@ -10,10 +10,15 @@ public struct SchedulerAPI: Sendable {
 
     /// Get agent schedule
     ///
+    /// Returns the agent's schedule flattened into one object — the cron configuration together
+    /// with `status`, `next_fire_at`, `last_fired_at` and `consecutive_failures`. An agent with no
+    /// schedule is answered `200` with a body of `null`, not `404`, so "never scheduled" and "no
+    /// such agent" are not distinguished here.
+    ///
     /// `GET /api/v1/agents/{agentId}/schedule`
     ///
     /// Required scopes: `agents:read`.
-    public func getSchedule(agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getSchedule(agentId: String, options: RequestOptions = .init()) async throws -> Schedule {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/schedule",
@@ -21,12 +26,32 @@ public struct SchedulerAPI: Sendable {
         ))
     }
 
+    /// List every agent schedule
+    ///
+    /// One call for the whole tenant, so a canvas can badge scheduled agents without a per-agent
+    /// fetch. `agent_name` is resolved for display and is absent when the agent record is gone — a
+    /// schedule outliving its agent is exactly the case worth showing.
+    ///
+    /// `GET /api/v1/schedules`
+    public func listSchedules(options: RequestOptions = .init()) async throws -> ListSchedulesResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/schedules",
+            options: options
+        ))
+    }
+
     /// Remove agent schedule
+    ///
+    /// Removes the agent's schedule so it stops firing, and returns `{removed: true, agent_id}`.
+    /// Requires the `agents.delete` permission in addition to the `agents:write` scope. Idempotent
+    /// and unconditional — an agent that had no schedule answers the same way. Runs already created
+    /// by earlier fires are untouched.
     ///
     /// `DELETE /api/v1/agents/{agentId}/schedule`
     ///
     /// Required scopes: `agents:write`.
-    public func removeSchedule(agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func removeSchedule(agentId: String, options: RequestOptions = .init()) async throws -> RemoveScheduleResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/schedule",
@@ -37,10 +62,20 @@ public struct SchedulerAPI: Sendable {
 
     /// Set/update agent schedule
     ///
+    /// WRITE SEMANTICS: replaces wholesale — there is no partial path, so a field the body omits is
+    /// reset to its default (`enabled` true, `input` `{}`, `timezone` `UTC`,
+    /// `max_concurrent_scheduled` 1, `on_failure` `retry_next`) rather than kept. `cron` is
+    /// required and must be exactly five fields; it is parsed for well-formedness and refused `422`
+    /// when the minute field resolves to a cadence faster than every five minutes (explicit
+    /// comma-lists of literal minutes are the deliberate exception). `timezone` must be a real IANA
+    /// name, or the schedule would save as active and never fire. Scheduling is refused for agents
+    /// that run on a local bridge, since a cron fire would create a cloud run the bridge never
+    /// claims, and setting a schedule on a platform agent is super-admin only.
+    ///
     /// `PUT /api/v1/agents/{agentId}/schedule`
     ///
     /// Required scopes: `agents:write`.
-    public func setSchedule(agentId: String, body: SetScheduleRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func setSchedule(agentId: String, body: SetScheduleRequest, options: RequestOptions = .init()) async throws -> ScheduleEntry {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/schedule",

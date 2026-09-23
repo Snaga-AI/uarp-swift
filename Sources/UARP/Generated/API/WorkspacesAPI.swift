@@ -10,15 +10,22 @@ public struct WorkspacesAPI: Sendable {
 
     /// Assign agent/team/company to workspace
     ///
+    /// Binds the workspace to exactly one of `agent_id`, `team_id` or `company_id`; sending none of
+    /// them is 400 and only the first present one is acted on. The owning record is updated to
+    /// point back at the workspace. Assigning an agent does more: it merges the workspace file
+    /// tools into the agent's built-in tools — plus `code_interpreter` and `run_command` when those
+    /// are enabled on the deployment — and appends the matching instruction fragments to the
+    /// agent's system prompt if they are not already there. 404 when the workspace is not in the
+    /// active tenant.
+    ///
     /// `POST /api/v1/workspaces/{workspaceId}/assign`
     ///
     /// Required scopes: `files:write`.
-    public func assignWorkspace(workspaceId: String, body: AssignWorkspaceRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func assignWorkspace(workspaceId: String, body: AssignWorkspaceRequest, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/assign",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -26,10 +33,14 @@ public struct WorkspacesAPI: Sendable {
 
     /// Copy a file within the workspace
     ///
+    /// Stores the bytes again under the new path (workspace-store.ts copyFile → storeFile): a NEW
+    /// `file_id` and its own record come back, 201; the source is untouched. Body: `source_path`,
+    /// `dest_path` (the move route spells them `from_path`/`to_path`).
+    ///
     /// `POST /api/v1/workspaces/{workspaceId}/files/copy`
     ///
     /// Required scopes: `files:write`.
-    public func copyWorkspaceFile(workspaceId: String, body: CopyWorkspaceFileRequest, options: RequestOptions = .init()) async throws -> CopyWorkspaceFileResponse {
+    public func copyWorkspaceFile(workspaceId: String, body: CopyWorkspaceFileRequest, options: RequestOptions = .init()) async throws -> WorkspaceFile {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files/copy",
@@ -41,15 +52,18 @@ public struct WorkspacesAPI: Sendable {
 
     /// Create a workspace
     ///
+    /// Creates a standalone workspace, not bound to an agent, team or company until it is assigned.
+    /// The tenant's workspace quota is enforced first (403 when full). `name` is optional and
+    /// defaults to "New Workspace". Answers 201 with the workspace record.
+    ///
     /// `POST /api/v1/workspaces`
     ///
     /// Required scopes: `files:write`.
-    public func create(body: CreateWorkspaceRequest? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func create(body: CreateWorkspaceRequest, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/workspaces",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -57,11 +71,18 @@ public struct WorkspacesAPI: Sendable {
 
     /// Delete workspace and all files
     ///
+    /// Deletes the workspace and every file in it, in the active tenant only. Refused while the
+    /// tenant is under legal hold or suspended, and a `workspace.deleted` audit row is written
+    /// before the cascade so a crash mid-way still leaves a trace. When the tenant's
+    /// `shared_workspace_id` named this workspace the pointer is cleared, so later reads stop
+    /// advertising a workspace that is gone. Answers 204, or 404 when the workspace is unknown.
+    /// There is no undo — this is not the trash.
+    ///
     /// `DELETE /api/v1/workspaces/{workspaceId}`
     ///
     /// Required scopes: `files:write`.
-    public func delete(workspaceId: String, options: RequestOptions = .init()) async throws -> JSONValue {
-        return try await client.send(RequestSpec(
+    public func delete(workspaceId: String, options: RequestOptions = .init()) async throws {
+        try await client.sendVoid(RequestSpec(
             method: "DELETE",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))",
             idempotent: true,
@@ -71,12 +92,22 @@ public struct WorkspacesAPI: Sendable {
 
     /// Delete a file
     ///
+    /// Deletes the file or folder named by the required `path` query parameter. For a human caller
+    /// (JWT auth) the file is moved to `.trash/console/…` with a manifest row and the response says
+    /// `trashed: true` with the trash path, so it can be restored; `?trash=false` forces a
+    /// permanent delete. API-key callers always delete permanently. When the path is not a file the
+    /// handler falls through to deleting a folder and everything beneath it, answering 204; 404
+    /// when neither a file nor a folder matches.
+    ///
     /// `DELETE /api/v1/workspaces/{workspaceId}/files`
     ///
     /// Required scopes: `files:write`.
-    public func deleteWorkspaceFile(workspaceId: String, path: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func deleteWorkspaceFile(workspaceId: String, path: String, trash: DeleteWorkspaceFileTrash? = nil, options: RequestOptions = .init()) async throws -> DeleteWorkspaceFileResponse {
         var query: [URLQueryItem] = []
         query.append(URLQueryItem(name: "path", value: path))
+        if let trash {
+            query.append(URLQueryItem(name: "trash", value: trash.rawValue))
+        }
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files",
@@ -88,13 +119,21 @@ public struct WorkspacesAPI: Sendable {
 
     /// Download file content
     ///
+    /// Streams the bytes of the file named by the required `path` query parameter, resolving the
+    /// owning tenant through the caller's memberships when the active tenant does not hold the
+    /// workspace. `If-None-Match` against the underlying artifact's sha256 answers 304.
+    /// `Content-Disposition` is `inline` for images other than SVG, PDFs, audio and video and
+    /// `attachment` otherwise. A file stored as `application/octet-stream` has its type re-detected
+    /// from the extension for this response and the correction written back to the record. 404 when
+    /// the file record or its bytes are missing.
+    ///
     /// `GET /api/v1/workspaces/{workspaceId}/files/content`
     ///
     /// Required scopes: `files:read`.
-    public func downloadWorkspaceFile(workspaceId: String, path: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func downloadWorkspaceFile(workspaceId: String, path: String, options: RequestOptions = .init()) async throws -> Data {
         var query: [URLQueryItem] = []
         query.append(URLQueryItem(name: "path", value: path))
-        return try await client.send(RequestSpec(
+        return try await client.sendData(RequestSpec(
             method: "GET",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files/content",
             query: query,
@@ -103,6 +142,13 @@ public struct WorkspacesAPI: Sendable {
     }
 
     /// Permanently empty workspace trash
+    ///
+    /// Permanently deletes every file the trash manifest names; nothing here is recoverable
+    /// afterwards. Human callers only — an API key is refused with 403. The store, not the route,
+    /// validates each manifest row and refuses any whose path is not inside `.trash/`, reporting
+    /// them as `refused_paths` so a manifest row naming a live file cannot turn "empty the trash"
+    /// into deleting it. The response carries `deleted_count` and the action is audit-logged as
+    /// `workspace.trash_emptied`.
     ///
     /// `DELETE /api/v1/workspaces/{workspaceId}/trash`
     ///
@@ -118,10 +164,15 @@ public struct WorkspacesAPI: Sendable {
 
     /// Get workspace metadata
     ///
+    /// Returns the workspace record enriched with a computed `file_count` and `total_size_bytes`,
+    /// which are derived by listing its files on each read. When the active tenant does not hold
+    /// the workspace the caller's other verified memberships are walked, so a multi-tenant user can
+    /// read a workspace that lives in another of their tenants; 404 when none does.
+    ///
     /// `GET /api/v1/workspaces/{workspaceId}`
     ///
     /// Required scopes: `files:read`.
-    public func get(workspaceId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func get(workspaceId: String, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))",
@@ -129,7 +180,38 @@ public struct WorkspacesAPI: Sendable {
         ))
     }
 
+    /// Bytes of a prior version
+    ///
+    /// `version` is a `file_id` from `listWorkspaceFileHistory` and must belong to `path`'s history
+    /// — any other id is 404. Served with the version's own `Content-Type`, its `Content-Length`,
+    /// and `Cache-Control: private, max-age=3600`.
+    ///
+    /// `GET /api/v1/workspaces/{workspaceId}/files/history/content`
+    ///
+    /// Required scopes: `files:read`.
+    public func getWorkspaceFileHistoryContent(workspaceId: String, path: String, version: String, options: RequestOptions = .init()) async throws -> Data {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "path", value: path))
+        query.append(URLQueryItem(name: "version", value: version))
+        return try await client.sendData(RequestSpec(
+            method: "GET",
+            path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files/history/content",
+            query: query,
+            options: options
+        ))
+    }
+
     /// WebSocket terminal session for workspace
+    ///
+    /// Upgrades the connection to a WebSocket carrying an interactive shell; the request must send
+    /// `Upgrade: websocket`, or no other branch claims it. Four gates apply: the deployment must
+    /// set `run_command.terminal_enabled` (403 — enabling the sandboxed `run_command` does not
+    /// enable this), the workspace must exist in the caller's active tenant (404), and the caller
+    /// needs the admin role and the `files:write` scope. The shell is a `sh -i` on the API host
+    /// with a deliberately minimal environment — no host credentials are inherited — and its
+    /// working directory is the server's own, not the workspace. Socket messages are written to the
+    /// shell's stdin and its stdout and stderr are sent back; closing the socket terminates the
+    /// process.
     ///
     /// `GET /api/v1/workspaces/{workspaceId}/terminal`
     ///
@@ -144,6 +226,10 @@ public struct WorkspacesAPI: Sendable {
 
     /// List all workspaces
     ///
+    /// Lists the workspaces in the active tenant — those owned by an agent, a team or a company as
+    /// well as standalone ones — with a `total`. Requires files read permission and the
+    /// `files:read` scope. Metadata only; no file counts.
+    ///
     /// `GET /api/v1/workspaces`
     ///
     /// Required scopes: `files:read`.
@@ -157,10 +243,18 @@ public struct WorkspacesAPI: Sendable {
 
     /// List agent workspace files (shortcut)
     ///
+    /// Shortcut that resolves the agent's own workspace and lists one directory of it, selected by
+    /// `path`. It provisions on read: an agent with no workspace of its own adopts the one its
+    /// `workspace_id` names, or else a new workspace is created — spending the tenant's workspace
+    /// quota (403 when full) and writing `workspace_id` back onto the agent. Only GET is served on
+    /// this path and authorization runs before any of that, so a caller without files read access
+    /// causes no writes. 404 when the agent does not exist. The listing is not recursive and omits
+    /// the `updated_at`/`etag` the workspace-keyed listing carries.
+    ///
     /// `GET /api/v1/agents/{agentId}/workspace/files`
     ///
     /// Required scopes: `agents:read`.
-    public func listAgentWorkspaceFiles(agentId: String, path: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listAgentWorkspaceFiles(agentId: String, path: String? = nil, options: RequestOptions = .init()) async throws -> ListAgentWorkspaceFilesResponse {
         var query: [URLQueryItem] = []
         if let path {
             query.append(URLQueryItem(name: "path", value: path))
@@ -173,15 +267,47 @@ public struct WorkspacesAPI: Sendable {
         ))
     }
 
+    /// Prior versions of a file
+    ///
+    /// Every earlier version kept for `path`, newest first; the current content is not in the list.
+    /// `versions` is empty for a file that has never been overwritten (measured 2026-09-10); a
+    /// workspace that does not exist answers **404**. Read a version's bytes with
+    /// `getWorkspaceFileHistoryContent`.
+    ///
+    /// `GET /api/v1/workspaces/{workspaceId}/files/history`
+    ///
+    /// Required scopes: `files:read`.
+    public func listWorkspaceFileHistory(workspaceId: String, path: String, options: RequestOptions = .init()) async throws -> ListWorkspaceFileHistoryResponse {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "path", value: path))
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files/history",
+            query: query,
+            options: options
+        ))
+    }
+
     /// List files in workspace directory
+    ///
+    /// Lists one directory of the workspace: `path` selects the directory (the root when omitted)
+    /// and `recursive=true` walks the whole subtree instead of one level. Returns `directories` and
+    /// a `files` array projected to `file_id`, `path`, `filename`, `mime_type`, `size_bytes`,
+    /// `created_at`, `updated_at` and `etag` — the `etag` is what a conditional write sends back as
+    /// `If-Match`. Cross-tenant resolution applies; a workspace that does not exist, or that the
+    /// caller cannot resolve, answers **404** — an empty listing always means an existing, empty
+    /// directory.
     ///
     /// `GET /api/v1/workspaces/{workspaceId}/files`
     ///
     /// Required scopes: `files:read`.
-    public func listWorkspaceFiles(workspaceId: String, path: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listWorkspaceFiles(workspaceId: String, path: String? = nil, recursive: Bool? = nil, options: RequestOptions = .init()) async throws -> ListWorkspaceFilesResponse {
         var query: [URLQueryItem] = []
         if let path {
             query.append(URLQueryItem(name: "path", value: path))
+        }
+        if let recursive {
+            query.append(URLQueryItem(name: "recursive", value: String(recursive)))
         }
         return try await client.send(RequestSpec(
             method: "GET",
@@ -192,6 +318,11 @@ public struct WorkspacesAPI: Sendable {
     }
 
     /// List trashed files in workspace
+    ///
+    /// Lists what is recoverable in the workspace's trash, read from the `.trash/_manifest.json`
+    /// file. Human callers only: an API key is refused with 403, since agents read their trash
+    /// through their own tool. A workspace with no manifest, or one that does not parse, answers
+    /// 200 with an empty list rather than an error.
     ///
     /// `GET /api/v1/workspaces/{workspaceId}/trash`
     ///
@@ -206,10 +337,15 @@ public struct WorkspacesAPI: Sendable {
 
     /// Move/rename a file
     ///
+    /// Renames the record in place (workspace-store.ts moveFile): the SAME `file_id` comes back
+    /// with the new `path` — a client holding the id keeps a live key. The content and its `etag`
+    /// do not change. Answers 200. Body: `from_path`, `to_path` (the copy route spells them
+    /// `source_path`/`dest_path`; both stay as they are).
+    ///
     /// `POST /api/v1/workspaces/{workspaceId}/files/move`
     ///
     /// Required scopes: `files:write`.
-    public func moveWorkspaceFile(workspaceId: String, body: MoveWorkspaceFileRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func moveWorkspaceFile(workspaceId: String, body: MoveWorkspaceFileRequest, options: RequestOptions = .init()) async throws -> WorkspaceFile {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files/move",
@@ -219,12 +355,55 @@ public struct WorkspacesAPI: Sendable {
         ))
     }
 
+    /// Mint a public share link for an HTML snapshot
+    ///
+    /// Stores a self-contained HTML page (assets already inlined by the client, ≤3 MB) under an
+    /// opaque token for seven days; `GET /public/share/{token}` serves it back as JSON data for the
+    /// sandboxed viewer, never as executable HTML. The workspace id is not consulted beyond scope.
+    ///
+    /// `POST /api/v1/workspaces/{workspaceId}/publish`
+    ///
+    /// Required scopes: `files:write`.
+    public func publishWorkspaceSnapshot(workspaceId: String, body: PublishWorkspaceSnapshotRequest, options: RequestOptions = .init()) async throws -> PublishWorkspaceSnapshotResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/publish",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Restore a trashed file to its original path
+    ///
+    /// Restores one trashed file to the path it was deleted from, using the same store method the
+    /// agent's trash tool uses. Human callers only — an API key is refused with 403. `trash_path`
+    /// is required and must be a non-empty string (400). 404 when no manifest row names that trash
+    /// path, and 410 when the row exists but the bytes behind it are gone — a distinct answer, not
+    /// a missing entry. Returns the original path it was restored to.
+    ///
+    /// `POST /api/v1/workspaces/{workspaceId}/trash/restore`
+    ///
+    /// Required scopes: `files:write`.
+    public func restoreWorkspaceTrash(workspaceId: String, body: RestoreWorkspaceTrashRequest, options: RequestOptions = .init()) async throws -> RestoreWorkspaceTrashResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/trash/restore",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Revoke workspace sharing
+    ///
+    /// Removes the agent from the workspace's `shared_with` list and returns the updated workspace;
+    /// the workspace and its files are untouched. `POST` the share again to restore access.
     ///
     /// `DELETE /api/v1/workspaces/{workspaceId}/share/{agentId}`
     ///
     /// Required scopes: `files:write`.
-    public func revokeWorkspaceShare(workspaceId: String, agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func revokeWorkspaceShare(workspaceId: String, agentId: String, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/share/\(encodePathSegment(agentId))",
@@ -234,6 +413,13 @@ public struct WorkspacesAPI: Sendable {
     }
 
     /// Execute shell command in workspace
+    ///
+    /// Runs a shell command inside the workspace through the same sandboxed handler the agent's
+    /// `run_command` tool uses, and returns its combined output. Refused with 403 unless
+    /// `run_command` is enabled on the deployment. `command` is required; `workdir` is interpreted
+    /// relative to the workspace root and `timeout_sec` bounds the execution. Requires files write
+    /// permission and the `files:write` scope. Side effects are whatever the command does to the
+    /// workspace.
     ///
     /// `POST /api/v1/workspaces/{workspaceId}/run-command`
     ///
@@ -249,6 +435,16 @@ public struct WorkspacesAPI: Sendable {
     }
 
     /// Search files in workspace
+    ///
+    /// Searches the text content of the workspace's files for `q`. An empty `q` answers an empty
+    /// result set rather than matching everything. `glob` filters candidate paths and `regex=true`
+    /// treats `q` as a regular expression — one screened first for catastrophic backtracking and
+    /// refused with 400 if unsafe, or if it does not compile. The search is bounded rather than
+    /// exhaustive: at most 500 paths considered, 100 files read and 300 matches returned, and only
+    /// text MIME types are opened, so a missing hit may mean the bound was reached. Each result
+    /// carries the path, line number, the whole line and the matched text. Cross-tenant resolution
+    /// applies; a workspace that does not exist, or that the caller cannot resolve, answers
+    /// **404**.
     ///
     /// `GET /api/v1/workspaces/{workspaceId}/search`
     ///
@@ -272,10 +468,15 @@ public struct WorkspacesAPI: Sendable {
 
     /// Share workspace with an agent
     ///
+    /// Grants one agent access to this workspace in addition to its owner, so the agent's file
+    /// tools can read and write here. `agent_id` is required. Active tenant only — 404 when the
+    /// workspace is not in it. Returns the updated workspace record; revoking is a separate delete
+    /// on the share path.
+    ///
     /// `POST /api/v1/workspaces/{workspaceId}/share`
     ///
     /// Required scopes: `files:write`.
-    public func share(workspaceId: String, body: ShareWorkspaceRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func share(workspaceId: String, body: ShareWorkspaceRequest, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/share",
@@ -287,13 +488,24 @@ public struct WorkspacesAPI: Sendable {
 
     /// Unassign agent/team/company from workspace
     ///
+    /// The body names WHICH assignment to remove — `agent_id`, `team_id` or `company_id`. It was
+    /// undeclared until 2026-08-31, and the omission did not stay in the document: the SDK
+    /// generator faithfully wrote `body: false`, a proxy honoured that flag and dropped the body,
+    /// and the server still read it. The result was a DELETE that always succeeded and changed
+    /// nothing — 200, no error, unchanged state, under a button labelled Unassign.
+    ///
+    /// Three layers each behaved correctly on what they were given; the mistake in the first passed
+    /// through both and came out the other side as "it works". A spec cannot be checked against a
+    /// spec.
+    ///
     /// `DELETE /api/v1/workspaces/{workspaceId}/assign`
     ///
     /// Required scopes: `files:write`.
-    public func unassignWorkspace(workspaceId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func unassignWorkspace(workspaceId: String, body: UnassignWorkspaceRequest, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/assign",
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -301,15 +513,18 @@ public struct WorkspacesAPI: Sendable {
 
     /// Update workspace name
     ///
+    /// Renames the workspace; `name` is the only writable field and is required. Unlike the reads,
+    /// this is scoped to the active tenant only — a workspace in another of the caller's tenants
+    /// answers 404 here.
+    ///
     /// `PATCH /api/v1/workspaces/{workspaceId}`
     ///
     /// Required scopes: `files:write`.
-    public func update(workspaceId: String, body: UpdateWorkspaceRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func update(workspaceId: String, body: UpdateWorkspaceRequest, options: RequestOptions = .init()) async throws -> Workspace {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -317,16 +532,35 @@ public struct WorkspacesAPI: Sendable {
 
     /// Upload or update a file
     ///
+    /// Writes the file at `?path=` — a NEW record with a NEW `file_id` every time, also when the
+    /// path already exists (workspace-store.ts storeFile: the previous record moves into the path's
+    /// version history and its bytes stay readable through it; a client that keeps the old
+    /// `file_id` after re-uploading holds a key to the previous version). `etag` is the lowercase
+    /// hex sha256 of the content. Body: multipart/form-data with a `file` part, or the raw bytes as
+    /// application/octet-stream. Conditional forms via `If-Match` / `If-None-Match` — see the
+    /// parameters.
+    ///
     /// `PUT /api/v1/workspaces/{workspaceId}/files`
     ///
     /// Required scopes: `files:write`.
-    public func uploadWorkspaceFile(workspaceId: String, path: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func uploadWorkspaceFile(workspaceId: String, body: UploadWorkspaceFileRequest, path: String, ifMatch: String? = nil, ifNoneMatch: UploadWorkspaceFileIfNoneMatch? = nil, options: RequestOptions = .init()) async throws -> WorkspaceFile {
         var query: [URLQueryItem] = []
         query.append(URLQueryItem(name: "path", value: path))
+        var headers: [String: String] = [:]
+        if let ifMatch {
+            headers["If-Match"] = ifMatch
+        }
+        if let ifNoneMatch {
+            headers["If-None-Match"] = ifNoneMatch.rawValue
+        }
+        var parts: [MultipartPart] = []
+        parts.append(MultipartPart(name: "file", value: .file(body.file)))
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/workspaces/\(encodePathSegment(workspaceId))/files",
             query: query,
+            headers: headers,
+            body: .multipart(parts),
             idempotent: true,
             options: options
         ))

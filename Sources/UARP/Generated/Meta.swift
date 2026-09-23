@@ -3,10 +3,10 @@
 import Foundation
 
 /// Version of the OpenAPI document this SDK was generated from.
-public let specVersion = "0.2.0"
+public let specVersion = "0.4.0"
 
 /// Version of this SDK.
-public let sdkVersion = "0.5.13"
+public let sdkVersion = "0.7.0"
 
 /// Production base URL.
 public let defaultBaseURL = "https://api.snaga.ai"
@@ -16,9 +16,13 @@ public let scopes: [String] = [
     "admin",
     "agents:read",
     "agents:write",
+    "analytics:read",
     "api_keys:read",
+    "api_keys:write",
     "billing:read",
     "billing:write",
+    "drawing:read",
+    "drawing:write",
     "evaluations:read",
     "evaluations:write",
     "events:read",
@@ -33,7 +37,6 @@ public let scopes: [String] = [
     "memory:write",
     "notifications:read",
     "notifications:write",
-    "read:analytics",
     "runs:create",
     "runs:read",
     "search:read",

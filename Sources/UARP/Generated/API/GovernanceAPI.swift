@@ -14,7 +14,7 @@ public struct GovernanceAPI: Sendable {
     /// sufficient.
     ///
     /// `POST /api/v1/governance/emergency/safe-mode`
-    public func activateSafeMode(body: ActivateSafeModeRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func activateSafeMode(body: ActivateSafeModeRequest, options: RequestOptions = .init()) async throws -> EmergencyState {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/emergency/safe-mode",
@@ -26,8 +26,15 @@ public struct GovernanceAPI: Sendable {
 
     /// Veto
     ///
+    /// Records an ambassador veto against a target named by `target_type` and `target_id`, with a
+    /// reason; admin or founder only (403). The issuer is the authenticated tenant and is never
+    /// taken from the body, and that identity must itself be a registered ambassador carrying
+    /// `can_veto` — otherwise the store refuses the veto. The veto is appended to the immutable
+    /// ledger. It is a record: this endpoint does not itself change the state of whatever was
+    /// vetoed. 201.
+    ///
     /// `POST /api/v1/governance/ambassador/veto`
-    public func ambassadorVeto(body: AmbassadorVetoRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func ambassadorVeto(body: AmbassadorVetoRequest, options: RequestOptions = .init()) async throws -> VetoRecord {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/ambassador/veto",
@@ -39,8 +46,16 @@ public struct GovernanceAPI: Sendable {
 
     /// Amend constitution
     ///
+    /// Applies a single amendment to the constitution; admin or founder only (403). `rule_id` and
+    /// `action` are required (400) and `action` must be exactly `add`, `modify` or `remove` (422) —
+    /// an unlisted verb used to bump the version and append an amendment while doing nothing. A
+    /// founder amends on direct authority; an admin acts as a delegated voting source and must
+    /// supply `proposal_id` as authorisation proof (400 without it). The amendment is mirrored into
+    /// the immutable ledger by the store and the enforcement cache is invalidated; the amended
+    /// constitution is returned.
+    ///
     /// `POST /api/v1/governance/constitution/amend`
-    public func amendConstitution(body: AmendConstitutionRequest, options: RequestOptions = .init()) async throws -> AmendConstitutionResponse {
+    public func amendConstitution(body: AmendConstitutionRequest, options: RequestOptions = .init()) async throws -> ConstitutionDocument {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/constitution/amend",
@@ -52,8 +67,15 @@ public struct GovernanceAPI: Sendable {
 
     /// Bootstrap first ambassador
     ///
+    /// Registers the tenant's founder ambassador, the identity every later veto is checked against;
+    /// admin or founder only (403). The body is optional: `founder_id` and `name` override,
+    /// otherwise the platform founder configuration is consulted, then the deployment's founder
+    /// environment variables, and finally the tenant id itself is used — so the call cannot fail
+    /// for want of an identity. The bootstrap is appended to the immutable ledger and the created
+    /// ambassador is returned with 201.
+    ///
     /// `POST /api/v1/governance/ambassador/ambassadors/bootstrap`
-    public func bootstrapAmbassador(options: RequestOptions = .init()) async throws -> BootstrapAmbassadorResponse {
+    public func bootstrapAmbassador(options: RequestOptions = .init()) async throws -> Ambassador {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/ambassador/ambassadors/bootstrap",
@@ -64,11 +86,19 @@ public struct GovernanceAPI: Sendable {
 
     /// Cast ballot
     ///
-    /// `POST /api/v1/governance/voting/proposals/{id}/ballot`
-    public func castBallot(id: String, body: CastBallotRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Casts one ballot. The voter is the authenticated caller unless the body names an `agent_id`,
+    /// which must name an agent of this tenant (400 otherwise) — without that check one caller
+    /// could mint as many voters as it liked. `vote` must be `approve`, `reject` or `abstain`,
+    /// `weight` must be a finite number in (0, 1], `reasoning` at most 4000 and `signature` at most
+    /// 1024 characters, each refused 400. The ballot is keyed by voter, so a second ballot from the
+    /// same voter replaces the first rather than adding one. The proposal must still be `open` and
+    /// before its deadline (422 otherwise). The cast is appended to the ledger; 201.
+    ///
+    /// `POST /api/v1/governance/voting/proposals/{proposalId}/ballot`
+    public func castBallot(proposalId: String, body: CastBallotRequest, options: RequestOptions = .init()) async throws -> Ballot {
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(id))/ballot",
+            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(proposalId))/ballot",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -77,8 +107,14 @@ public struct GovernanceAPI: Sendable {
 
     /// Check for deadlock
     ///
+    /// Reports constitutional deadlock: every pair where a `requirement` rule's `obligated_action`
+    /// is exactly what a `prohibition` rule forbids, with a recommendation to activate safe mode
+    /// when any exist. Read-only, and the request body is not read. 404 when the tenant has no
+    /// STORED constitution — the virtual genesis view that `GET /governance/constitution` serves is
+    /// not substituted here, so a tenant that has never written one cannot run this check.
+    ///
     /// `POST /api/v1/governance/emergency/deadlock-check`
-    public func checkDeadlock(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func checkDeadlock(options: RequestOptions = .init()) async throws -> DeadlockReport {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/emergency/deadlock-check",
@@ -89,8 +125,17 @@ public struct GovernanceAPI: Sendable {
 
     /// Check governance compliance
     ///
+    /// Evaluates a proposed action against the tenant's constitution and answers whether it is
+    /// allowed, which rules were checked, the violations found and the penalties they carry.
+    /// `agent_id` and `action` are required (400); `run_id`, `team_id`, `role` and `metadata`
+    /// narrow which rules apply. The evaluation is read-only — no violation record is written by
+    /// this path. Everything is allowed when governance is disabled on the deployment or the tenant
+    /// has no constitution, and everything is blocked by a synthetic `emergency-safe-mode` rule
+    /// while emergency mode is active; a `permission` rule overrides a prohibition only at strictly
+    /// higher priority and never overrides an immutable genesis rule.
+    ///
     /// `POST /api/v1/governance/check`
-    public func checkGovernance(body: CheckGovernanceRequest, options: RequestOptions = .init()) async throws -> CheckGovernanceResponse {
+    public func checkGovernance(body: CheckGovernanceRequest, options: RequestOptions = .init()) async throws -> EnforcementResult {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/check",
@@ -101,6 +146,13 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Check spawn permission
+    ///
+    /// Asks whether `parent_agent_id` may spawn a child carrying `child_permissions`, and answers
+    /// `allowed` with a reason when it is not. Read-only — nothing is stored and no agent is
+    /// created. The gate refuses when the parent has no permission set, when its `can_spawn` is
+    /// false, and when the resulting depth would exceed the policy's `max_depth`. The body is
+    /// passed to the gate unvalidated, so a missing field arrives as undefined rather than as a
+    /// validation error.
     ///
     /// `POST /api/v1/governance/permissions/check-spawn`
     public func checkSpawnPermission(body: CheckSpawnPermissionRequest, options: RequestOptions = .init()) async throws -> PermissionCheckResult {
@@ -115,8 +167,14 @@ public struct GovernanceAPI: Sendable {
 
     /// Create request
     ///
+    /// Submits a request from an agent to the tenant's ambassadors, stored with status `pending`.
+    /// Unlike the other mutations on this sub-handler there is no admin gate — any caller the
+    /// governance router admits may file one. The body's `from_agent_id`, `type`, `subject` and
+    /// `body` are passed to the store without validation, so a missing field is stored as undefined
+    /// rather than refused. 201 with the created request.
+    ///
     /// `POST /api/v1/governance/ambassador/requests`
-    public func createAmbassadorRequest(body: CreateAmbassadorRequestRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createAmbassadorRequest(body: CreateAmbassadorRequestRequest, options: RequestOptions = .init()) async throws -> AmbassadorRequest {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/ambassador/requests",
@@ -127,6 +185,13 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Create design request
+    ///
+    /// Submits a design request for a new agent; admin or founder only — every non-GET on this
+    /// sub-handler is refused 403 otherwise. `agent_name` and `agent_description` are required;
+    /// role, model, tools, parent and rationale are optional because they are settled at approval.
+    /// `submitted_by` is stamped from the authenticated caller and is not accepted from the body —
+    /// the field naming who asked must not be supplied by whoever is asking. 201 with the stored
+    /// request.
     ///
     /// `POST /api/v1/governance/builder/requests`
     public func createBuilderRequest(body: DesignRequestCreate, options: RequestOptions = .init()) async throws -> DesignRequest {
@@ -141,8 +206,14 @@ public struct GovernanceAPI: Sendable {
 
     /// Create goal
     ///
+    /// Proposes a goal for an agent; admin or founder only — every non-GET on this sub-handler is
+    /// refused 403 otherwise. `agent_id`, `title`, `description`, `rationale`,
+    /// `alignment_justification`, `expected_impact` and `resource_estimate_usd` are all required
+    /// (422): the justification and the cost estimate are the substance the later constitution
+    /// check and vote act on. 201 with the stored goal.
+    ///
     /// `POST /api/v1/governance/goals`
-    public func createGoal(body: CreateGoalRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createGoal(body: CreateGoalRequest, options: RequestOptions = .init()) async throws -> Goal {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/goals",
@@ -154,8 +225,15 @@ public struct GovernanceAPI: Sendable {
 
     /// Create improvement proposal
     ///
+    /// Proposes a change to an agent — a prompt edit, a tool addition or removal, a model change,
+    /// parameter tuning or a new skill. `type`, `title`, `description`, `rationale`,
+    /// `failed_run_ids`, `changes` and `baseline_success_rate` are all required (422), because the
+    /// evidence is what the later review stages judge. The store assigns the proposal's version; it
+    /// opens at status `proposed`, from which only `arbiter_review` or `rejected` are reachable.
+    /// The creation is appended to the immutable ledger. 201.
+    ///
     /// `POST /api/v1/governance/improvement/{agentId}`
-    public func createImprovementProposal(agentId: String, body: CreateImprovementProposalRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createImprovementProposal(agentId: String, body: CreateImprovementProposalRequest, options: RequestOptions = .init()) async throws -> ImprovementProposal {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/improvement/\(encodePathSegment(agentId))",
@@ -167,8 +245,15 @@ public struct GovernanceAPI: Sendable {
 
     /// Create proposal
     ///
+    /// Opens a governance proposal. `proposed_by` is taken from the authenticated caller — the user
+    /// behind the credential, else the credential, else the tenant — and a value sent in the body
+    /// is accepted and ignored, because a proposal that names its own proposer names nobody.
+    /// `quorum` may not be set below 0.6 (422) and defaults to 0.6; `deadline_hours` defaults to 48
+    /// and fixes the deadline past which ballots are refused. The proposal opens in `open` status
+    /// and the creation is appended to the immutable ledger. 201.
+    ///
     /// `POST /api/v1/governance/voting/proposals`
-    public func createVotingProposal(body: CreateVotingProposalRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createVotingProposal(body: CreateVotingProposalRequest, options: RequestOptions = .init()) async throws -> VotingProposal {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/voting/proposals",
@@ -194,6 +279,13 @@ public struct GovernanceAPI: Sendable {
 
     /// Delete spawn policy
     ///
+    /// Removes the tenant's stored spawn policy, so `GET /governance/permissions/spawn-policy`
+    /// answers the platform default again (`max_depth` 5 and the other defaults in
+    /// governance/permission-gate.ts). Admin or founder only — any other role is refused 403.
+    /// Idempotent: deleting when no override is stored is also 200 `{ok: true}`. Recorded in the
+    /// governance ledger as `governance.permissions.spawn_policy_deleted`. Documented since the
+    /// contract's first cut, the route had no handler until 2026-09-16 and answered 404.
+    ///
     /// `DELETE /api/v1/governance/permissions/spawn-policy`
     public func deleteSpawnPolicy(options: RequestOptions = .init()) async throws -> DeleteSpawnPolicyResponse {
         return try await client.send(RequestSpec(
@@ -206,11 +298,16 @@ public struct GovernanceAPI: Sendable {
 
     /// File appeal
     ///
-    /// `POST /api/v1/governance/arbiter/cases/{id}/appeal`
-    public func fileArbiterAppeal(id: String, body: FileArbiterAppealRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Files an appeal against a case. `filed_by` may be supplied for a delegated filing, but falls
+    /// back to the authenticated user and then to the tenant, so the stored record always names a
+    /// filer — it used to be written as undefined and vanish from the response. `reason` is passed
+    /// through unvalidated. The appeal is appended to the immutable ledger and returned with 201.
+    ///
+    /// `POST /api/v1/governance/arbiter/cases/{caseId}/appeal`
+    public func fileArbiterAppeal(caseId: String, body: FileArbiterAppealRequest, options: RequestOptions = .init()) async throws -> FileArbiterAppealResponse {
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(id))/appeal",
+            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(caseId))/appeal",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -223,7 +320,7 @@ public struct GovernanceAPI: Sendable {
     /// with the chosen arbiter pool (server checks before persisting).
     ///
     /// `POST /api/v1/governance/arbiter/cases`
-    public func fileArbiterCase(body: FileArbiterCaseRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func fileArbiterCase(body: FileArbiterCaseRequest, options: RequestOptions = .init()) async throws -> ArbiterCase {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/governance/arbiter/cases",
@@ -234,6 +331,13 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Get agent obligations
+    ///
+    /// Lists the constitution's `requirement` rules that apply to one agent: those scoped
+    /// `all_agents`, and those scoped `agent` whose targets name it. Team- and role-scoped rules
+    /// are deliberately omitted because this read has no run context to resolve them against. Each
+    /// rule carries the same `advisory` flag the constitution read uses, so a requirement no code
+    /// path can raise does not appear as a live obligation. A tenant with no stored constitution
+    /// answers an empty list, not 404.
     ///
     /// `GET /api/v1/governance/obligations/{agentId}`
     public func getAgentObligations(agentId: String, options: RequestOptions = .init()) async throws -> GetAgentObligationsResponse {
@@ -246,6 +350,11 @@ public struct GovernanceAPI: Sendable {
 
     /// Get agent permissions
     ///
+    /// Returns the agent's stored permission set — allowed tools and roles, resource permissions,
+    /// per-run budget ceiling, spawn depth and the `can_spawn` / `can_self_modify` flags. 404 when
+    /// the agent has no permission set at all, which is a different thing from a set whose flags
+    /// are all false.
+    ///
     /// `GET /api/v1/governance/permissions/{agentId}`
     public func getAgentPermissions(agentId: String, options: RequestOptions = .init()) async throws -> PermissionSet {
         return try await client.send(RequestSpec(
@@ -256,6 +365,10 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Get agent violations
+    ///
+    /// Returns the constitution violations recorded against one agent, up to 100, with a `count`.
+    /// An agent with a clean record answers an empty list rather than 404 — nothing here
+    /// distinguishes an unknown agent from an unviolating one.
     ///
     /// `GET /api/v1/governance/violations/{agentId}`
     public func getAgentViolations(agentId: String, options: RequestOptions = .init()) async throws -> GetAgentViolationsResponse {
@@ -268,27 +381,36 @@ public struct GovernanceAPI: Sendable {
 
     /// Get ambassador
     ///
-    /// `GET /api/v1/governance/ambassador/ambassadors/{id}`
-    public func getAmbassador(id: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Returns one ambassador record. 404 when the tenant has no ambassador with that id.
+    ///
+    /// `GET /api/v1/governance/ambassador/ambassadors/{ambassadorId}`
+    public func getAmbassador(ambassadorId: String, options: RequestOptions = .init()) async throws -> Ambassador {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/ambassador/ambassadors/\(encodePathSegment(id))",
+            path: "/api/v1/governance/ambassador/ambassadors/\(encodePathSegment(ambassadorId))",
             options: options
         ))
     }
 
     /// Get case
     ///
-    /// `GET /api/v1/governance/arbiter/cases/{id}`
-    public func getArbiterCase(id: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Returns one arbitration case — who filed it, against which agent, the rules cited, the
+    /// evidence and the assigned arbiter. 404 when the tenant has no such case.
+    ///
+    /// `GET /api/v1/governance/arbiter/cases/{caseId}`
+    public func getArbiterCase(caseId: String, options: RequestOptions = .init()) async throws -> ArbiterCase {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(id))",
+            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(caseId))",
             options: options
         ))
     }
 
     /// Get arbiter registry
+    ///
+    /// Returns the tenant's arbiter registry — the agent ids eligible to arbitrate, the panel size,
+    /// the ruling deadline and the maximum number of appeals. This is the set `POST /arbiter/cases`
+    /// draws an assignee from.
     ///
     /// `GET /api/v1/governance/arbiter/registry`
     public func getArbiterRegistry(options: RequestOptions = .init()) async throws -> ArbiterRegistry {
@@ -301,19 +423,32 @@ public struct GovernanceAPI: Sendable {
 
     /// Get design request
     ///
-    /// `GET /api/v1/governance/builder/requests/{id}`
-    public func getBuilderRequest(id: String, options: RequestOptions = .init()) async throws -> DesignRequest {
+    /// Returns one design request with the proposed agent's name, description and optional role,
+    /// model, tools and rationale, plus its current status and whoever the flow recorded as
+    /// submitter. 404 when the tenant has no such request. Reads on this sub-handler are open to
+    /// any caller the governance router admits; only the mutations are gated to admin or founder.
+    ///
+    /// `GET /api/v1/governance/builder/requests/{requestId}`
+    public func getBuilderRequest(requestId: String, options: RequestOptions = .init()) async throws -> DesignRequest {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/builder/requests/\(encodePathSegment(id))",
+            path: "/api/v1/governance/builder/requests/\(encodePathSegment(requestId))",
             options: options
         ))
     }
 
     /// Get constitution
     ///
+    /// Returns the tenant's constitution. Strictly side-effect-free: when no document has been
+    /// stored the response is a virtual view of the platform genesis rules with `version: 0` and
+    /// `virtual: true`, and nothing is written — an earlier self-heal bootstrapped the document on
+    /// read and bypassed the ledger doing it. Every rule carries an `advisory` flag saying whether
+    /// any code path can actually raise it, so a rule nothing enforces does not read as a live
+    /// constraint. Governance sub-systems answer 501 when the deployment has governance switched
+    /// off.
+    ///
     /// `GET /api/v1/governance/constitution`
-    public func getConstitution(options: RequestOptions = .init()) async throws -> GetConstitutionResponse {
+    public func getConstitution(options: RequestOptions = .init()) async throws -> ConstitutionDocument {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/governance/constitution",
@@ -322,6 +457,12 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Get emergency state
+    ///
+    /// Returns the tenant's emergency state. With nothing stored the answer is `{mode: "normal"}`
+    /// rather than 404; a stored state also carries the reason, who activated it and the deadline.
+    /// While the mode is anything but normal, `POST /governance/check` blocks every action against
+    /// a synthetic `emergency-safe-mode` rule, so this read says whether the tenant's agents can
+    /// act at all.
     ///
     /// `GET /api/v1/governance/emergency/state`
     public func getEmergencyState(options: RequestOptions = .init()) async throws -> EmergencyState {
@@ -334,11 +475,16 @@ public struct GovernanceAPI: Sendable {
 
     /// Get goal
     ///
-    /// `GET /api/v1/governance/goals/{id}`
-    public func getGoal(id: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Returns one governance goal with the agent it belongs to, its rationale, alignment
+    /// justification, expected impact and resource estimate, and its current status. 404 when the
+    /// tenant has no goal with that id. Reads here are open to any caller the governance router
+    /// admits; only the mutations are gated to admin or founder.
+    ///
+    /// `GET /api/v1/governance/goals/{goalId}`
+    public func getGoal(goalId: String, options: RequestOptions = .init()) async throws -> Goal {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/goals/\(encodePathSegment(id))",
+            path: "/api/v1/governance/goals/\(encodePathSegment(goalId))",
             options: options
         ))
     }
@@ -361,16 +507,22 @@ public struct GovernanceAPI: Sendable {
     /// "broken".
     ///
     /// `GET /api/v1/governance/ledger`
-    public func getGovernanceLedger(count: Int? = nil, from: String? = nil, to: String? = nil, options: RequestOptions = .init()) async throws -> GetGovernanceLedgerResponse {
+    public func getGovernanceLedger(category: String? = nil, action: String? = nil, count: Int? = nil, from: Int? = nil, to: Int? = nil, options: RequestOptions = .init()) async throws -> GetGovernanceLedgerResponse {
         var query: [URLQueryItem] = []
+        if let category {
+            query.append(URLQueryItem(name: "category", value: category))
+        }
+        if let action {
+            query.append(URLQueryItem(name: "action", value: action))
+        }
         if let count {
             query.append(URLQueryItem(name: "count", value: String(count)))
         }
         if let from {
-            query.append(URLQueryItem(name: "from", value: from))
+            query.append(URLQueryItem(name: "from", value: String(from)))
         }
         if let to {
-            query.append(URLQueryItem(name: "to", value: to))
+            query.append(URLQueryItem(name: "to", value: String(to)))
         }
         return try await client.send(RequestSpec(
             method: "GET",
@@ -382,8 +534,11 @@ public struct GovernanceAPI: Sendable {
 
     /// Get proposal
     ///
+    /// Returns one improvement proposal by agent and version number; the version segment must be
+    /// digits or the path does not match this branch. 404 when no proposal exists at that version.
+    ///
     /// `GET /api/v1/governance/improvement/{agentId}/{version}`
-    public func getImprovementProposal(agentId: String, version: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getImprovementProposal(agentId: String, version: String, options: RequestOptions = .init()) async throws -> ImprovementProposal {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/governance/improvement/\(encodePathSegment(agentId))/\(encodePathSegment(version))",
@@ -392,6 +547,10 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Get permission lineage
+    ///
+    /// Returns the agent's spawn lineage — the chain of ancestors and the depth the spawn gate
+    /// computes from it. 404 when no lineage record exists, which is the case for an agent that was
+    /// not created through the spawn path.
     ///
     /// `GET /api/v1/governance/permissions/{agentId}/lineage`
     public func getPermissionLineage(agentId: String, options: RequestOptions = .init()) async throws -> AgentLineage {
@@ -404,6 +563,9 @@ public struct GovernanceAPI: Sendable {
 
     /// Get root agent
     ///
+    /// Returns `{root_agent_id}` — the agent designated to act under the emergency protocol. The
+    /// value is null when none has been set; this is not a 404.
+    ///
     /// `GET /api/v1/governance/emergency/root-agent`
     public func getRootAgent(options: RequestOptions = .init()) async throws -> GetRootAgentResponse {
         return try await client.send(RequestSpec(
@@ -415,8 +577,12 @@ public struct GovernanceAPI: Sendable {
 
     /// Get root attestation
     ///
+    /// Returns the stored root attestation — the root agent id, the founder id, the founder's
+    /// signature and the constitution hash it was made over. 404 when no attestation has been
+    /// written.
+    ///
     /// `GET /api/v1/governance/emergency/root-attestation`
-    public func getRootAttestation(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getRootAttestation(options: RequestOptions = .init()) async throws -> RootAttestation {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/governance/emergency/root-attestation",
@@ -425,6 +591,12 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Get spawn policy
+    ///
+    /// Returns the tenant's spawn policy — maximum depth, child budget ratio, allowed roles, the
+    /// depth above which approval is required, and the per-agent child cap. Platform defaults are
+    /// merged UNDER the stored record, so a policy saved before a field existed still answers
+    /// complete and a stored zero or empty list still wins; the tenant id is answered for the
+    /// tenant that asked. Never 404: an unconfigured tenant gets the defaults.
     ///
     /// `GET /api/v1/governance/permissions/spawn-policy`
     public func getSpawnPolicy(options: RequestOptions = .init()) async throws -> SpawnPolicy {
@@ -437,22 +609,34 @@ public struct GovernanceAPI: Sendable {
 
     /// Get proposal
     ///
-    /// `GET /api/v1/governance/voting/proposals/{id}`
-    public func getVotingProposal(id: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Returns one proposal with its type, quorum, status and deadline. 404 when the tenant has no
+    /// such proposal.
+    ///
+    /// `GET /api/v1/governance/voting/proposals/{proposalId}`
+    public func getVotingProposal(proposalId: String, options: RequestOptions = .init()) async throws -> VotingProposal {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(id))",
+            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(proposalId))",
             options: options
         ))
     }
 
     /// Issue ruling
     ///
-    /// `POST /api/v1/governance/arbiter/cases/{id}/ruling`
-    public func issueArbiterRuling(id: String, body: IssueArbiterRulingRequest, options: RequestOptions = .init()) async throws -> IssueArbiterRulingResponse {
+    /// Enacts a ruling on an open case; admin or founder only (403) — arbiters are agents, so the
+    /// authority that enacts a ruling is the operator. `arbiter_id` must be present AND equal the
+    /// case's assigned arbiter (403); omitting it used to skip the check entirely. The case must
+    /// exist (404). `case_id` comes from the URL and `ruled_at` from the server clock, neither from
+    /// the body, so a ruling cannot be back-dated or filed against a different case than the one
+    /// addressed. Any `penalties` are applied to the named agents after the ruling is stored — a
+    /// penalty that fails is logged and does not fail the request — and the ruling is appended to
+    /// the immutable ledger. `{ok: true}`.
+    ///
+    /// `POST /api/v1/governance/arbiter/cases/{caseId}/ruling`
+    public func issueArbiterRuling(caseId: String, body: IssueArbiterRulingRequest, options: RequestOptions = .init()) async throws -> IssueArbiterRulingResponse {
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(id))/ruling",
+            path: "/api/v1/governance/arbiter/cases/\(encodePathSegment(caseId))/ruling",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -460,6 +644,10 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// List requests
+    ///
+    /// Lists ambassador requests for the tenant, optionally narrowed by a `status` query parameter
+    /// of `pending`, `acknowledged` or `resolved`. An unrecognised status is passed through to the
+    /// store rather than refused.
     ///
     /// `GET /api/v1/governance/ambassador/requests`
     public func listAmbassadorRequests(status: AmbassadorRequestStatus? = nil, options: RequestOptions = .init()) async throws -> ListAmbassadorRequestsResponse {
@@ -477,6 +665,9 @@ public struct GovernanceAPI: Sendable {
 
     /// List ambassadors
     ///
+    /// Lists the tenant's human ambassadors as a bare array — id, name, role and the three
+    /// permission flags. No paging and no filter.
+    ///
     /// `GET /api/v1/governance/ambassador/ambassadors`
     public func listAmbassadors(options: RequestOptions = .init()) async throws -> [Ambassador] {
         return try await client.send(RequestSpec(
@@ -487,6 +678,11 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// List vetoes
+    ///
+    /// Lists the tenant's veto records, up to 50, unpaged and unfiltered. Each record names who
+    /// issued it, the target type and id it was issued against, and the reason. These are records
+    /// of vetoes, not the effect of one — nothing here reflects whether the target was actually
+    /// stopped.
     ///
     /// `GET /api/v1/governance/ambassador/vetoes`
     public func listAmbassadorVetoes(options: RequestOptions = .init()) async throws -> ListAmbassadorVetoesResponse {
@@ -499,6 +695,9 @@ public struct GovernanceAPI: Sendable {
 
     /// List cases
     ///
+    /// Lists the tenant's arbitration cases with their assigned arbiter and status. No paging, no
+    /// filter.
+    ///
     /// `GET /api/v1/governance/arbiter/cases`
     public func listArbiterCases(options: RequestOptions = .init()) async throws -> ListArbiterCasesResponse {
         return try await client.send(RequestSpec(
@@ -510,16 +709,24 @@ public struct GovernanceAPI: Sendable {
 
     /// List ballots
     ///
-    /// `GET /api/v1/governance/voting/proposals/{id}/ballots`
-    public func listBallots(id: String, options: RequestOptions = .init()) async throws -> ListBallotsResponse {
+    /// Returns the ballots cast on one proposal, up to 500, unpaged. A proposal that does not exist
+    /// answers an empty list rather than 404, so an empty array here does not by itself mean nobody
+    /// voted.
+    ///
+    /// `GET /api/v1/governance/voting/proposals/{proposalId}/ballots`
+    public func listBallots(proposalId: String, options: RequestOptions = .init()) async throws -> ListBallotsResponse {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(id))/ballots",
+            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(proposalId))/ballots",
             options: options
         ))
     }
 
     /// List design requests
+    ///
+    /// Lists the tenant's agent design requests — the builder flow's queue of proposed agents and
+    /// their statuses. Reads are open to any caller the governance router admits; only the
+    /// mutations on this sub-handler are gated.
     ///
     /// `GET /api/v1/governance/builder/requests`
     public func listBuilderRequests(options: RequestOptions = .init()) async throws -> ListBuilderRequestsResponse {
@@ -531,6 +738,10 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// List goals
+    ///
+    /// Lists the tenant's governance goals, optionally narrowed to one agent with the `agent_id`
+    /// query parameter. Reads are open to any caller the governance router admits; the mutations on
+    /// this sub-handler are not.
     ///
     /// `GET /api/v1/governance/goals`
     public func listGoals(agentId: String? = nil, options: RequestOptions = .init()) async throws -> ListGoalsResponse {
@@ -548,6 +759,9 @@ public struct GovernanceAPI: Sendable {
 
     /// List improvement proposals
     ///
+    /// Lists one agent's self-improvement proposals as a bare array, each with its version and
+    /// status. No paging, no status filter.
+    ///
     /// `GET /api/v1/governance/improvement/{agentId}`
     public func listImprovementProposals(agentId: String, options: RequestOptions = .init()) async throws -> [ImprovementProposal] {
         return try await client.send(RequestSpec(
@@ -559,6 +773,9 @@ public struct GovernanceAPI: Sendable {
 
     /// List proposals
     ///
+    /// Lists the tenant's governance proposals, up to 50. There is no paging, no status filter and
+    /// no ordering parameter — the prefix is read as stored.
+    ///
     /// `GET /api/v1/governance/voting/proposals`
     public func listVotingProposals(options: RequestOptions = .init()) async throws -> ListVotingProposalsResponse {
         return try await client.send(RequestSpec(
@@ -569,6 +786,13 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Register ambassador
+    ///
+    /// Registers a human ambassador; admin or founder only (403). `ambassador_id` is required
+    /// (400); a `role` outside `founder`, `ambassador` and `observer` is silently normalised to
+    /// `observer` rather than refused, and the three permission flags default by role — `can_veto`
+    /// and `can_propose` only for a founder, `can_audit` for everyone — unless the body sets them
+    /// as booleans. The reply is `{ok: true}` with 201, not the stored record. Registering the same
+    /// id again overwrites it.
     ///
     /// `POST /api/v1/governance/ambassador/ambassadors`
     public func registerAmbassador(body: RegisterAmbassadorRequest, options: RequestOptions = .init()) async throws -> RegisterAmbassadorResponse {
@@ -583,8 +807,19 @@ public struct GovernanceAPI: Sendable {
 
     /// Replace constitution
     ///
+    /// Replaces the tenant's constitution rules, and who may call it depends on whether one exists:
+    /// provisioning the FIRST document is open to the tenant's own owner or admin, while replacing
+    /// a stored one is founder-only — an admin must instead go through `POST /constitution/amend`
+    /// with a passed proposal, so the same request that succeeded at genesis is 403 afterwards. A
+    /// replay that would change nothing is answered from storage without a write, because the store
+    /// always bumps the version and a bump carrying no amendment is exactly the audit-trail-free
+    /// edit governance forbids. `rules` must be an array (400); immutable rules are preserved
+    /// verbatim and an attempt to alter one is 400. Every accepted change is recorded as a typed
+    /// amendment, appended to the immutable ledger, and the enforcement cache is invalidated at
+    /// once.
+    ///
     /// `PUT /api/v1/governance/constitution`
-    public func replaceConstitution(body: ReplaceConstitutionRequest, options: RequestOptions = .init()) async throws -> ReplaceConstitutionResponse {
+    public func replaceConstitution(body: ReplaceConstitutionRequest, options: RequestOptions = .init()) async throws -> ConstitutionDocument {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/governance/constitution",
@@ -596,11 +831,17 @@ public struct GovernanceAPI: Sendable {
 
     /// Resolve request
     ///
-    /// `POST /api/v1/governance/ambassador/requests/{id}/resolve`
-    public func resolveAmbassadorRequest(id: String, body: ResolveAmbassadorRequestRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Closes an ambassador request: admin or founder only (403), because resolving one is an
+    /// adjudication and any tenant member could otherwise close it with text of their choosing.
+    /// Sets the status to `resolved`, stores `body.response` on the record and stamps
+    /// `resolved_at`. 404 when the request does not exist. Calling it again on an already-resolved
+    /// request overwrites the response and the timestamp.
+    ///
+    /// `POST /api/v1/governance/ambassador/requests/{requestId}/resolve`
+    public func resolveAmbassadorRequest(requestId: String, body: ResolveAmbassadorRequestRequest, options: RequestOptions = .init()) async throws -> AmbassadorRequest {
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/ambassador/requests/\(encodePathSegment(id))/resolve",
+            path: "/api/v1/governance/ambassador/requests/\(encodePathSegment(requestId))/resolve",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -609,8 +850,14 @@ public struct GovernanceAPI: Sendable {
 
     /// Set agent permissions
     ///
+    /// WRITE SEMANTICS: merges. A field the body omits keeps its stored value; only a FIRST write
+    /// falls back to the documented defaults (budget 1.0, spawn depth 3, empty lists). A field that
+    /// IS present but of the wrong type falls to the safe default rather than to the stored value —
+    /// on a permissions surface a malformed write must fail closed, not become a silent no-op.
+    /// `created_at` is server-owned and ignored from the body.
+    ///
     /// `PUT /api/v1/governance/permissions/{agentId}`
-    public func setAgentPermissions(agentId: String, body: PermissionSet, options: RequestOptions = .init()) async throws -> SetAgentPermissionsResponse {
+    public func setAgentPermissions(agentId: String, body: PermissionSetUpdate, options: RequestOptions = .init()) async throws -> SetAgentPermissionsResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/governance/permissions/\(encodePathSegment(agentId))",
@@ -621,6 +868,13 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Set arbiter registry
+    ///
+    /// WRITE SEMANTICS: replaces. Admin or founder only (403). The store spreads the body into a
+    /// fresh record without reading the stored one, so every field — `arbiter_agent_ids`,
+    /// `panel_size`, `ruling_deadline_hours` and `max_appeals` — must be present or the write is
+    /// refused 422 naming what is missing; an omitted field would otherwise be gone rather than
+    /// kept. `tenant_id` is stamped by the server and `updated_at` by the store. The reply is `{ok:
+    /// true}`.
     ///
     /// `PUT /api/v1/governance/arbiter/registry`
     public func setArbiterRegistry(body: JSONObject, options: RequestOptions = .init()) async throws -> SetArbiterRegistryResponse {
@@ -635,6 +889,11 @@ public struct GovernanceAPI: Sendable {
 
     /// Set root agent
     ///
+    /// Designates the emergency root agent; admin or founder only (403). `agent_id` must be a
+    /// non-empty string (422) — the value is stored verbatim and nothing else validates it, so junk
+    /// here disables the emergency root path until the next valid write; the agent's existence is
+    /// not checked. Writing the same id again leaves the same state.
+    ///
     /// `PUT /api/v1/governance/emergency/root-agent`
     public func setRootAgent(body: SetRootAgentRequest, options: RequestOptions = .init()) async throws -> SetRootAgentResponse {
         return try await client.send(RequestSpec(
@@ -647,6 +906,10 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Set root attestation
+    ///
+    /// WRITE SEMANTICS: replaces. The body IS the attestation record — every field is required and
+    /// nothing is carried over, which is why a body missing one answers 422 rather than storing a
+    /// partial record. `created_at` is server-stamped, never taken from the caller.
     ///
     /// `PUT /api/v1/governance/emergency/root-attestation`
     public func setRootAttestation(body: JSONObject, options: RequestOptions = .init()) async throws -> SetRootAttestationResponse {
@@ -661,8 +924,16 @@ public struct GovernanceAPI: Sendable {
 
     /// Set spawn policy
     ///
+    /// WRITE SEMANTICS: replaces. Admin or founder only (403). Because the store writes the body
+    /// without reading what is there, every field — `child_budget_ratio`, `max_depth`,
+    /// `allowed_roles`, `require_approval_above_depth` and `max_children_per_agent` — must be
+    /// present or the write is refused 422 naming the ones missing; a partial body used to delete
+    /// the fields it omitted with a 200 and no warning. `tenant_id` is stamped by the server rather
+    /// than taken from the caller. The change is appended to the immutable ledger; the reply is
+    /// `{ok: true}`, not the stored policy.
+    ///
     /// `PUT /api/v1/governance/permissions/spawn-policy`
-    public func setSpawnPolicy(body: SpawnPolicy, options: RequestOptions = .init()) async throws -> SetSpawnPolicyResponse {
+    public func setSpawnPolicy(body: SpawnPolicyUpdate, options: RequestOptions = .init()) async throws -> SetSpawnPolicyResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/governance/permissions/spawn-policy",
@@ -674,11 +945,15 @@ public struct GovernanceAPI: Sendable {
 
     /// Tally votes
     ///
-    /// `POST /api/v1/governance/voting/proposals/{id}/tally`
-    public func tallyVotes(id: String, options: RequestOptions = .init()) async throws -> TallyVotesResponse {
+    /// Computes the tally and, when the proposal passed, executes it (constitution amendment,
+    /// permission change, agent termination). Admin or founder only since 2026-09-16; any member
+    /// could call it before.
+    ///
+    /// `POST /api/v1/governance/voting/proposals/{proposalId}/tally`
+    public func tallyVotes(proposalId: String, options: RequestOptions = .init()) async throws -> VoteResult {
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(id))/tally",
+            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(proposalId))/tally",
             idempotent: true,
             options: options
         ))
@@ -686,11 +961,18 @@ public struct GovernanceAPI: Sendable {
 
     /// Update request status
     ///
-    /// `PUT /api/v1/governance/builder/requests/{id}/status`
-    public func updateBuilderRequestStatus(id: String, body: UpdateBuilderRequestStatusRequest, options: RequestOptions = .init()) async throws -> DesignRequest {
+    /// Moves a design request to a new status; admin or founder only (403). `status` must be one of
+    /// `pending`, `voting`, `approved`, `rejected` or `spawned` (422) — an unchecked value used to
+    /// set the status to undefined, which no screen and no filter matches. There is no transition
+    /// check, so any of the five may follow any other. `proposal_id` and `spawned_agent_id` ride
+    /// along into the record and are deliberately not stripped, since they carry the authorisation
+    /// for the move.
+    ///
+    /// `PUT /api/v1/governance/builder/requests/{requestId}/status`
+    public func updateBuilderRequestStatus(requestId: String, body: UpdateBuilderRequestStatusRequest, options: RequestOptions = .init()) async throws -> DesignRequest {
         return try await client.send(RequestSpec(
             method: "PUT",
-            path: "/api/v1/governance/builder/requests/\(encodePathSegment(id))/status",
+            path: "/api/v1/governance/builder/requests/\(encodePathSegment(requestId))/status",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -699,11 +981,18 @@ public struct GovernanceAPI: Sendable {
 
     /// Update goal status
     ///
-    /// `PUT /api/v1/governance/goals/{id}/status`
-    public func updateGoalStatus(id: String, body: UpdateGoalStatusRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    /// Moves a goal to a new status; admin or founder only (403). `status` must come from the
+    /// seven-value vocabulary — `proposed`, `checking`, `voting`, `approved`, `rejected`, `active`,
+    /// `completed` — and anything else is 422, where an unchecked string used to be stored
+    /// verbatim. There is no transition check between them. `proposal_id` and
+    /// `constitution_check_passed` are carried through to the record as the update's authorisation
+    /// proof rather than stripped.
+    ///
+    /// `PUT /api/v1/governance/goals/{goalId}/status`
+    public func updateGoalStatus(goalId: String, body: UpdateGoalStatusRequest, options: RequestOptions = .init()) async throws -> Goal {
         return try await client.send(RequestSpec(
             method: "PUT",
-            path: "/api/v1/governance/goals/\(encodePathSegment(id))/status",
+            path: "/api/v1/governance/goals/\(encodePathSegment(goalId))/status",
             body: try client.encode(body),
             idempotent: true,
             options: options
@@ -722,7 +1011,7 @@ public struct GovernanceAPI: Sendable {
     /// Any other transition returns 400. Requires admin/founder role.
     ///
     /// `PUT /api/v1/governance/improvement/{agentId}/{version}/status`
-    public func updateImprovementStatus(agentId: String, version: String, body: UpdateImprovementStatusRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateImprovementStatus(agentId: String, version: String, body: UpdateImprovementStatusRequest, options: RequestOptions = .init()) async throws -> ImprovementProposal {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/governance/improvement/\(encodePathSegment(agentId))/\(encodePathSegment(version))/status",
@@ -733,6 +1022,15 @@ public struct GovernanceAPI: Sendable {
     }
 
     /// Verify ledger integrity
+    ///
+    /// Recomputes each entry's hash and its link to the previous one and reports `valid`,
+    /// `entries_checked` and, on failure, the first bad sequence number with what went wrong — a
+    /// missing entry, a broken `prev_hash` chain or a hash that no longer matches its content.
+    /// Admin or founder only (403). When both `from` and `to` are given the window is validated
+    /// exactly as the ledger read validates it — positive integers, ordered, at most 1000 apart,
+    /// else 400 — because a coerced bound used to report a clean chain it had not looked at; with
+    /// one bound or none the chain's own end supplies the rest and the whole chain is walked. The
+    /// chain is global rather than per-tenant, so this verifies platform-wide integrity.
     ///
     /// `GET /api/v1/governance/ledger/verify`
     public func verifyGovernanceLedger(from: String? = nil, to: String? = nil, options: RequestOptions = .init()) async throws -> LedgerIntegrity {
@@ -753,12 +1051,19 @@ public struct GovernanceAPI: Sendable {
 
     /// Veto proposal
     ///
-    /// `POST /api/v1/governance/voting/proposals/{id}/veto`
-    public func vetoProposal(id: String, body: VetoProposalRequest? = nil, options: RequestOptions = .init()) async throws -> VetoProposalResponse {
+    /// Overrules a proposal: admin or founder only (403). The proposal's status is set to `vetoed`
+    /// regardless of the votes cast, and a vetoed result is recorded alongside it; the veto is
+    /// appended to the immutable ledger. An optional `founder_id` must be a non-empty string of at
+    /// most 256 characters (400) and only names the actor being logged — the tenant is what is
+    /// recorded as the vetoer either way. An unknown proposal is 404. Repeating the call leaves the
+    /// same state.
+    ///
+    /// `POST /api/v1/governance/voting/proposals/{proposalId}/veto`
+    public func vetoProposal(proposalId: String, body: VetoProposalRequest? = nil, options: RequestOptions = .init()) async throws -> VetoProposalResponse {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
-            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(id))/veto",
+            path: "/api/v1/governance/voting/proposals/\(encodePathSegment(proposalId))/veto",
             body: encodedBody,
             idempotent: true,
             options: options

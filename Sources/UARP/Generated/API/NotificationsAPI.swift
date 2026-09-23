@@ -32,6 +32,11 @@ public struct NotificationsAPI: Sendable {
 
     /// Purge a single notification
     ///
+    /// Purges a single notification and its per-user index row. Requires the `notifications:write`
+    /// scope on top of the read scope every notifications call needs. An id that does not exist is
+    /// a silent no-op that still answers 200 `{ok: true}`, so the call is idempotent and its
+    /// response says nothing about whether a record was there.
+    ///
     /// `DELETE /api/v1/notifications/{notifId}`
     ///
     /// Required scopes: `notifications:write`.
@@ -44,7 +49,48 @@ public struct NotificationsAPI: Sendable {
         ))
     }
 
+    /// Remove a target
+    ///
+    /// Removes a configured delivery target, so notifications stop being fanned out to that email
+    /// address, webhook, browser or device. Requires `notifications:write`. The delete is
+    /// unconditional — no existence check — so it is idempotent and answers 200 `{ok: true}`
+    /// whether or not the id was there. Existing notification records are untouched.
+    ///
+    /// `DELETE /api/v1/notifications/targets/{targetId}`
+    ///
+    /// Required scopes: `notifications:write`.
+    public func deleteNotificationTarget(targetId: String, options: RequestOptions = .init()) async throws -> DeleteNotificationTargetResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/notifications/targets/\(encodePathSegment(targetId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Read the tenant's notification routing preferences
+    ///
+    /// Returns the stored preferences, or the server defaults (critical → in_app+email, everything
+    /// else → in_app) when none are stored. Note: `email` in a channel list only delivers when the
+    /// tenant also has an email target configured (see POST /notifications/targets).
+    ///
+    /// `GET /api/v1/notifications/prefs`
+    ///
+    /// Required scopes: `notifications:read`.
+    public func getNotificationPreferences(options: RequestOptions = .init()) async throws -> NotificationPreferences {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/notifications/prefs",
+            options: options
+        ))
+    }
+
     /// Get unread notification count
+    ///
+    /// Counts the unread notifications this caller can see — tenant-wide ones plus those addressed
+    /// to the caller's own key — by scanning the tenant-wide index, the same set the list endpoint
+    /// reads, so the count and the list cannot disagree. The same number is returned under three
+    /// names (`count`, `unread_count`, `unreadCount`) for older clients.
     ///
     /// `GET /api/v1/notifications/unread`
     ///
@@ -58,6 +104,13 @@ public struct NotificationsAPI: Sendable {
     }
 
     /// List notifications
+    ///
+    /// Lists the tenant's notifications newest first. `limit` is clamped to 1..100 and falls back
+    /// to 20 for anything non-numeric or empty; `unread=true` returns only unread ones,
+    /// over-fetching internally so a page full of read rows does not come back empty while the
+    /// unread count says otherwise. There is no cursor and no by-id read — this collection path
+    /// answers only for the exact path, and any single-segment suffix under `/notifications` is 404
+    /// rather than this list.
     ///
     /// `GET /api/v1/notifications`
     ///
@@ -78,7 +131,28 @@ public struct NotificationsAPI: Sendable {
         ))
     }
 
+    /// List notification targets
+    ///
+    /// Every configured destination, with secrets redacted — see `NotificationTarget`.
+    ///
+    /// `GET /api/v1/notifications/targets`
+    ///
+    /// Required scopes: `notifications:read`.
+    public func listNotificationTargets(options: RequestOptions = .init()) async throws -> ListNotificationTargetsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/notifications/targets",
+            options: options
+        ))
+    }
+
     /// Mark all notifications as read
+    ///
+    /// Marks every unread notification visible to this caller — tenant-wide ones and the caller's
+    /// own; other people's personal notifications are left alone — as read, writing both the record
+    /// and its per-user mirror. Requires `notifications:write`. `marked` counts the rows that
+    /// actually changed, so rows that were already read or whose write failed are not included, and
+    /// a second call answers 0.
     ///
     /// `PUT /api/v1/notifications/read-all`
     ///
@@ -94,13 +168,37 @@ public struct NotificationsAPI: Sendable {
 
     /// Mark notification as read
     ///
+    /// Marks one notification read, writing the flag to both the tenant-wide record and the
+    /// per-user mirror when the notification is addressed to a user. Requires
+    /// `notifications:write`. An id that does not exist is a silent no-op answering 200 `{ok:
+    /// true}`, and re-marking an already-read notification is harmless — the call is idempotent.
+    ///
     /// `PUT /api/v1/notifications/{notifId}/read`
     ///
     /// Required scopes: `notifications:write`.
-    public func markNotificationRead(notifId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func markNotificationRead(notifId: String, options: RequestOptions = .init()) async throws -> MarkNotificationReadResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/notifications/\(encodePathSegment(notifId))/read",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Replace the tenant's notification routing preferences
+    ///
+    /// WRITE SEMANTICS: replaces. An omitted field is stored as omitted (the only way to clear
+    /// muted_types or drop quiet_hours). `tenant_id` and `updated_at` are ignored — the server
+    /// derives them.
+    ///
+    /// `PUT /api/v1/notifications/prefs`
+    ///
+    /// Required scopes: `notifications:write`.
+    public func replaceNotificationPreferences(body: NotificationPreferencesInput, options: RequestOptions = .init()) async throws -> NotificationPreferences {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/notifications/prefs",
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -132,6 +230,46 @@ public struct NotificationsAPI: Sendable {
             path: "/api/v1/notifications/stream",
             query: query,
             headers: headers,
+            options: options
+        ))
+    }
+
+    /// Send a test notification
+    ///
+    /// Queues one notification through the real fan-out, so it proves the whole path rather than
+    /// the stored configuration. **200 means queued, not delivered** — read `last_delivered_at` and
+    /// `last_error` on the target afterwards for the outcome.
+    ///
+    /// `POST /api/v1/notifications/targets/{targetId}/test`
+    ///
+    /// Required scopes: `notifications:write`.
+    public func testNotificationTarget(targetId: String, options: RequestOptions = .init()) async throws -> TestNotificationTargetResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/notifications/targets/\(encodePathSegment(targetId))/test",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Create or update a target
+    ///
+    /// Upsert, not insert: sending an `id` rewrites that target. A device target (push or web push)
+    /// additionally reuses the id of an existing entry for the same device, so a client that
+    /// re-registers on every launch does not accumulate duplicates.
+    ///
+    /// The answer is the REDACTED target — the signing secret or device token you just sent is not
+    /// echoed back.
+    ///
+    /// `POST /api/v1/notifications/targets`
+    ///
+    /// Required scopes: `notifications:write`.
+    public func upsertNotificationTarget(body: UpsertNotificationTargetRequest, options: RequestOptions = .init()) async throws -> NotificationTarget {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/notifications/targets",
+            body: try client.encode(body),
+            idempotent: true,
             options: options
         ))
     }

@@ -6,6 +6,613 @@ All five SDKs share one version, cut from one tag. Set it with
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0 — 2026-09-23
+
+Build `f9f433ee`, canonical digest `9de209f5e0d40b51` — sorted keys, no
+whitespace, which is what `check-spec-freshness.sh` compares and what the
+release refuses to proceed without. Against 0.6.0, the last release published
+to any registry: 535 → 544 paths, 723 → 736 operations (+16, −3), 352 → 352
+schemas (+3, −3).
+
+The first `v0.7.0` tag, on 2026-09-22 at build `34cc8169`, published nothing:
+the platform deployed `3a9d4c08` between the regeneration and the tag, and the
+release job refused the stale document in its first step, before any registry
+was touched. `5732283f`, `c5694dc0` and `f9f433ee` followed while the refresh
+was in CI. This entry describes the second cut.
+
+**The minor moves, and that is the point.** A caret under 1.0 does not cross
+the minor, so `^0.6.0` admits 0.6.1 automatically and refuses 0.7.0. This
+release removes exported names and adds required request fields; on a patch
+those would have arrived in builds nobody touched, and the first anyone heard
+of it would have been a red compile. The number is the announcement.
+
+### Removed — three operations and eighteen exported names
+
+The SPEC-package surface is withdrawn on the platform (uarp `f058b582`), so
+it leaves the clients:
+
+- `GET` and `PUT /admin/config/spec-packages`, and
+  `POST /admin/config/spec-packages/{packageId}/stripe-price`.
+- Eighteen names disappear from the TypeScript models (1679 exports → 1720,
+  with these gone): `SpecPackage`, `SpecPackagePricing`,
+  `SpecPackagePricingBillingInterval`, `SpecPackageIncludedInPlan`,
+  `SpecPackageProgram`, `SpecPackageProgramNav`, `SpecPackageProgramPage`,
+  `AdminSpecPackagesList`, `UpdateAdminSpecPackagesRequest`,
+  `CreateAdminSpecPackageStripePriceResponse`,
+  `CreateSpecPackageCheckoutSessionRequest`,
+  `ListBillingSpecPackagesResponsePackage` and its `…Entitlement`,
+  `DeleteCustomPlanForce`, and the four `*_VALUES` consts of those enums.
+
+`GET /billing/spec-packages` and its checkout do NOT leave: the withdrawal
+left the list answering `[]` and the checkout answering 410, both marked
+deprecated, and both stay generated for clients that still call them.
+
+### Changed — six operations now require body fields they did not
+
+Breaking for any call site that compiled without them:
+
+| Operation | Newly required |
+|---|---|
+| `POST /governance/goals` | `title`, `description`, `rationale`, `expected_impact`, `alignment_justification`, `resource_estimate_usd` |
+| `POST /governance/improvement/{agentId}` | `title`, `description`, `rationale`, `changes`, `baseline_success_rate`, `failed_run_ids` |
+| `POST /governance/arbiter/cases` | `description`, `rule_ids` |
+| `POST /bridge/delegate` | `message` |
+| `POST /marketplace/listings/{listingId}/subscribe` | `stripe_subscription_id` |
+| `POST /programs/{programId}/apply` | `start_date` |
+
+`POST /a2a/tasks` tightens without a new top-level field: each entry of
+`messages` now requires `role` (`'user' | 'agent'`, no longer any string) and
+a non-empty `parts` typed as `A2APart[]` rather than bare objects, and the
+list itself needs at least one entry. The handler refused all of these with
+422 already; the types now say so before the request is sent.
+
+The first three were unusable in 0.6.0 rather than merely under-declared:
+`CreateGoalRequest` shipped with one field beside a doc comment naming seven,
+so no client generated from that document could form a valid request. They
+compile differently here because they now describe what the handler actually
+demands.
+
+### Added — a failed run says why, in a field
+
+- `Run.error_code` and `Run.error_details`, and the same pair on
+  `TenantOverviewRunsRecentItem` — the thinner shape the fleet board reads.
+  `error_code` is absent when the failure carries nothing to branch on, which
+  is deliberate; `error_details` carries what the code cannot
+  (`retry_after_ms`, `quota_exhausted`, `stale_seconds`).
+- `ErrorCode` and `ERROR_CODE_VALUES`, 78 values — among the newest,
+  `approval_rejected` for a run that stopped because a person refused its tool
+  call, and `kb_embedding_failed`. **New, not widened**: 0.6.0
+  declared no `code` on `Error` at all, in the tag or in the published
+  tarball, so there was nothing for a client to branch on.
+
+Until this release no generated client could learn why a run failed except by
+matching English in `error` — a sentence with no `Accept-Language` behind it.
+
+### Added — the rest of the surface
+
+- `SpecToolCatalogSpec` with `tools_waiting` and
+  `status: 'ready' | 'needs_connection'`: an installed SPEC that is waiting on
+  a connection says so instead of vanishing.
+- `UsageQuotaCounter` and its eight kinds (`runs`, `tokens`, `tokens_daily`,
+  `tool_calls`, `agents`, `teams`, `knowledge_bases`, `workspaces`).
+- `GET|PUT /agents/{agentId}/mcp-servers` with `McpServerAuth` — the connect
+  surface between an agent and the MCP servers its tenant has installed.
+- Billing: `GET|PUT|DELETE /billing/budget`, `GET|PUT /billing/overage`,
+  `GET /billing/promo`, `POST /billing/promo/redeem`.
+- `GET /admin/data-explorer/export`, `POST /admin/data-explorer/import`,
+  `POST /auth/oauth/nonce` (served undocumented until uarp #487),
+  `GET /bridge/agent-specs`, `GET /companies/{companyId}/events`.
+- `SubjectSweep`, `TenantSocialLinks`.
+- `GET /agents/{agentId}/memory/core` and `ListCoreMemoryBlocksResponse` —
+  every core memory block of an agent in one call, beside the per-label routes.
+- `GET /agents/{agentId}/experiments` and `ListExperimentsResponse` — an
+  agent's evaluation experiments, newest first.
+- `InboxItem.tools` (`InboxItemTool`): an `approval` row names each tool the
+  run waits on, with how many calls named it, as data rather than prose.
+- `Run.approvals` (`RunApproval`, decision `'approved' | 'rejected'`): each
+  human decision on a tool approval the run waited for, oldest first. Absent
+  on runs from before 2026-09-22, when nothing was recorded.
+- `POST /runs/{runId}/resume` takes an optional `ResumeRunRequest`; a string
+  `input.note` is handed to the model as a user turn when the run continues.
+- `Objective.strikes_used` and `abort_reason`, `AARRootCause.code`,
+  `AARObjectiveOutcome.abort_reason`, `MissionStartResponse.run_started`.
+- `PUT /agents/{agentId}/memory/core/{label}` documents `409`, and the public
+  session upload, respond and share routes document `410` for an agent made
+  private after the session opened.
+
+### Fixed — the tooling that made the last cut cost two attempts
+
+- `scripts/update-spec.sh` gains `--allow-shrink "<reason>"`. Its guard
+  correctly refuses a document smaller than the vendored copy, but its advice
+  on refusal was to pass a different url, which cannot work: the guard weighs
+  whatever is fetched, so the only url that satisfies it is a document stale
+  enough to still carry the withdrawn surface. The override requires a reason
+  and NAMES what leaves — paths, operations and schemas, each listed.
+- `scripts/set-version.sh` now moves three things it silently left behind:
+  `generator/package-lock.json`, the crate's own version in
+  `packages/rust/Cargo.lock`, and the generator goldens, which bake
+  `SDK_VERSION` in four languages. That last one is why the first `v0.6.0` tag
+  published nothing — 40 of 100 generator tests red at the tag, every language
+  job dead before its publish step. Measured again here: 48 of 114 red
+  immediately after the bump, before the refresh.
+- `scripts/check-prose-schema.ts` reports 0 divergences over all 736
+  operations.
+
+### Known
+
+- The SwiftPM mirror is stuck at 0.5.13 (2026-08-21) because
+  `SWIFT_MIRROR_TOKEN` expired; 0.5.15, 0.5.21, 0.5.24 and 0.6.0 never reached
+  it. Swift consumers do not get this release until that token is reissued —
+  this is not something the tag can fix.
+- `examples/react-landing` still asks for `uarp-sdk: ^0.6.0`. It cannot ask
+  for `^0.7.0` before 0.7.0 exists on npm, so that bump follows the publish
+  rather than preceding it.
+
+## 0.6.0 — 2026-09-14
+
+`spec/openapi.json` is `https://api.snaga.ai/api/v1/openapi.json` normalised
+by `python3 -m json.tool`, which is what `scripts/update-spec.sh` writes.
+Earlier entries quoted a sha256 of the served bytes; this one does not,
+because the vendored file is no longer those bytes. The identity that means
+something is the canonical digest — sorted keys, no whitespace —
+`d281e0b33c55a670`, which is exactly what `check-spec-freshness.sh` compares
+and what the release refuses to proceed without. Build `d19c367e`
+(uarp #456–#477). Against 0.5.24 (the last release published to any
+registry): 709 → 723 operations (+14, none removed), 142 with a changed
+shape; 271 → 352 schemas (+81, one member removed — see below), 31 with a
+changed shape.
+
+This tag is cut a second time. `v0.6.0` was first tagged on 2026-09-12 from
+a tree whose generated TypeScript did not compile (`agents.ts` had a string
+cursor reaching a number parameter) and whose generator goldens still said
+`0.5.24`; every job of the release run failed before its publish step, so
+npm, crates.io, Maven Central and the SwiftPM mirror never saw it — 0.5.24
+remained the latest everywhere. Nothing consumed the number, so the number
+is reused rather than burned. The tag now points at a tree that compiles.
+
+### Removed — one field, and it is a breaking change
+
+- `Invite.secret` is gone from the schema (uarp #471). The accept token is
+  not something an administrator reading the invite list is given; only the
+  invitee's own link carries it. Code that read `invite.secret` compiled
+  against 0.5.24 and does not compile here — that is the whole of the
+  breakage in this release, and the reason to read the note before bumping.
+
+### Added — the Drawings surface (uarp #472, stage 1)
+
+- Nine paths and twelve operations: `GET|POST /sessions/{sessionId}/drawings`,
+  `GET|DELETE /drawings/{drawingId}`, `GET|POST /drawings/{drawingId}/ops`,
+  `GET /drawings/{drawingId}/render`,
+  `GET /drawings/{drawingId}/tiles/{layerId}/{tx}/{ty}`,
+  `POST /drawings/{drawingId}/masks`, `GET /drawings/{drawingId}/masks/{maskId}`
+  and its `/content`. `listSessionDrawings` pages on the list convention.
+- Eight schemas: `Drawing`, `DrawingLayer`, `DrawingOp`, `DrawingBrush`,
+  `DrawingMask`, `DrawingStrokePoint`, `DrawingSelectionShape`,
+  `DrawingJournalEntry`.
+
+### Added — deletions the API grew
+
+- `DELETE /sessions/{sessionId}/branches/{branchId}` (uarp #472).
+- `DELETE /runs/{runId}/feedback` and
+  `DELETE /sessions/{sessionId}/runs/{runId}/feedback` (uarp #474, #477):
+  a reaction can be taken back, and the feedback reason now comes back on
+  the read rather than only on the write.
+
+### Changed — the versions cursor is an opaque string
+
+- `GET /agents/{agentId}/versions`: `cursor` is a string, in the request and
+  in the answer, where the first draft of this paging made it the version
+  number (uarp #471). Treat it as opaque and pass it back unchanged. No
+  published release ever carried the integer form — it existed only in the
+  0.6.0 tag that failed to publish — so for anyone upgrading from 0.5.24
+  this parameter is simply new.
+
+### Changed — typed responses (121 operations, 73 new schemas)
+
+- Operations that decoded to a bare object now have a model: the whole
+  `admin/config` family (Auth, Guardrails, FeatureFlags, RateLimits,
+  Retention, SSE, WorkerPool, ToolSecurity, LlmAdapters, Logging,
+  CodeInterpreter, RunCommand, Stripe, Smtp…), admin audit, marketplace
+  reviews and subscriptions, company objectives and activity, workspace
+  trash, activity-stats, public states and agents, team-run messages.
+
+### Changed — types
+
+- `Error`: `title` is an enum of the twenty HTTP reason phrases (422 is
+  "Validation Error"), `detail` is required, `code` is the machine code.
+- `ConversationEntry.message_id` is required — the derived id of every
+  transcript entry (`{run_id}`, `{run_id}-reply[-N]`, `{run_id}-user-N`,
+  `{run_id}-tool-N`, `{run_id}-system-N`), the canonical key for reactions,
+  bookmarks and annotations; `content` is a string on v1. The session detail
+  (`Session.conversation_history`) carries `message_id` too.
+- `ConstitutionRule.advisory` (true when no code path can raise the rule;
+  on `GET /governance/constitution` and `/governance/obligations/{agentId}`)
+  and `obligated_action`.
+- `TenantOverview`: nine members are optional — `usage`, `cost`, `system`,
+  `runs.cost_24h_usd`, `fleet.top_by_cost`, `fleet.by_execution_mode`,
+  `fleet.bridge`, `fleet.head_agent_id`, `schedules.at_risk`. v1 still
+  serves all nine; readers must tolerate absence.
+- Additive fields on `Agent`, `AgentUpdate`, `RunMetrics`, `Session`,
+  `Company`, `A2ATask`, `PublicSessionView`, `PublicAgentCard`
+  (`tenant_slug`, `tenant_name`), `PublicState`, `RunCheckpoint`,
+  `McpServer*`; `RunOutput.search_sources`.
+- `AgentVersion.changelog` names the eleven values the server writes.
+
+### Added — parameters and fields
+
+- `GET /agents/{agentId}/versions`: `limit`, `cursor`, `fields=summary`;
+  with `limit` the answer carries `cursor` and `has_more` (the document's
+  list convention). Without `limit` the answer is unchanged.
+- `GET /governance/ledger`: `category`, `action` (they filter now).
+- `POST /admin/config/stripe/test` success: `active_key_matches` (required)
+  and `warning` — whether the billing manager serving checkout holds the
+  key the panel stores; `livemode` is derived from the key prefix.
+- `PUT /workspaces/{workspaceId}/files`: `If-Match` / `If-None-Match`;
+  the 412 is `Error` plus an optional `current_etag` (absent when the file
+  does not exist).
+
+### Documented — what the wire always did
+
+- `PUT /admin/config/stripe` body: omit = unchanged, empty string = clear,
+  a redacted read-back is ignored.
+- Billing `return_url` / `success_url` / `cancel_url` accept the app scheme
+  (`snaga://`) beside same-origin URLs.
+- The public chat's 401 and 410 carry the bare fact
+  "This conversation has expired."
+- `message_id` on feedback, bookmarks and annotations is stored as sent; a
+  non-canonical one is counted, never refused.
+- Workspace move/copy/overwrite and what they do to `file_id`.
+
+## 0.5.24 — 2026-09-10
+
+The copy follows the served document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`ba6417e34fcafb5a…`, build `5011669e` (uarp #453, #454), `info.version`
+0.4.0. 709 operations, 271 schemas. This is the first release since 0.5.21;
+0.5.22 and 0.5.23 were cut as commits and never tagged — everything listed
+under them ships here, including the generator fix below. From now on one
+SDK release follows one deployed batch.
+
+### Fixed — all five clients
+
+- The generator regression of 0.5.21 (see 0.5.23): fifteen 204 operations
+  were typed by the in-flight 202 body. Fixed here for every registry.
+
+### Changed — source-breaking, though nothing that works today breaks
+
+- Nineteen path parameters are named after their resource: `{id}` became
+  `{companyId}`, `{knowledgeBaseId}`, `{integrationId}`, `{proposalId}`,
+  `{ambassadorId}`, `{requestId}`, `{caseId}`, `{goalId}`. Method parameter
+  names follow; the URLs are unchanged.
+- 56 responses that decoded to a bare object now decode into models:
+  `RunOutput` (with `search_sources` — the URLs a real `web_search` returned,
+  at most 8, present only when non-empty — and `output_truncated`),
+  `UsageQuota`, `EvalDataset`, `EvalRun`, `AgentScorer`, `PublicAgentCard`,
+  `PublicSessionView`, `JsonRpcResponse` (MCP and A2A envelopes),
+  `SearchResult`, `ReplayResult`, `CreatedTask`, `MarketplaceSubscription`,
+  `DeadlockReport`, `RootAttestation`, `DataSubjectAccessReport`,
+  `DataSubjectErasureResult`, `SessionAnnotation`, `A2AAgentCard`,
+  `OpenAiChatCompletion`, `TenantUser` on `getUser`, `Tenant` on
+  `PUT`/`PATCH /tenants/me`, and the team/squad graph node and edge records.
+- `GET /agents/{agentId}/memory/{entryId}` returns a `MemoryEntry`. Until
+  build `5011669e` the server answered the agent's list on that path; no
+  client had called it.
+- Response codes corrected at the source, so a call that used to land in
+  "unexpected status" now decodes: `DELETE /agents/{agentId}/integrations/{integrationId}`
+  204; `DELETE /mcp/servers/{serverId}` 200 with `{ ok, cascade }`;
+  `POST /runs/{runId}/replay` 200; ambassador `bootstrap` and `requests` 201;
+  billing without Stripe 501 (was documented as 502).
+- Scope `analytics:read` replaces `read:analytics` in the catalogue (the
+  server accepts both); `billing:write` enters the catalogue; `api_keys:read`
+  / `api_keys:write` are declared on the key operations.
+- `Agent.metadata.ui` is typed (`AgentMetadataUi`: `avatar`, `drop_genome`,
+  `drop_genome_source`); a partial `PATCH` of `metadata.ui.avatar` keeps the
+  avatar fields it does not name.
+
+## 0.5.23 — 2026-09-10 (never tagged; shipped in 0.5.24)
+
+### Fixed — all five clients
+
+- Fifteen operations whose answer is a `204` — `files.delete`,
+  `workspaces.delete`, `companies.delete`, `integrations.delete`,
+  `knowledge.deleteKnowledgeBase`, `knowledge.deleteKbDocument`,
+  `users.deleteInvite`, `agents.deleteAgentIdentity`,
+  `memory.deleteMemoryEntry`, `sessions.deleteSessionAnnotation`,
+  `sessions.revokeSessionShare`, `marketplace.unpublishListing`,
+  `registry.registryYankVersion`, `registry.registryUnyankVersion`,
+  `admin.deleteAndroidTester` (TypeScript spelling) — were typed in 0.5.21 and
+  0.5.22 by the body of the `202 IdempotencyInFlight` reply that uarp #444
+  attached to every idempotent operation (`{ error: "Accepted", message,
+  retry_after_seconds }`). The generator took the lowest 2xx as the answer.
+  Rust failed to decode the empty 204 it actually received (`invalid type:
+  null, expected struct DeleteFileResponse`); Ada did not compile; TypeScript,
+  Swift and Kotlin returned a model no response ever carries. The generator
+  now types an operation by its settled status: a 202 next to another 2xx is
+  the idempotency layer saying "still in flight", not the result. The sixteen
+  models that existed only for this (`Delete*Response`,
+  `RevokeSessionShareResponse`, `UnpublishListingResponse`,
+  `RegistryYankVersionResponse`, `RegistryUnyankVersionResponse` and their
+  shared `error` enum) are gone; the fifteen methods return nothing again, as
+  they did in 0.5.20. The cross-SDK contract check caught it in CI on
+  `ca08686` and `697d02d`; a parser test now pins all fifteen against the
+  served document.
+
+## 0.5.22 — 2026-09-10 (never tagged; shipped in 0.5.24)
+
+The copy follows the served document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`22c24643fbacbc35027e5058cc08433610fa7d77adf7a83971350a9049adf76f`, build `4c12c94a`, `info.version` 0.4.0. 709 operations, 249 schemas.
+
+### Changed
+
+- `Run.execution_mode` is documented (`async` | `bridge`); the descriptions on
+  it and on the overview row say what production writes: `bridge` by the
+  platform, `async` only as an echo of a client value — never stored so far
+  (8605 run records measured: absent 7738, bridge 867, async 0).
+
+## 0.5.21 — 2026-09-10
+
+The copy follows the served document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`ba5a7338214ddbe6cb76b9cac203ddf726f7f52692ee637bf8c1cd64125112ca`, build `eaa42cb2`, `info.version` 0.4.0. 709 operations, 249 schemas.
+
+### Added
+
+- `execution_mode` (`async` | `bridge`) on `GET /analytics/overview` →
+  `runs.recent[]`, passed through from the run record — a bridge report with
+  no transcript is now distinguishable from "nothing ran".
+
+### Changed
+
+- uarp #450 (CTR-07 tranche 2a): 48 responses on governance, teams/squads,
+  a2a, public, playground, files, programs, users, webhooks, mfa, guardrails,
+  marketplace, workspaces, notifications and tenant keys now have the shape
+  they serve — new `ReadinessReport`, `FileRecord`, `TeamRunDetail`,
+  `PlaygroundAgentState`, `PlaygroundTemplate`, `MfaEnrolment`.
+- Status codes the wire actually answers: `POST /governance/ambassador/
+  ambassadors`, `POST /governance/goals`, `POST /governance/improvement/
+  {agentId}` are **201** (not 200); `POST /playground/agents/{agentId}/run`
+  is **202**; `DELETE /marketplace/listings/{listingId}` is **204**.
+
+## 0.5.20 — 2026-09-10
+
+The copy follows the served document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`8d6c371c0ade9c233c57c9048758bbbc29ab1f7412e0ed02d6aca025571d9015`, build `bccf5ef4`, `info.version` 0.4.0. 709 operations, 243 schemas.
+
+### Changed
+
+- uarp #448 (CTR-07 tranche 1): 39 responses on agents, sessions, runs and
+  workspaces now have the shape they serve — new `AuditLogEntry`,
+  `AgentCapabilities`, `RunFeedbackList`/`RunFeedbackOne`/`RunFeedbackSet`;
+  `MemoryEntry`, `Session`, `Workspace` gained served keys; run
+  approve/cancel/pause/reject/continue/resume/checkpoint, session delete/
+  todos, agent activate/suspend/versions/rollback/traffic, workspace
+  assign/share/move are typed.
+- `POST /runs/{runId}/resume` and `…/checkpoint` answer **202** (the document
+  said 200 / 201); generated clients now expect the code the wire gives.
+- `DELETE /workspaces/{workspaceId}` is 204 with no body.
+
+## 0.5.19 — 2026-09-10
+
+The copy follows the served document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`c212d1f94faa8a5c665b5bca17a5432e9ef82f53cd2e04dde2a221025e7ce34c`, build `ae8a2d2e`, `info.version` 0.4.0. 709 operations, 238 schemas.
+
+### Changed
+
+- uarp #447 settled every schema no operation reached: `Schedule` now has the
+  keys `GET /agents/{agentId}/schedule` serves (`status`, `next_fire_at`,
+  `consecutive_failures`; `next_run_at` is gone) and the response is
+  `Schedule | null`; `PUT` returns the new `ScheduleEntry` with
+  `AgentScheduleConfig`; `EnforcementResult`, `VetoRecord`,
+  `ConstitutionDocument`, `MarketplaceListingRating`, `VoteResult` and
+  `BridgeTaskEvent` are what their operations return or accept.
+- `GET /usage/timeseries` rows carry `label` (an `M/D` bucket label), not
+  `date`.
+- `PUT /governance/permissions/{agentId}` takes `PermissionSetUpdate`;
+  `PUT …/spawn-policy` takes `SpawnPolicyUpdate`.
+
+### Removed
+
+- Schemas `Constitution`, `Veto`, `AgentFleetSummary`, `LlmCredential`,
+  `TeacherRef` (no operation produced or consumed them).
+
+## 0.5.18 — 2026-09-10
+
+Training (LLM Studio) and the Creativity canvas are gone from the API
+(uarp #445, deployed as build `e0da8c83`), and the copy follows the served
+document byte for byte: `spec/openapi.json` is
+`curl https://api.snaga.ai/api/v1/openapi.json` verbatim, sha256
+`4a1a5f9c0a11d827c9cb6fe682c4b06da7e0c2bb7fe838809330b5162b0c0267`, `info.version` 0.4.0,
+`X-API-Version` 2026-09-10. 709 operations and 239 schemas, down from 710
+and 242 — the sixteen operations uarp #444 described from their bytes arrived
+in the same document.
+
+### Removed
+
+- Every `/api/v1/training-jobs/*` and `/api/v1/creativity/sessions/*`
+  operation — the generated `training` and `creativity` resources are deleted
+  in all five SDKs.
+- Schemas `TrainingDroplet`, `TrainingGate`, `TrainingHyperparams`,
+  `TrainingJob`, `TrainingJobMetrics`, `TrainingJobRequest`,
+  `TrainingPersona`, `TrainingQuote`, `TrainingSettings`.
+
+### Added
+
+- The sixteen operations described in uarp #444: run feedback (`PUT`/`GET`
+  `/runs/{runId}/feedback`), `PATCH /me`, workspace file history and version
+  content, the three public-session operations (`share`, `upload`,
+  `runs/{runId}/cancel`), agent bookmarks, `POST /sessions/bulk-delete`,
+  `POST /workspaces/{id}/publish`, `POST /agents/{id}/memory/import` — with
+  their real bodies and responses; every authenticated mutating operation now
+  declares the `202` in-flight response and the `X-Idempotency-Replayed`
+  header.
+
+## 0.5.17 — 2026-09-10
+
+The Commerce surface is gone from the API (uarp #441, deployed as build
+`4d323a8b`), and this copy follows the served document byte for byte:
+`spec/openapi.json` is `curl https://api.snaga.ai/api/v1/openapi.json`
+verbatim, sha256
+`5647eb801f794ef9d5ca2eecf15c1f122cfd6f8935d00e8537c5a76b93ecaff8`, `info.version`
+0.3.0, `X-API-Version` 2026-09-10. 710 operations and 242 schemas, down from
+725 and 251.
+
+### Removed
+
+- Every `/api/v1/commerce/*` operation (products, customers, orders,
+  enrollments, analytics) and `POST /api/v1/webhooks/shopify` — the generated
+  `commerce` resource is deleted in all five SDKs (TypeScript
+  `resources/commerce.ts`, Rust `api/commerce.rs`, Swift `CommerceAPI.swift`,
+  Kotlin `CommerceApi.kt`, Ada `uarp-api-commerce`).
+- Schemas `Customer`, `CustomerUpdate`, `Product`, `ProductUpdate`, `Order`,
+  `Enrollment`.
+
+## 0.5.16 — 2026-09-10
+
+Cut from the bytes production serves, not from a copy of the source document.
+`spec/openapi.json` is now `curl https://api.snaga.ai/api/v1/openapi.json`
+verbatim, sha256 `2d0119336bb7b507343b9b2ec41b80b2d6bafc6863ecddfdc54597e4f682e938`,
+build `53ab19ed`. The previous copy had drifted to 712 operations against the
+platform's 725 — the three Android closed-testing routes, the public blog, the
+link-preview pair, `/api/v1/health`, the knowledge-base retrieval routes and
+the `410` a public session now answers when its TTL has passed.
+
+- 712 operations to **725**, 242 schemas to **248**.
+- Every `nullable: true` from OpenAPI 3.0 is gone; null is a type union now, so
+  generated optionals stop depending on a keyword 3.1 does not define. Seven
+  enums that sat beside a nullable gained `null` as a member — without it a
+  strict decoder rejects the very value the field exists to carry.
+- `OAuthLoginProviderItem.id` lists `apple` beside `github` and `google`. The
+  wire has answered all three for months; a generated Swift or Kotlin decoder
+  throws on a value outside an enum, and this is the login screen's provider
+  list, where a throw means no buttons at all.
+- `info.license` carries an SPDX `identifier`, so the document validates as 3.1
+  rather than failing at the first schema check.
+
+Verified both directions rather than by count: every method+path pair in the
+document has a call site in `packages/typescript/dist`, and every call site in
+`dist` is in the document — 725 to 725, none missing, none extra.
+
+## 0.5.15 — 2026-08-28
+
+The first release cut from a document that matches what the platform serves.
+559 operations to 641, 163 schemas to 219 — the 0.5.14 tag was cut before the
+document refresh landed, so everything below has been on `main` and in no
+installable package.
+
+### Fixed — all five clients
+
+- **`quota_overrides` stopped being a copy of the plan's quotas.** It was
+  declared `$ref: TenantQuotas`, which requires sixteen fields, and overrides
+  are partial by definition — a tenant that overrides six sends six. So every
+  strict client failed to decode `GET /tenants/me` outright. Measured against
+  the released 0.5.14 model and a live production body:
+
+      before   DECODE FAILED: missing field `max_workers_per_team`
+      after    DECODED OK
+
+  Rust, Swift and Kotlin all generated the sixteen as non-optional. To be
+  precise about the blast radius, since an earlier draft of this entry
+  overstated it: no PUBLISHED package was affected. 0.5.13 predates the
+  refresh that introduced `TenantQuotas` and does not model `quota_overrides`
+  at all, so it decodes the same body cleanly — verified against the crate
+  pulled from crates.io, not against a local tree. The defect lived in `main`
+  from the document refresh onward and would have shipped with this release.
+  It was caught first. The fix is a dedicated all-optional
+  `TenantQuotaOverrides`; `TenantQuotas` is correct as it stands for the
+  effective set and is unchanged.
+
+- **`cursor` is nullable on `/files` and `/public/tenants`.** Both were
+  declared a plain string and both serve `null` on the last page — the same
+  strict-decoder hazard, on pagination, which every consumer touches.
+
+- **Workspace file upload sent no body at all.** `uploadWorkspaceFile` had no
+  body parameter, so the route's `arrayBuffer()` received zero bytes and wrote
+  an EMPTY file under a 200. `downloadWorkspaceFile` ran binary responses
+  through a JSON parser, corrupting any png or pdf into something that still
+  opens.
+
+- **Team runs.** `startTeamRun` takes `input` and `metadata` instead of four
+  top-level fields the handler was discarding in silence; `listTeamRuns` gained
+  the `limit` and `cursor` the handler has always read, so a client is no longer
+  stuck on the first fifty; `streamTeamRunEvents` takes `teamRunId` like every
+  sibling under that prefix.
+
+### Added
+
+- **82 operations and 56 schemas** the vendored document had been missing.
+- **`getAgentActivityStats` declares the fourteen fields it serves**, not three.
+  `cancelledRuns`, `guardrailBlockedRuns`, `errorRatePercent`, `avgStepsPerRun`,
+  `avgDurationMs`, `avgInputTokens`, `avgOutputTokens`, `avgThinkingTokens`,
+  `toolBreakdown`, `topErrorMessages` and `runsByDay` were being served and were
+  invisible in all five clients.
+
+### Changed — source-breaking, though nothing that works today breaks
+
+- `uploadWorkspaceFile` gains a required body parameter and
+  `downloadWorkspaceFile` returns binary (`Blob` / `bytes::Bytes` / `Data` /
+  `ByteArray` / `UARP.Types.Text`). Calling either today writes an empty file
+  or corrupts a download, so there is no working call site to regress.
+- `Tenant.quota_overrides` changes type from `TenantQuotas` to
+  `TenantQuotaOverrides`. Anyone naming that type in a signature must rename it.
+- `getGovernanceLedger`'s `from` and `to` change from string to integer. They
+  are ledger SEQUENCE NUMBERS, not timestamps, and were declared as strings —
+  so callers reasonably sent an ISO timestamp, the server ran it through
+  `parseInt`, and `2026-08-28T18:00:00Z` silently became sequence 2026. The
+  request then answered 200 with an empty page over a ledger holding thousands
+  of entries. Non-integer values are now rejected with 400 instead. The
+  parameter also gained `count`, which is what most callers actually want.
+
+### Internal
+
+- The freshness gate hashes the whole document canonically rather than its
+  schema and path NAMES. The name digest could not see a request body being
+  declared, a media type added or a false `required` dropped, and it reported
+  `current` over a document three fixes behind.
+- The generator refuses two operations in one group that would emit the same
+  method name — five compiler errors' worth of information, available before
+  any of them run. It checks the emitted name, not the `operationId`: the live
+  document has a duplicate id across two groups and it is harmless.
+- A route-coverage gate compares the BUILT client against the operations the
+  platform serves, because the Ada manifest is generated from the TypeScript
+  declarations rather than from openapi — so a gate on the spec alone goes
+  green while the last link stays stale.
+- CI enforces the commit-trailer rule the repository documents. There was no
+  `commit-msg` hook and never had been.
+- `scripts/set-version.sh` writes the version into `package-lock.json`, which
+  it never did, so every release left the lockfile a version behind (#42).
+- The contract gate no longer dies on macOS's `/usr/bin/java` stub, which
+  exists and fails; it now runs four SDKs where it ran none.
+
+## 0.5.14 — 2026-08-26
+
+### Fixed — Ada
+
+- **The models unit compiles on Windows.** A PE-COFF object header holds its
+  section count in 16 bits, so 65535 is the ceiling, and `uarp-models.o` asked
+  for 164648 — every Windows runner on the index PR stopped at
+  `as: too many sections` (alire-project/alire-index#2059). It asked because
+  `uarp-models.ads` declares 1824 subprograms and instantiates
+  `Ada.Containers.Vectors` 126 times, all of it landing in that one object,
+  and because Alire's profiles pass `-ffunction-sections -fdata-sections` —
+  one section per subprogram, plus its `.pdata$` and `.xdata$` unwind sections
+  on x86-64 Windows. ELF has no such ceiling, which is why Linux and macOS
+  built it all along. The two switches are now off for that unit alone,
+  which costs only the linker's dead-code stripping inside it; the rest of
+  the crate stays sectioned as the profile asks.
+
+  Verified on Windows 10 against the index's own toolchain (alr 2.1.1,
+  gnat_native 15.3.1, gprbuild 26.0.1): 176494 sections before, 100 after,
+  `libuarp_sdk.a` archived, the test suite 127/127 green over real HTTP and
+  SSE, and all three examples linked against libcurl.
+
+- **The Ada CI job now also builds on Windows.** It ran on `ubuntu-latest`
+  alone, so a break of this class had nowhere to surface but the index PR.
+
+No generated code changed — this is the version the index submission moves to.
+
 ## 0.5.13 — 2026-08-21
 
 ### Fixed — Ada

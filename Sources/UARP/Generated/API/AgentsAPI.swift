@@ -10,10 +10,14 @@ public struct AgentsAPI: Sendable {
 
     /// Activate agent
     ///
+    /// Returns a suspended agent to `active` and clears its `status_reason`. `409` when the agent
+    /// is in any state other than `suspended`, and `409` on a lost CAS against a concurrent write.
+    /// Returns the sanitised agent.
+    ///
     /// `POST /api/v1/agents/{agentId}/activate`
     ///
     /// Required scopes: `agents:write`.
-    public func activateAgent(agentId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func activateAgent(agentId: String, options: RequestOptions = .init()) async throws -> Agent {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/activate",
@@ -23,6 +27,18 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Create an agent
+    ///
+    /// Creates an agent in the caller's tenant and returns it with `201`. The plan's agent cap is
+    /// enforced twice — a fast count that excludes bridge agents, then an atomic slot claim inside
+    /// a per-tenant lock — and a tenant at the cap is refused `403`; a super-admin tenant bypasses
+    /// both. `model`, `fallback_model` and `prompts.system` in the body are ignored: every agent is
+    /// born on the platform default model and a neutral system prompt, and
+    /// `built_in_tools`/`skills` are stripped by the schema (tools come from installed SPECs). Each
+    /// MCP server with an `http` transport has its URL checked against a DNS-aware SSRF guard and
+    /// the list against `max_mcp_servers`; on success the handler also writes version 1, creates
+    /// the agent's Ed25519 identity, registers any inline `schedule` with the cron scheduler, and —
+    /// when the agent is created public — the cross-tenant discovery index. The response withholds
+    /// `model.provider`, `model.model_ref`, `model.endpoint_url` and `fallback_model`.
     ///
     /// `POST /api/v1/agents`
     ///
@@ -37,7 +53,37 @@ public struct AgentsAPI: Sendable {
         ))
     }
 
+    /// Pin a message
+    ///
+    /// Idempotent on `message_id`: pinning a message already pinned returns the existing record
+    /// with 200 and changes nothing; a new pin is 201. `content` is stored as sent (≤10 000 chars).
+    /// Unknown fields are dropped. `message_id` is stored as sent. The canonical form is the id
+    /// `GET /sessions/{sessionId}/messages` serves for the entry (`{run_id}`, `{run_id}-reply[-N]`,
+    /// `{run_id}-user-N`, `{run_id}-tool-N`, `{run_id}-system-N`); any other string is accepted —
+    /// older iOS builds send `{run_id}-{timestamp}-assistant-{hash}` and App Store never retires
+    /// them — but cannot be matched back to the transcript, and each such arrival is counted per
+    /// day (owner's decision 2026-09-11, option A: a 422 comes no earlier than a month of zero).
+    ///
+    /// `POST /api/v1/agents/{agentId}/bookmarks`
+    ///
+    /// Required scopes: `agents:write`.
+    public func createAgentBookmark(agentId: String, body: CreateAgentBookmarkRequest, options: RequestOptions = .init()) async throws -> AgentBookmark {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/bookmarks",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Create or update FRIA report
+    ///
+    /// Creates or replaces the agent's Fundamental Rights Impact Assessment. The agent must already
+    /// carry a risk classification of `limited` or `high`, otherwise the request is refused `422` —
+    /// a FRIA is only required at those levels. The stored report is replaced whole (there is no
+    /// partial update) and stamped with the current time as `assessed_at` and the agent's current
+    /// risk level; the write is audit-logged as `agent.fria_updated`.
     ///
     /// `POST /api/v1/agents/{agentId}/fria`
     ///
@@ -54,15 +100,21 @@ public struct AgentsAPI: Sendable {
 
     /// Create a version snapshot of an agent
     ///
+    /// Snapshots the agent's CURRENT stored configuration as a new numbered version and returns it
+    /// with `201`. The version number comes from a per-agent counter incremented under CAS, so
+    /// concurrent calls cannot mint the same number. Unlike the automatic snapshots that
+    /// `PUT`/`PATCH` take, this endpoint enforces the plan's version quota hard and answers `403`
+    /// when the history is full — it exists so the caller knows whether the snapshot landed. The
+    /// embedded `config` is sanitised the same way `GET /api/v1/agents/{agentId}` is.
+    ///
     /// `POST /api/v1/agents/{agentId}/versions`
     ///
     /// Required scopes: `agents:write`.
-    public func createAgentVersion(agentId: String, body: CreateAgentVersionRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func createAgentVersion(agentId: String, body: CreateAgentVersionRequest, options: RequestOptions = .init()) async throws -> AgentVersion {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/versions",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -70,10 +122,18 @@ public struct AgentsAPI: Sendable {
 
     /// Delete an agent
     ///
+    /// Deletes the agent and everything keyed to it. Refused `423` while the tenant is under legal
+    /// hold, `403` for the tenant's head agent, and `409` for an agent that is published and
+    /// serving a public chat — unpublish it first. The agent record is removed inside the request
+    /// and the cascade over the tenant's sessions, runs and events runs in the background, guarded
+    /// against a second concurrent cascade by a 24-hour tombstone, so a repeated call is a cheap
+    /// `404`; the attempt is audit-logged before the cascade starts so an interrupted sweep still
+    /// leaves a trail. Irreversible.
+    ///
     /// `DELETE /api/v1/agents/{agentId}`
     ///
     /// Required scopes: `agents:write`.
-    public func delete(agentId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func delete(agentId: String, options: RequestOptions = .init()) async throws -> DeleteAgentResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/agents/\(encodePathSegment(agentId))",
@@ -82,7 +142,30 @@ public struct AgentsAPI: Sendable {
         ))
     }
 
+    /// Unpin one message
+    ///
+    /// Removes one bookmarked message from this agent's bookmark list. `404` when that message is
+    /// not bookmarked — unlike the clear-all form, this one checks the record exists first, so a
+    /// repeated call reports the absence rather than succeeding twice. The message itself is
+    /// untouched; only the bookmark is deleted.
+    ///
+    /// `DELETE /api/v1/agents/{agentId}/bookmarks/{messageId}`
+    ///
+    /// Required scopes: `agents:write`.
+    public func deleteAgentBookmark(agentId: String, messageId: String, options: RequestOptions = .init()) async throws -> DeleteAgentBookmarkResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/bookmarks/\(encodePathSegment(messageId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Delete agent identity
+    ///
+    /// Deletes the agent's stored keypair and answers `204`. Idempotent: it does not check that an
+    /// identity existed, so a repeat call succeeds the same way. The agent keeps running; it simply
+    /// has no signing identity until one is created again.
     ///
     /// `DELETE /api/v1/agents/{agentId}/identity`
     ///
@@ -96,7 +179,36 @@ public struct AgentsAPI: Sendable {
         ))
     }
 
+    /// Unpin every message of an agent
+    ///
+    /// Removes every bookmarked message for this agent and returns `{removed}` — the number
+    /// actually deleted. It sweeps one listing page of up to 1000 bookmarks, so an agent with more
+    /// than that needs repeated calls. Idempotent: a second call answers `{removed: 0}`.
+    ///
+    /// `DELETE /api/v1/agents/{agentId}/bookmarks`
+    ///
+    /// Required scopes: `agents:write`.
+    public func deleteAllAgentBookmarks(agentId: String, options: RequestOptions = .init()) async throws -> DeleteAllAgentBookmarksResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/bookmarks",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Get an agent
+    ///
+    /// Returns one agent, `404` when no such agent exists in the tenant. A record still carrying
+    /// the legacy `built_in_tools`/`skills` fields is migrated into `specs[]` on read and written
+    /// back under CAS, so the shape settles after the first fetch. For an agent with
+    /// `execution_mode: "bridge"` a `bridge` block is added from the live connection records
+    /// (online machine count, platforms, working directories, latest heartbeat and the machines'
+    /// `installed_specs` report); the enrichment is best-effort and its absence is not an error.
+    /// `model.provider`, `model.model_ref`, `model.endpoint_url` and `fallback_model` are withheld
+    /// — only `model.capabilities` travels — and `status` is filled in as `active` when the stored
+    /// record has none. Any unrecognised sub-path under the agent answers `404` instead of being
+    /// served this record.
     ///
     /// `GET /api/v1/agents/{agentId}`
     ///
@@ -110,6 +222,14 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Get agent activity stats
+    ///
+    /// Aggregates the agent's per-run activity logs into run counts by outcome, error rate,
+    /// averages for steps, duration and tokens, a tool breakdown, the most frequent error messages
+    /// and a per-day series. `days` selects the window — default 30, clamped to 1..90. These
+    /// figures come from the on-disk activity log rather than the run records, so when the platform
+    /// is running without `logging.agent_activity_dir` configured the endpoint answers `200` with
+    /// an all-zero object instead of an error; a zero here can mean "not recorded" as well as "no
+    /// runs".
     ///
     /// `GET /api/v1/agents/{agentId}/activity-stats`
     ///
@@ -129,10 +249,16 @@ public struct AgentsAPI: Sendable {
 
     /// Get agent capability manifest
     ///
+    /// Returns the agent's capability manifest, which the team router reads when it decides what to
+    /// delegate. An agent with no stored manifest is not a `404`: one is generated from its current
+    /// configuration and returned without being persisted, so the first read after `PUT` and the
+    /// first read before it differ in origin but not in shape. `404` only when the agent itself
+    /// does not exist.
+    ///
     /// `GET /api/v1/agents/{agentId}/capabilities`
     ///
     /// Required scopes: `agents:read`.
-    public func getAgentCapabilities(agentId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAgentCapabilities(agentId: String, options: RequestOptions = .init()) async throws -> AgentCapabilities {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/capabilities",
@@ -141,6 +267,10 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Get Fundamental Rights Impact Assessment
+    ///
+    /// Returns the agent's Fundamental Rights Impact Assessment. `404` both when the agent does not
+    /// exist and when it has no FRIA report yet — an absent assessment is not served as an empty
+    /// one, so a client never has to tell two shapes apart.
     ///
     /// `GET /api/v1/agents/{agentId}/fria`
     ///
@@ -155,6 +285,11 @@ public struct AgentsAPI: Sendable {
 
     /// Get agent identity (public key)
     ///
+    /// Returns the agent's public cryptographic identity — the Ed25519 public key and its metadata;
+    /// the private half never leaves the identity store. `404` when the agent has no identity,
+    /// which is the state of every agent created while `UARP_IDENTITY_ENCRYPTION_KEY` was not
+    /// configured.
+    ///
     /// `GET /api/v1/agents/{agentId}/identity`
     ///
     /// Required scopes: `agents:read`.
@@ -168,6 +303,10 @@ public struct AgentsAPI: Sendable {
 
     /// Read the EU AI Act risk classification
     ///
+    /// Returns the agent's EU AI Act risk classification alone — not the agent record. `404` when
+    /// the agent does not exist, and `404` with a pointer to the `PATCH` when the agent exists but
+    /// has never been classified.
+    ///
     /// `GET /api/v1/agents/{agentId}/risk-classification`
     ///
     /// Required scopes: `agents:read`.
@@ -179,7 +318,32 @@ public struct AgentsAPI: Sendable {
         ))
     }
 
+    /// Tool → output-view catalog
+    ///
+    /// What the builder needs to render a tool result: for each tool the agent can actually call,
+    /// the SPEC that owns it and the view to render its output with.
+    ///
+    /// Only tools the agent can actually call are listed — the same filter the runtime applies,
+    /// which since 2026-09-21 means the agent's declared, enabled SPECs — so the UI cannot offer a
+    /// view for a tool that will never fire. A stored view whose JSON will not parse is skipped,
+    /// not fatal: one broken view must not take the catalog down.
+    ///
+    /// `GET /api/v1/agents/{agentId}/spec-catalog`
+    ///
+    /// Required scopes: `agents:read`.
+    public func getAgentSpecCatalog(agentId: String, options: RequestOptions = .init()) async throws -> SpecToolCatalog {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/spec-catalog",
+            options: options
+        ))
+    }
+
     /// Get EU AI Act Annex IV system card
+    ///
+    /// Generates the EU AI Act Annex IV system card for the agent from its stored configuration;
+    /// `404` when the agent does not exist. `format=markdown` returns the same card rendered as
+    /// `text/markdown` instead of JSON. Read-only — nothing is stored.
     ///
     /// `GET /api/v1/agents/{agentId}/system-card`
     ///
@@ -199,6 +363,10 @@ public struct AgentsAPI: Sendable {
 
     /// Get traffic split configuration
     ///
+    /// Returns the agent's traffic split across versions. An agent with no split configured is not
+    /// a `404`: the response is `{agent_id, entries: [], updated_at: null}`, which the runtime
+    /// reads as "always use the latest version".
+    ///
     /// `GET /api/v1/agents/{agentId}/traffic`
     ///
     /// Required scopes: `agents:read`.
@@ -211,6 +379,13 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Diff between two agent versions
+    ///
+    /// Compares two version snapshots of the agent and returns the top-level keys that differ, each
+    /// as `{from, to}`, plus `changed_fields`. `compare_to` names the other version and defaults to
+    /// `versionNum - 1`. `404` when either version is missing from the history. The comparison is
+    /// made on the SANITISED snapshots, so fields withheld from `GET /api/v1/agents/{agentId}` —
+    /// provider, model reference, endpoint, fallback model — are not republished by a diff that
+    /// happens to span a change to them.
     ///
     /// `GET /api/v1/agents/{agentId}/versions/{versionNum}/diff`
     ///
@@ -229,6 +404,15 @@ public struct AgentsAPI: Sendable {
     }
 
     /// List all agents
+    ///
+    /// Lists the tenant's agents newest first. `limit` defaults to 20 and is capped at 100,
+    /// `cursor` is the opaque continuation from the previous page, and `has_more` says whether more
+    /// remain. Bridge agents whose machine is not currently connected are omitted unless
+    /// `include_offline=true`, and attribution-only shells are dropped entirely; because those
+    /// filters run after the KV read, the page is refilled round by round until `limit` VISIBLE
+    /// rows are collected, bounded at 500 scanned rows and 20 rounds — when a bound stops the scan
+    /// early `has_more` stays true rather than claiming completeness. Bridge rows are enriched with
+    /// the live machine's capabilities instead of the summary frozen into the record at enrolment.
     ///
     /// `GET /api/v1/agents`
     ///
@@ -266,23 +450,98 @@ public struct AgentsAPI: Sendable {
         )
     }
 
-    /// List version snapshots for an agent
+    /// Pinned messages of an agent
     ///
-    /// Returns the ordered version history for an agent. Lazily creates v1 from the current config
-    /// if no versions exist yet.
+    /// Up to 1000, unordered. `{"items":[]}` on an agent with none (measured 2026-09-10).
     ///
-    /// `GET /api/v1/agents/{agentId}/versions`
+    /// `GET /api/v1/agents/{agentId}/bookmarks`
     ///
     /// Required scopes: `agents:read`.
-    public func listAgentVersions(agentId: String, options: RequestOptions = .init()) async throws -> ListAgentVersionsResponse {
+    public func listAgentBookmarks(agentId: String, options: RequestOptions = .init()) async throws -> ListAgentBookmarksResponse {
         return try await client.send(RequestSpec(
             method: "GET",
-            path: "/api/v1/agents/\(encodePathSegment(agentId))/versions",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/bookmarks",
             options: options
         ))
     }
 
+    /// Messages between agents
+    ///
+    /// Newest first. `agent_id` matches a message in EITHER direction — sent or received — which is
+    /// what an inbox view of one agent means.
+    ///
+    /// `total_scanned` is how many messages the scan looked at before `limit` was applied, so a
+    /// client can tell a short page from an exhausted one.
+    ///
+    /// `GET /api/v1/agent-mail`
+    ///
+    /// Required scopes: `agents:read`.
+    public func listAgentMail(threadId: String? = nil, agentId: String? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> ListAgentMailResponse {
+        var query: [URLQueryItem] = []
+        if let threadId {
+            query.append(URLQueryItem(name: "thread_id", value: threadId))
+        }
+        if let agentId {
+            query.append(URLQueryItem(name: "agent_id", value: agentId))
+        }
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/agent-mail",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// List version snapshots for an agent
+    ///
+    /// Returns the ordered version history for an agent. Lazily creates v1 from the current config
+    /// if no versions exist yet. Versions are never deleted and there is no DELETE for one: a
+    /// rollback records a NEW version (`changelog` "Rollback to version N"), so the history stays
+    /// complete for the audit.
+    ///
+    /// `GET /api/v1/agents/{agentId}/versions`
+    ///
+    /// Required scopes: `agents:read`.
+    public func listAgentVersions(agentId: String, limit: Int? = nil, cursor: String? = nil, fields: ListAgentVersionsFields? = nil, options: RequestOptions = .init()) async throws -> ListAgentVersionsResponse {
+        var query: [URLQueryItem] = []
+        if let limit {
+            query.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        if let cursor {
+            query.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        if let fields {
+            query.append(URLQueryItem(name: "fields", value: fields.rawValue))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/versions",
+            query: query,
+            options: options
+        ))
+    }
+
+    /// Stream every item returned by `listAgentVersions`, following the `cursor` cursor until the
+    /// server reports no further pages.
+    public func listAgentVersionsAll(agentId: String, limit: Int? = nil, cursor: String? = nil, fields: ListAgentVersionsFields? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<AgentVersion, Error> {
+        autoPaginate(
+            fetch: { cursor in try await self.listAgentVersions(agentId: agentId, limit: limit, cursor: cursor, fields: fields, options: options) },
+            items: { $0.items },
+            cursor: { $0.cursor },
+            hasMore: { $0.hasMore }
+        )
+    }
+
     /// Partial update agent
+    ///
+    /// WRITE SEMANTICS: merges. Top-level fields the body omits keep their stored values.
+    /// `public_config` merges one level (agents.ts). `metadata` merges one level, `metadata.ui` one
+    /// more, and `metadata.ui.avatar` one more (agent-genome.ts mergeAgentMetadata) — so a client
+    /// may send `{metadata: {ui: {avatar: {hue: 40}}}}` without erasing `protocol`, `variant`,
+    /// `drop_genome` or `drop_genome_source`. Any other nested object is replaced whole.
     ///
     /// `PATCH /api/v1/agents/{agentId}`
     ///
@@ -297,12 +556,44 @@ public struct AgentsAPI: Sendable {
         ))
     }
 
+    /// Clear an agent's memory and conversation history
+    ///
+    /// Purges the agent's memory store and every session it owns — with their runs, events and
+    /// todos — plus any session-less runs. The agent RECORD is untouched: prompts, model, tools,
+    /// specs, workspaces and marketplace listings all survive. The same purge the super-agent's
+    /// cross-tenant `manageAgent("reset")` hook calls, deliberately shared rather than copied.
+    ///
+    /// Undeclared until 2026-08-31 while the console shipped a button for it — a route can be
+    /// missing from the contract and still be in people's hands. The two symptoms differ by client:
+    /// a hand-written client BUILDS a workaround (the web calls it with a direct POST, past the
+    /// SDK), while a generated one simply has no method and nobody notices. That makes the SDK side
+    /// the quieter of the two — there is not even a crutch to show someone came looking.
+    ///
+    /// `POST /api/v1/agents/{agentId}/reset`
+    ///
+    /// Required scopes: `agents:write`.
+    public func resetAgent(agentId: String, options: RequestOptions = .init()) async throws -> ResetAgentResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/reset",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Rollback an agent to a previous version
+    ///
+    /// Restores the configuration stored in the version named by `version` over the live agent
+    /// record, and returns that version record. `404` when the agent has no such version. The write
+    /// is a CAS against the agent as it was read, so a concurrent modification answers `409` rather
+    /// than overwriting it. The agent's genome (its `metadata` appearance fields) is deliberately
+    /// NOT rolled back — the live one is carried onto the restored config, so a rollback changes
+    /// what the agent does and not what it looks like.
     ///
     /// `POST /api/v1/agents/{agentId}/rollback`
     ///
     /// Required scopes: `agents:write`.
-    public func rollbackAgent(agentId: String, body: RollbackAgentRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func rollbackAgent(agentId: String, body: RollbackAgentRequest, options: RequestOptions = .init()) async throws -> AgentVersion {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/rollback",
@@ -313,6 +604,10 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Rotate agent identity
+    ///
+    /// Generates a new Ed25519 keypair for the agent, replacing the stored one, and returns the new
+    /// public identity. `404` when the agent has no identity to rotate — rotation does not create
+    /// one. Anything that pinned the previous public key stops verifying after this call.
     ///
     /// `POST /api/v1/agents/{agentId}/identity/rotate`
     ///
@@ -327,6 +622,11 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Set agent capabilities
+    ///
+    /// Stores the agent's capability manifest, replacing any previous one; `agent_id` is taken from
+    /// the path and an `agent_id` in the body is ignored. Only `capabilities`, `tools` (up to 200)
+    /// and `permissions` are read from the body — anything else is stripped. Returns `{status,
+    /// agent_id}` rather than the stored manifest; read it back with the `GET` on this path.
     ///
     /// `PUT /api/v1/agents/{agentId}/capabilities`
     ///
@@ -343,10 +643,16 @@ public struct AgentsAPI: Sendable {
 
     /// Set traffic split configuration
     ///
+    /// Replaces the agent's traffic split with the `entries` in the body — between 1 and 20
+    /// `{version, weight}` pairs whose weights must sum to 100; a set that does not sum to 100 is
+    /// refused and nothing is stored. The split is what the runtime draws against when it resolves
+    /// which version a new run executes, using a cryptographically-secure weighted draw. The agent
+    /// record itself is untouched.
+    ///
     /// `PUT /api/v1/agents/{agentId}/traffic`
     ///
     /// Required scopes: `agents:write`.
-    public func setAgentTraffic(agentId: String, body: SetAgentTrafficRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setAgentTraffic(agentId: String, body: SetAgentTrafficRequest, options: RequestOptions = .init()) async throws -> SetAgentTrafficResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/traffic",
@@ -358,10 +664,16 @@ public struct AgentsAPI: Sendable {
 
     /// Suspend agent
     ///
+    /// Moves an agent from `active` to `suspended`, which stops it accepting new runs. `409` when
+    /// the agent is in any other state, and `409` again when a concurrent write lands between the
+    /// read and the CAS — two competing suspends, or a suspend racing an activate, cannot both
+    /// succeed. An optional `reason` in the body is stored as `status_reason`; `status_changed_at`
+    /// and `updated_at` are stamped. Returns the sanitised agent.
+    ///
     /// `POST /api/v1/agents/{agentId}/suspend`
     ///
     /// Required scopes: `agents:write`.
-    public func suspendAgent(agentId: String, body: SuspendAgentRequest? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func suspendAgent(agentId: String, body: SuspendAgentRequest? = nil, options: RequestOptions = .init()) async throws -> Agent {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -373,6 +685,13 @@ public struct AgentsAPI: Sendable {
     }
 
     /// Terminate/delete agent
+    ///
+    /// Permanently destroys the agent and everything keyed to it: the full cascade runs inside the
+    /// request and the record is deleted. Requires the `agents.delete` permission; refused `423`
+    /// while the tenant is under legal hold and `403` for the tenant's head agent. Unlike `DELETE
+    /// /api/v1/agents/{agentId}` it does NOT refuse a published agent — the cascade clears the
+    /// tenant's public pointers as part of the teardown, which is the difference between the two
+    /// routes. Irreversible, and audit-logged before and after the cascade.
     ///
     /// `POST /api/v1/agents/{agentId}/terminate`
     ///
@@ -388,15 +707,24 @@ public struct AgentsAPI: Sendable {
 
     /// Update an agent
     ///
+    /// WRITE SEMANTICS: merges — this method and `PATCH` share one handler, so the note on `PATCH
+    /// /api/v1/agents/{agentId}` applies here unchanged. `model`, `fallback_model` and
+    /// `prompts.system` in the body are ignored, `@platform/core` and `@platform/essentials` cannot
+    /// be dropped from `specs[]` (`422`), the `platform_control` capability cannot be newly granted
+    /// and `execution_mode` cannot be moved to or from `bridge` (`403`), and a `workspace_id` must
+    /// belong to this tenant. The agent is snapshotted as a new version before the write and again
+    /// after it, so one update appends two entries to the version list; the version quota is
+    /// informational here and a full history only skips the snapshot rather than failing the
+    /// update. The record is written under CAS, so a concurrent update answers `409`.
+    ///
     /// `PUT /api/v1/agents/{agentId}`
     ///
     /// Required scopes: `agents:write`.
-    public func update(agentId: String, body: AgentUpdate? = nil, options: RequestOptions = .init()) async throws -> Agent {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func update(agentId: String, body: AgentUpdate, options: RequestOptions = .init()) async throws -> Agent {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/agents/\(encodePathSegment(agentId))",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -404,13 +732,50 @@ public struct AgentsAPI: Sendable {
 
     /// Update EU AI Act risk classification (admin only)
     ///
+    /// Sets the agent's EU AI Act risk classification. Beyond the `agents:write` scope this
+    /// requires the caller to hold the `admin` ROLE — classification is a tenant-policy act, not a
+    /// developer-level config change. The classification is replaced whole: `level`,
+    /// `annex_iii_category`, `justification`, `assessor`, `assessed_at` (defaulted to now when
+    /// omitted) and `review_due_at` are taken from the body, so a field omitted here is cleared
+    /// rather than kept. The write is a CAS against the agent record — `409` when a concurrent
+    /// update lands first, which is what stops an ordinary agent save clobbering the compliance
+    /// trail — and it is audit-logged. The response is the whole sanitised agent, not just the
+    /// classification.
+    ///
     /// `PATCH /api/v1/agents/{agentId}/risk-classification`
     ///
     /// Required scopes: `agents:write`.
-    public func updateAgentRiskClassification(agentId: String, body: RiskClassificationUpdate, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAgentRiskClassification(agentId: String, body: RiskClassificationUpdate, options: RequestOptions = .init()) async throws -> Agent {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/risk-classification",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Set one per-tool trust override
+    ///
+    /// Upserts a single entry: sending the same `tool_name` twice replaces its `trust_level` rather
+    /// than adding a second row. The response is the agent's FULL override list after the write, so
+    /// a client can render the table without a second call.
+    ///
+    /// WRITE SEMANTICS: merges. Read from the handler, not from the body shape: it loads the agent,
+    /// drops any existing entry with this `tool_name`, appends the new one and leaves every other
+    /// override untouched. So this call cannot clear the list, and cannot set two entries at once.
+    ///
+    /// The write is a compare-and-set against the agent record, so a concurrent `PUT
+    /// /agents/{agentId}` cannot clobber the override with a stale snapshot — a lost race answers
+    /// 409 and the caller reloads.
+    ///
+    /// `PATCH /api/v1/agents/{agentId}/autonomy/tool-override`
+    ///
+    /// Required scopes: `agents:write`.
+    public func upsertAgentToolOverride(agentId: String, body: AgentToolOverrideUpdate, options: RequestOptions = .init()) async throws -> UpsertAgentToolOverrideResponse {
+        return try await client.send(RequestSpec(
+            method: "PATCH",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/autonomy/tool-override",
             body: try client.encode(body),
             idempotent: true,
             options: options

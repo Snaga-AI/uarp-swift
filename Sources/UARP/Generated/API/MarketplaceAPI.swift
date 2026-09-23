@@ -10,6 +10,11 @@ public struct MarketplaceAPI: Sendable {
 
     /// Get marketplace listing details
     ///
+    /// Reads one listing from the shared marketplace index, so a listing published by any tenant is
+    /// readable here and no scope is required beyond the bearer key. 404 when no such listing
+    /// exists. The branch requires the bare path: a request carrying any sub-path this handler does
+    /// not name is refused 404 rather than answered with the listing.
+    ///
     /// `GET /api/v1/marketplace/listings/{listingId}`
     ///
     /// Required scopes: `marketplace:read`.
@@ -22,6 +27,12 @@ public struct MarketplaceAPI: Sendable {
     }
 
     /// Get reviews for a listing
+    ///
+    /// Pages the ratings left on a listing. The listing is read first, so an unknown id is 404
+    /// rather than an empty list. `limit` defaults to 20 and is capped at 100 — a malformed value
+    /// falls back to the default instead of reaching the store, where it used to produce a 500 —
+    /// and `cursor` is echoed back only when more reviews remain. `total` is the length of this
+    /// page, not the review count.
     ///
     /// `GET /api/v1/marketplace/listings/{listingId}/reviews`
     public func getListingReviews(listingId: String, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) async throws -> GetListingReviewsResponse {
@@ -42,7 +53,7 @@ public struct MarketplaceAPI: Sendable {
 
     /// Stream every item returned by `getListingReviews`, following the `cursor` cursor until the
     /// server reports no further pages.
-    public func getListingReviewsAll(listingId: String, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<JSONObject, Error> {
+    public func getListingReviewsAll(listingId: String, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<MarketplaceListingRating, Error> {
         autoPaginate(
             fetch: { cursor in try await self.getListingReviews(listingId: listingId, limit: limit, cursor: cursor, options: options) },
             items: { $0.reviews ?? [] },
@@ -53,10 +64,14 @@ public struct MarketplaceAPI: Sendable {
 
     /// List marketplace categories
     ///
+    /// Returns the fixed category vocabulary that `POST /marketplace/listings` accepts and that
+    /// `search` filters on. The list is a constant in the store — no storage is read, no parameters
+    /// are taken, and the answer is the same for every caller.
+    ///
     /// `GET /api/v1/marketplace/categories`
     ///
     /// Required scopes: `marketplace:read`.
-    public func getMarketplaceCategories(options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getMarketplaceCategories(options: RequestOptions = .init()) async throws -> GetMarketplaceCategoriesResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/marketplace/categories",
@@ -65,6 +80,11 @@ public struct MarketplaceAPI: Sendable {
     }
 
     /// Get invocation status
+    ///
+    /// Returns one cross-tenant invocation. The record is read from the CALLING tenant's own space,
+    /// so only the tenant that invoked can see it and any other caller gets 404. It carries the
+    /// input, the publisher and agent it was routed to, the status, and — once the run finishes —
+    /// the output and metrics, plus `revenue_error` when the revenue-share charge failed.
     ///
     /// `GET /api/v1/marketplace/invocations/{invocationId}`
     ///
@@ -79,10 +99,20 @@ public struct MarketplaceAPI: Sendable {
 
     /// Invoke a marketplace agent
     ///
+    /// Invokes another tenant's published agent and returns a pending cross-tenant invocation with
+    /// 202; the invocation record is stored in the caller's tenant, so the response belongs to the
+    /// caller while the agent configuration stays with the publisher. Requires the
+    /// `marketplace:invoke` scope and is throttled to 120 invocations per tenant per hour, because
+    /// every invoke increments the listing's `total_runs`, which is what `sort=popularity` orders
+    /// by. Refused with 422 for an unpublished listing, for self-invocation, and for a
+    /// `subscription`-priced listing the caller has no active subscription to. Revenue sharing is
+    /// charged only when the deployment enables it and a revenue manager exists; a failed charge is
+    /// recorded on the invocation as `revenue_error` rather than failing the call.
+    ///
     /// `POST /api/v1/marketplace/listings/{listingId}/invoke`
     ///
     /// Required scopes: `marketplace:invoke`.
-    public func invokeListingAgent(listingId: String, body: InvokeListingAgentRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func invokeListingAgent(listingId: String, body: InvokeListingAgentRequest, options: RequestOptions = .init()) async throws -> InvokeListingAgentResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/marketplace/listings/\(encodePathSegment(listingId))/invoke",
@@ -92,7 +122,24 @@ public struct MarketplaceAPI: Sendable {
         ))
     }
 
+    /// Featured spec ids
+    ///
+    /// No authentication. Sorted, so a client diffing the list sees a change only when the set
+    /// really changed.
+    ///
+    /// `GET /api/v1/marketplace/featured-specs`
+    public func listFeaturedSpecs(options: RequestOptions = .init()) async throws -> ListFeaturedSpecsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/marketplace/featured-specs",
+            options: options
+        ))
+    }
+
     /// List user subscriptions
+    ///
+    /// Lists the calling tenant's marketplace subscriptions, up to 200, including cancelled ones —
+    /// the status field distinguishes them. Requires the `marketplace:read` scope.
     ///
     /// `GET /api/v1/marketplace/subscriptions`
     ///
@@ -106,6 +153,15 @@ public struct MarketplaceAPI: Sendable {
     }
 
     /// Publish an agent to the marketplace
+    ///
+    /// Publishes one of the tenant's own agents to the shared marketplace index. Requires the
+    /// `marketplace` publish permission and the `marketplace:write` scope, and is throttled to 30
+    /// publishes per tenant per hour (429 beyond that). `agent_id` must name an agent of the
+    /// calling tenant, otherwise 404 — this is what stops a listing pointing at an agent the
+    /// publisher does not own. The listing is written twice, once into the cross-tenant index and
+    /// once under the tenant, with `status: "published"`, zeroed stats and `agent_version`
+    /// defaulting to `1.0.0`; the operation is not idempotent, so a repeated call mints a second
+    /// listing. 201.
     ///
     /// `POST /api/v1/marketplace/listings`
     ///
@@ -122,10 +178,16 @@ public struct MarketplaceAPI: Sendable {
 
     /// Rate a marketplace listing
     ///
+    /// Records the calling tenant's rating of a listing; requires the `marketplace:write` scope.
+    /// `rating` must be between 1 and 5 (422 otherwise), and the tenant that published the listing
+    /// cannot rate it (403). One rating per tenant per listing: a second call reuses the same
+    /// rating id and replaces the first, adjusting the listing's average and total under the same
+    /// lock the invoke counter takes. 404 when the listing does not exist; 201 on success.
+    ///
     /// `POST /api/v1/marketplace/listings/{listingId}/rate`
     ///
     /// Required scopes: `marketplace:write`.
-    public func rateListing(listingId: String, body: RateListingRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func rateListing(listingId: String, body: RateListingRequest, options: RequestOptions = .init()) async throws -> MarketplaceListingRating {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/marketplace/listings/\(encodePathSegment(listingId))/rate",
@@ -137,10 +199,19 @@ public struct MarketplaceAPI: Sendable {
 
     /// Search marketplace listings
     ///
+    /// Searches the shared, cross-tenant listing index and returns only listings whose status is
+    /// `published`. `q` matches a case-insensitive substring of the name or description, `category`
+    /// is an exact match, and `sort` is `rating`, `popularity` or `recency` (the default); `limit`
+    /// defaults to 20 and is clamped by the store, and a malformed `limit` falls back to the
+    /// default rather than emptying the page. The store walks the index into memory up to a walk
+    /// cap and logs a warning when results are therefore partial. `items` and `listings` carry the
+    /// same array — `listings` is a historical alias — and `total` is the length of the page, not
+    /// of the index.
+    ///
     /// `GET /api/v1/marketplace/search`
     ///
     /// Required scopes: `marketplace:read`.
-    public func search(q: String? = nil, category: SearchMarketplaceCategory? = nil, sort: SearchMarketplaceSort? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> SearchMarketplaceResponse {
+    public func search(q: String? = nil, category: MarketplaceListingCategory? = nil, sort: SearchMarketplaceSort? = nil, limit: Int? = nil, options: RequestOptions = .init()) async throws -> SearchMarketplaceResponse {
         var query: [URLQueryItem] = []
         if let q {
             query.append(URLQueryItem(name: "q", value: q))
@@ -164,10 +235,18 @@ public struct MarketplaceAPI: Sendable {
 
     /// Subscribe to a marketplace listing
     ///
+    /// Subscribes the calling tenant to a `subscription`-priced listing; requires the
+    /// `marketplace:write` scope. A `stripe_subscription_id` is mandatory — without one the request
+    /// is 403, because trial and complimentary subscriptions are granted server-side through the
+    /// webhook path, not claimed by the subscriber. The id is verified live against Stripe and must
+    /// be `active` or `trialing`; when Stripe is not configured on the deployment the answer is 503
+    /// rather than an unverified subscription. The listing must exist and be published, and its
+    /// pricing model must be `subscription` (422 otherwise). 201 with the subscription record.
+    ///
     /// `POST /api/v1/marketplace/listings/{listingId}/subscribe`
     ///
     /// Required scopes: `marketplace:write`.
-    public func subscribeToListing(listingId: String, body: SubscribeToListingRequest? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func subscribeToListing(listingId: String, body: SubscribeToListingRequest? = nil, options: RequestOptions = .init()) async throws -> MarketplaceSubscription {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -180,11 +259,14 @@ public struct MarketplaceAPI: Sendable {
 
     /// Unpublish a marketplace listing
     ///
+    /// Changes the listing's state to `archived` and keeps the record; existing subscriptions are
+    /// not touched. Only the publishing tenant may do this — another tenant's listing answers 403.
+    ///
     /// `DELETE /api/v1/marketplace/listings/{listingId}`
     ///
     /// Required scopes: `marketplace:write`.
-    public func unpublishListing(listingId: String, options: RequestOptions = .init()) async throws -> JSONValue {
-        return try await client.send(RequestSpec(
+    public func unpublishListing(listingId: String, options: RequestOptions = .init()) async throws {
+        try await client.sendVoid(RequestSpec(
             method: "DELETE",
             path: "/api/v1/marketplace/listings/\(encodePathSegment(listingId))",
             idempotent: true,
@@ -193,6 +275,9 @@ public struct MarketplaceAPI: Sendable {
     }
 
     /// Unsubscribe from a listing
+    ///
+    /// Changes the subscription's state to `cancelled` and keeps the record (it still appears in
+    /// the subscriptions list). 204 whether or not a subscription existed.
     ///
     /// `DELETE /api/v1/marketplace/listings/{listingId}/subscribe`
     ///

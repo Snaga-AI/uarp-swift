@@ -8,11 +8,49 @@ public struct TenantsAPI: Sendable {
 
     init(client: UARPClient) { self.client = client }
 
+    /// Accept a pending invite from the tenant picker
+    ///
+    /// The tenant is in the PATH, and that is the whole reason this route exists beside `POST
+    /// /api/v1/users/invites/{inviteId}/accept`. The older route resolves the invite against the
+    /// caller's active tenant, which cannot work here: the caller is not a member of the inviting
+    /// tenant yet — making them one is what the call is for. Without a tenant-in-path route the
+    /// picker's Accept button can never succeed for a cross-tenant invite.
+    ///
+    /// Semantics are otherwise identical to the older route: the same atomic create-user + email
+    /// index + membership index + `invite.status = accepted` write.
+    ///
+    /// Four refusals, and they are different questions: **403** the invite is addressed to another
+    /// email, or the `token` does not match; **409** the invite is not `pending` (already accepted,
+    /// revoked, declined) or the email already belongs to a member; **410** the invite has expired;
+    /// **404** no such invite, or the caller has no user record.
+    ///
+    /// `POST /api/v1/me/invites/{tenantId}/{inviteId}/accept`
+    public func acceptInviteFromPicker(tenantId: String, inviteId: String, body: AcceptInviteFromPickerRequest? = nil, options: RequestOptions = .init()) async throws -> AcceptInviteFromPickerResponse {
+        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/me/invites/\(encodePathSegment(tenantId))/\(encodePathSegment(inviteId))/accept",
+            body: encodedBody,
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Create a new API key
+    ///
+    /// Mints a new API key for the caller's tenant and returns `raw_key` exactly once. `name` is
+    /// required (a non-empty string of at most 200 characters) and `scopes`, when given, must be an
+    /// array of at most 100 strings of at most 100 characters each; omitting it grants a
+    /// twelve-scope default covering agents, runs, sessions, notifications, memory and files. The
+    /// authority a key can carry is capped by the caller: only an owner may request the wildcard
+    /// `*`, and a `role:<r>` scope may only be granted for a role the caller already holds
+    /// (**403**); a caller without `*` may not grant scopes it does not itself hold (**422**). The
+    /// key is bound to the caller's `user_id`, so it shows up only in that user's own listing, and
+    /// an `api_key.created` audit entry is written.
     ///
     /// `POST /api/v1/tenants/me/keys`
     ///
-    /// Required scopes: `tenants:write`.
+    /// Required scopes: `api_keys:write`.
     public func createAPIKey(body: CreateAPIKeyRequest, options: RequestOptions = .init()) async throws -> APIKeyResponse {
         return try await client.send(RequestSpec(
             method: "POST",
@@ -35,6 +73,25 @@ public struct TenantsAPI: Sendable {
             method: "POST",
             path: "/api/v1/me/tenants/create",
             body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Decline a pending invite
+    ///
+    /// Deliberately distinct from an admin's revoke, so the audit trail and the Members page can
+    /// tell "the invitee said no" from "an admin pulled it". The caller's email must match the
+    /// invite's — without that check anyone with a current session could decline someone else's
+    /// invites.
+    ///
+    /// No token is required here, unlike accept: declining grants nothing.
+    ///
+    /// `POST /api/v1/me/invites/{tenantId}/{inviteId}/decline`
+    public func declineInviteFromPicker(tenantId: String, inviteId: String, options: RequestOptions = .init()) async throws -> DeclineInviteFromPickerResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/me/invites/\(encodePathSegment(tenantId))/\(encodePathSegment(inviteId))/decline",
             idempotent: true,
             options: options
         ))
@@ -71,7 +128,56 @@ public struct TenantsAPI: Sendable {
         ))
     }
 
+    /// DNS and certificate state for this tenant's custom domain
+    ///
+    /// **Two different 404s, and a client should tell them apart:** no such tenant, and a tenant
+    /// with no custom domain configured. The second is the ordinary state of most tenants and is
+    /// not an error condition — a UI that renders both as a failure will report a fault to every
+    /// customer who has not set up a vanity domain.
+    ///
+    /// Records written before the lifecycle schema are lifted on read, so `dns` and `cert` are
+    /// present here even for a domain added under the old flat fields.
+    ///
+    /// `GET /api/v1/tenants/me/domain/health`
+    ///
+    /// Required scopes: `api_keys:read`.
+    public func getTenantDomainHealth(options: RequestOptions = .init()) async throws -> GetTenantDomainHealthResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/tenants/me/domain/health",
+            options: options
+        ))
+    }
+
+    /// Leave a tenant
+    ///
+    /// Removes the caller's own membership. The user-record cascade matches an admin-driven
+    /// removal.
+    ///
+    /// Two refusals, both **409**, and both name a specific thing to do first. The caller is the
+    /// only ACTIVE owner: transfer ownership before leaving. Or the caller is the only veto-holding
+    /// ambassador: rotate the founder ambassador via `/api/v1/governance/ambassadors` first. The
+    /// second check is skipped entirely when governance is not enabled, so its absence is not a
+    /// promise that no such constraint exists.
+    ///
+    /// `DELETE /api/v1/me/memberships/{tenantId}`
+    public func leaveTenant(tenantId: String, options: RequestOptions = .init()) async throws -> LeaveTenantResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/me/memberships/\(encodePathSegment(tenantId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// List API keys
+    ///
+    /// Lists this tenant's API keys without ever returning a key hash or the raw secret. The
+    /// `["api_key"]` prefix also holds the device-session keys minted by OTP and OAuth login, so
+    /// the listing pages the whole prefix and then filters: a caller sees keys bound to their own
+    /// `user_id` plus legacy keys that carry no owner at all. Each row carries a `kind` of
+    /// `session` or `api_key` so a client can tell a sign-in from a deliberately created
+    /// credential. Requires the `api_keys:read` permission and scope.
     ///
     /// `GET /api/v1/tenants/me/keys`
     ///
@@ -120,7 +226,7 @@ public struct TenantsAPI: Sendable {
     /// `PATCH /api/v1/tenants/me`
     ///
     /// Required scopes: `tenants:write`.
-    public func patch(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func patch(body: PatchTenantRequest, options: RequestOptions = .init()) async throws -> Tenant {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/tenants/me",
@@ -132,10 +238,14 @@ public struct TenantsAPI: Sendable {
 
     /// Revoke an API key
     ///
+    /// Changes the key's state to `revoked` and keeps the record for the listing and the audit
+    /// trail (`api_key.revoked`); the key stops authenticating immediately. Only the key's owner
+    /// can revoke it — another member's key answers 404. Not reversible: mint a new key instead.
+    ///
     /// `DELETE /api/v1/tenants/me/keys/{keyId}`
     ///
-    /// Required scopes: `tenants:write`.
-    public func revokeAPIKey(keyId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    /// Required scopes: `api_keys:write`.
+    public func revokeAPIKey(keyId: String, options: RequestOptions = .init()) async throws -> RevokeAPIKeyResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/tenants/me/keys/\(encodePathSegment(keyId))",
@@ -146,10 +256,23 @@ public struct TenantsAPI: Sendable {
 
     /// Update current tenant settings
     ///
+    /// Updates the caller's own tenant record — name, slug, description, logo, branding, public
+    /// visibility, `public_agent_id`, `published_agent_ids`, `public_settings`, `head_agent_id`,
+    /// `shared_workspace_id` and a merge into `settings`. Owner role and the `tenants:write` scope
+    /// are required; `legal_hold`, `suspended`, `max_concurrent_runs_override`, `default_model` and
+    /// `default_provider` are stripped from `settings` before the write, and a set `legal_hold`
+    /// cannot be cleared here (**403**). Pointer fields are validated against records this tenant
+    /// owns — an unknown agent, workspace or file answers **404**, an invalid slug or an over-long
+    /// `published_agent_ids` (more than 50) answers **422**, and a slug already held by another
+    /// public tenant answers **409**. The write is a CAS update on the tenant record; it also drops
+    /// the effective-plan cache, re-syncs or removes the `__public__` tenant and marketplace index
+    /// rows for the slug, may auto-publish the named public agent and enrol the tenant in the
+    /// marketplace, and writes a `tenant.updated` audit entry.
+    ///
     /// `PUT /api/v1/tenants/me`
     ///
     /// Required scopes: `tenants:write`.
-    public func update(body: UpdateTenantRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func update(body: UpdateTenantRequest? = nil, options: RequestOptions = .init()) async throws -> Tenant {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "PUT",
@@ -161,6 +284,16 @@ public struct TenantsAPI: Sendable {
     }
 
     /// Verify domain
+    ///
+    /// Forces an immediate DNS re-check of the tenant's configured custom domain: it resolves the
+    /// CNAME against the expected target and, failing that, compares A records with the target's
+    /// own, then records the outcome on the tenant as `dns.state` `verified` or `failed` with
+    /// `last_checked_at` and, on failure, a `last_error` naming what the records actually point at.
+    /// On success it also flips `cert.state` to `provisioning`, writes the `domain_map` entry that
+    /// authorises Caddy to issue a certificate for the name, and kicks off certificate provisioning
+    /// in the background — so the response returns before the certificate exists; poll `GET
+    /// /tenants/me/domain/health` for the rest. Requires the owner role, the `tenants:write` scope
+    /// and a `pro` plan or above; a tenant with no domain configured answers **404**.
     ///
     /// `POST /api/v1/tenants/me/domain/verify`
     ///

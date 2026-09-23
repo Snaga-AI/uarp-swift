@@ -10,6 +10,12 @@ public struct SessionsAPI: Sendable {
 
     /// Switch active branch
     ///
+    /// Switches which branch subsequent messages in this session extend. `main` is always accepted;
+    /// any other id must name a branch of this session, otherwise `404`, and that branch must still
+    /// be `active`, otherwise `422`. The switch is a read-modify-write under optimistic
+    /// concurrency, retried on conflict, so it cannot be lost to a concurrent session update.
+    /// Returns `{session_id, active_branch}`; no history is copied or deleted.
+    ///
     /// `PUT /api/v1/sessions/{sessionId}/branches/{branchId}/activate`
     ///
     /// Required scopes: `sessions:write`.
@@ -22,12 +28,36 @@ public struct SessionsAPI: Sendable {
         ))
     }
 
+    /// Delete many sessions in one request
+    ///
+    /// Cascades each session in turn and writes one audit entry for the batch. Ids that no longer
+    /// exist come back in `failed`, not as an error — the caller's intent for them is already met.
+    /// Not JSON → 400; an empty list, or one over 200 ids → 400.
+    ///
+    /// `POST /api/v1/sessions/bulk-delete`
+    ///
+    /// Required scopes: `sessions:write`.
+    public func bulkDeleteSessions(body: BulkDeleteSessionsRequest, options: RequestOptions = .init()) async throws -> BulkDeleteSessionsResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/sessions/bulk-delete",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Close a session
+    ///
+    /// Deletes the session and everything it owns: its runs, their events and message feedback, the
+    /// share link (and its public lookup), annotations, and its todos with their schedules and
+    /// watchers. Refused with 423 while the tenant is under legal hold. Irreversible — there is no
+    /// restore; `POST /sessions/bulk-delete` runs the same cascade.
     ///
     /// `DELETE /api/v1/sessions/{sessionId}`
     ///
     /// Required scopes: `sessions:write`.
-    public func closeSession(sessionId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func closeSession(sessionId: String, options: RequestOptions = .init()) async throws -> CloseSessionResponse {
         return try await client.send(RequestSpec(
             method: "DELETE",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))",
@@ -38,10 +68,18 @@ public struct SessionsAPI: Sendable {
 
     /// Confirm or cancel a todo execution
     ///
+    /// Answers a todo that is waiting for a human decision. `409` unless its status is
+    /// `pending_confirmation`. `execute: false` cancels it and returns it as `cancelled`; `execute:
+    /// true` dispatches it — a run on the assigned agent, or a team run when the todo is assigned
+    /// to a team — sets the todo to `in_progress` and records the run id on it. The run is subject
+    /// to the tenant's run quota, so a dispatch can be refused `429` with the todo left untouched,
+    /// and a todo with neither an agent nor a team assigned is `400`. `404` when the session or the
+    /// todo does not exist.
+    ///
     /// `POST /api/v1/sessions/{sessionId}/todos/{todoId}/confirm`
     ///
     /// Required scopes: `sessions:write`.
-    public func confirmSessionTodo(sessionId: String, todoId: String, body: JSONObject? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func confirmSessionTodo(sessionId: String, todoId: String, body: JSONObject? = nil, options: RequestOptions = .init()) async throws -> Todo {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -53,6 +91,15 @@ public struct SessionsAPI: Sendable {
     }
 
     /// Create a session
+    ///
+    /// Opens a conversation against an existing agent and returns it with `201`. `404` when the
+    /// agent id is unknown in this tenant, and `403` when the plan's `max_active_sessions` is
+    /// already reached by sessions that are both `active` and not past their expiry. To absorb
+    /// double-submits the handler first looks for an active session on the same agent, created
+    /// within the last 30 seconds, with no messages and no runs, and returns THAT with `200`
+    /// instead of minting a second one — so a `200` here means an existing session was reused. A
+    /// new session starts on branch `main`, expires 24 hours later, and gets a lightweight preview
+    /// record written alongside it for the session list.
     ///
     /// `POST /api/v1/sessions`
     ///
@@ -69,21 +116,32 @@ public struct SessionsAPI: Sendable {
 
     /// Create annotation
     ///
+    /// `message_id` is stored as sent. The canonical form is the id `GET
+    /// /sessions/{sessionId}/messages` serves for the entry (`{run_id}`, `{run_id}-reply[-N]`,
+    /// `{run_id}-user-N`, `{run_id}-tool-N`, `{run_id}-system-N`); any other string is accepted —
+    /// older iOS builds send `{run_id}-{timestamp}-assistant-{hash}` and App Store never retires
+    /// them — but cannot be matched back to the transcript, and each such arrival is counted per
+    /// day (owner's decision 2026-09-11, option A: a 422 comes no earlier than a month of zero).
+    ///
     /// `POST /api/v1/sessions/{sessionId}/annotations`
     ///
     /// Required scopes: `sessions:write`.
-    public func createSessionAnnotation(sessionId: String, body: CreateSessionAnnotationRequest? = nil, options: RequestOptions = .init()) async throws -> CreateSessionAnnotationResponse {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func createSessionAnnotation(sessionId: String, body: CreateSessionAnnotationRequest, options: RequestOptions = .init()) async throws -> CreateSessionAnnotationResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/annotations",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
     }
 
     /// Create a branch point in session
+    ///
+    /// A session holds at most 100 branches. The 101st is refused with 422; `detail` names the
+    /// count and points at `DELETE /sessions/{id}/branches/{branchId}`. The count is taken inside
+    /// the compare-and-set body against the fresh session, so two concurrent creators cannot both
+    /// see 99 and both write. There is no paging over the branch list.
     ///
     /// `POST /api/v1/sessions/{sessionId}/branch`
     ///
@@ -101,15 +159,20 @@ public struct SessionsAPI: Sendable {
 
     /// Create session share link
     ///
+    /// Mints a public share link for the session and returns its URL, `role` and `expires_at`.
+    /// `role` is `viewer` or `editor`; `expires_in_hours`, when given, both stamps the record and
+    /// sets a matching TTL on the public lookup row, so the link stops resolving on its own. Not
+    /// idempotent — each call mints a NEW share id and replaces the session's stored share record,
+    /// which silently invalidates the previously issued URL. `404` when the session does not exist.
+    ///
     /// `POST /api/v1/sessions/{sessionId}/share`
     ///
     /// Required scopes: `sessions:write`.
-    public func createSessionShare(sessionId: String, body: CreateSessionShareRequest? = nil, options: RequestOptions = .init()) async throws -> CreateSessionShareResponse {
-        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
+    public func createSessionShare(sessionId: String, body: CreateSessionShareRequest, options: RequestOptions = .init()) async throws -> CreateSessionShareResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/share",
-            body: encodedBody,
+            body: try client.encode(body),
             idempotent: true,
             options: options
         ))
@@ -117,10 +180,21 @@ public struct SessionsAPI: Sendable {
 
     /// Create a todo in session
     ///
+    /// Creates a todo in the session and returns it with `201`. `assign_agent_id` and
+    /// `assign_team_id` default to the session's own agent and team; assigning a platform agent is
+    /// refused unless the caller is the super-admin, because the scheduler later dispatches it with
+    /// no caller present. `due_at` decides whether it will run by itself: omitted with an assignee
+    /// means now (or, with a `recurrence` cron, the next occurrence of that cron), an explicit
+    /// `null` keeps it an unscheduled backlog item, and a string is used verbatim. When there is an
+    /// assignee, a due time no more than five minutes in the past, and a status of `pending` or
+    /// `pending_confirmation`, a schedule row is written for the background tick to fire. A
+    /// `delivery.channels` entry of `telegram` or `whatsapp` is refused `422` unless its feature
+    /// flag is enabled. `404` when the session does not exist.
+    ///
     /// `POST /api/v1/sessions/{sessionId}/todos`
     ///
     /// Required scopes: `sessions:write`.
-    public func createSessionTodo(sessionId: String, body: CreateSessionTodoRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createSessionTodo(sessionId: String, body: CreateSessionTodoRequest, options: RequestOptions = .init()) async throws -> Todo {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/todos",
@@ -137,7 +211,7 @@ public struct SessionsAPI: Sendable {
     /// schedules it; explicit `null` files it in the backlog with no schedule at all.
     ///
     /// `POST /api/v1/todos`
-    public func createTask(body: CreateTaskRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createTask(body: JSONValue, options: RequestOptions = .init()) async throws -> CreatedTask {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/todos",
@@ -149,6 +223,10 @@ public struct SessionsAPI: Sendable {
 
     /// Delete annotation
     ///
+    /// Deletes one annotation and answers `204`. `404` when the session or the annotation does not
+    /// exist, so a repeat call reports the absence rather than succeeding twice. The message it was
+    /// anchored to is untouched.
+    ///
     /// `DELETE /api/v1/sessions/{sessionId}/annotations/{annotationId}`
     ///
     /// Required scopes: `sessions:write`.
@@ -156,6 +234,52 @@ public struct SessionsAPI: Sendable {
         try await client.sendVoid(RequestSpec(
             method: "DELETE",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/annotations/\(encodePathSegment(annotationId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Delete a branch
+    ///
+    /// Deletes the branch record and everything the runs it lists own: those runs, their events and
+    /// message feedback; the run ids leave the session's `runs` too. Refused with 422 for `main`
+    /// (the session's own timeline, not a branch record), with 409 while the branch is the
+    /// session's active branch (activate another first) or has child branches (delete them first),
+    /// and with 423 while the tenant is under legal hold. Irreversible — there is no restore. Until
+    /// 2026-09-12 branches could only be created, listed and activated, so every probe left one
+    /// behind.
+    ///
+    /// `DELETE /api/v1/sessions/{sessionId}/branches/{branchId}`
+    ///
+    /// Required scopes: `sessions:write`.
+    public func deleteSessionBranch(sessionId: String, branchId: String, options: RequestOptions = .init()) async throws -> DeleteSessionBranchResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/sessions/\(encodePathSegment(sessionId))/branches/\(encodePathSegment(branchId))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Take back a reaction
+    ///
+    /// Removes the caller's own reaction on one message. Until 2026-09-13 there was no way back —
+    /// the reaction was required and enumerated, `null` and `""` answered 422 and DELETE answered
+    /// 405, so a reader who pressed thumbs-down by mistake had it recorded for ever and the web
+    /// chat hid its own toggle rather than lie about it. Only the row for THIS caller and this
+    /// `message_id` goes; another person's reaction on the same message is untouched. 204 whether
+    /// or not a reaction was there, so a retry is safe.
+    ///
+    /// `DELETE /api/v1/sessions/{sessionId}/runs/{runId}/feedback`
+    ///
+    /// Required scopes: `sessions:write`.
+    public func deleteSessionRunFeedback(sessionId: String, runId: String, messageId: String, options: RequestOptions = .init()) async throws {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "message_id", value: messageId))
+        try await client.sendVoid(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/sessions/\(encodePathSegment(sessionId))/runs/\(encodePathSegment(runId))/feedback",
+            query: query,
             idempotent: true,
             options: options
         ))
@@ -178,12 +302,44 @@ public struct SessionsAPI: Sendable {
         ))
     }
 
+    /// Export a conversation
+    ///
+    /// Two formats and no others: `md` (the default, `text/markdown`) and `json`
+    /// (`application/json`, the `snaga.chat.v1` envelope). Any other value is 400 with the two
+    /// names in the sentence — it is not silently coerced to the default, because a client asking
+    /// for `html` and receiving markdown would render it as text.
+    ///
+    /// `GET /api/v1/sessions/{sessionId}/export`
+    ///
+    /// Required scopes: `sessions:read`.
+    public func export(sessionId: String, format: ExportSessionFormat? = nil, options: RequestOptions = .init()) async throws -> SessionExport {
+        var query: [URLQueryItem] = []
+        if let format {
+            query.append(URLQueryItem(name: "format", value: format.rawValue))
+        }
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/sessions/\(encodePathSegment(sessionId))/export",
+            query: query,
+            options: options
+        ))
+    }
+
     /// Get a session
+    ///
+    /// Returns the session record with its conversation timeline. `404` when the session does not
+    /// exist, and `404` again — not `403` — when it is filed under a private project the caller
+    /// cannot open, because the existence of that project and of the chats in it is itself
+    /// confidential. Assistant turns are enriched from their runs: public run metrics, the billable
+    /// `cost_usd`, an `output_truncated` marker for a reply that was cut off, and `from_todo` for a
+    /// turn a scheduled todo started; runs still in flight are stitched in from `session.runs` so a
+    /// reload during streaming can reattach rather than render an idle screen. An unrecognised
+    /// sub-path under the session answers `405`, never this record.
     ///
     /// `GET /api/v1/sessions/{sessionId}`
     ///
     /// Required scopes: `sessions:read`.
-    public func get(sessionId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func get(sessionId: String, options: RequestOptions = .init()) async throws -> Session {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))",
@@ -193,10 +349,15 @@ public struct SessionsAPI: Sendable {
 
     /// Get audit log scoped to session
     ///
+    /// Returns the audit entries the audit logger holds against this session, with `total`. `404`
+    /// when the session does not exist. It is scoped by audit TARGET, so it carries the acts
+    /// performed on the session itself — entries for the runs inside it are read through `GET
+    /// /api/v1/runs/{runId}/audit-log`.
+    ///
     /// `GET /api/v1/sessions/{sessionId}/audit-log`
     ///
     /// Required scopes: `sessions:read`.
-    public func getSessionAuditLog(sessionId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getSessionAuditLog(sessionId: String, options: RequestOptions = .init()) async throws -> GetSessionAuditLogResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/audit-log",
@@ -204,16 +365,47 @@ public struct SessionsAPI: Sendable {
         ))
     }
 
+    /// The conversation transcript
+    ///
+    /// The transcript this session's clients render. Undescribed until 2026-09-10 and, until the
+    /// same day, not a route at all: a GET here fell through to the bare-session branch and was
+    /// answered with the SESSION record, whose `conversation_history` carries the same list.
+    /// Closing that fall-through took the Android chat screen down with it, which is how the gap
+    /// was found.
+    ///
+    /// `messages` and `items` carry the SAME list — a client reads whichever it already reads. The
+    /// `active_run_*` fields describe a run still in flight, so a cold launch into a chat the agent
+    /// is still working in can attach to it rather than render an idle screen.
+    ///
+    /// A session that does not exist is 404, not an empty list: "no messages yet" and "no such
+    /// session" must not render the same.
+    ///
+    /// `GET /api/v1/sessions/{sessionId}/messages`
+    ///
+    /// Required scopes: `sessions:read`.
+    public func getSessionMessages(sessionId: String, options: RequestOptions = .init()) async throws -> GetSessionMessagesResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/sessions/\(encodePathSegment(sessionId))/messages",
+            options: options
+        ))
+    }
+
     /// Get feedback for a run in session
+    ///
+    /// Returns the reaction THIS caller left on one message of this run — `{reaction, reason?}`,
+    /// with `reaction: null` when they left none. `message_id` is required; without it the request
+    /// is `400` (the run-scoped `GET /api/v1/runs/{runId}/feedback` is the form that returns them
+    /// in bulk). `404` when the session does not exist or the run is not part of it. Reactions are
+    /// stored per caller identity, so this never reports another person's reaction to the same
+    /// message.
     ///
     /// `GET /api/v1/sessions/{sessionId}/runs/{runId}/feedback`
     ///
     /// Required scopes: `sessions:read`.
-    public func getSessionRunFeedback(sessionId: String, runId: String, messageId: String? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getSessionRunFeedback(sessionId: String, runId: String, messageId: String, options: RequestOptions = .init()) async throws -> JSONValue {
         var query: [URLQueryItem] = []
-        if let messageId {
-            query.append(URLQueryItem(name: "message_id", value: messageId))
-        }
+        query.append(URLQueryItem(name: "message_id", value: messageId))
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/runs/\(encodePathSegment(runId))/feedback",
@@ -223,6 +415,11 @@ public struct SessionsAPI: Sendable {
     }
 
     /// Get session share link status
+    ///
+    /// Reports whether this session has a public share link, and its `role` and `expires_at`. "Not
+    /// shared" is a state, not a missing resource: the answer is `200` with `share_url`, `role` and
+    /// `expires_at` all `null`. `404` only when the session itself does not exist. The URL is built
+    /// against the app origin the request arrived through, not the API host.
     ///
     /// `GET /api/v1/sessions/{sessionId}/share`
     ///
@@ -236,6 +433,10 @@ public struct SessionsAPI: Sendable {
     }
 
     /// List sessions
+    ///
+    /// Chats filed under a project whose `visibility` is `private` and which the caller neither
+    /// created nor was granted are omitted from this list entirely, as they are from `GET
+    /// /sessions/{id}` (2026-09-15).
     ///
     /// `GET /api/v1/sessions`
     ///
@@ -272,6 +473,11 @@ public struct SessionsAPI: Sendable {
 
     /// List session annotations
     ///
+    /// Lists the comment annotations left on this session's messages, up to 500, each with the
+    /// `message_id` it is anchored to, its author and whether it has been resolved. `404` when the
+    /// session does not exist. Message ids are the derived, stable ids that reactions and bookmarks
+    /// also key on.
+    ///
     /// `GET /api/v1/sessions/{sessionId}/annotations`
     ///
     /// Required scopes: `sessions:read`.
@@ -284,6 +490,14 @@ public struct SessionsAPI: Sendable {
     }
 
     /// List artifacts across all runs in session
+    ///
+    /// Lists every artifact produced by any run in this session, with the run each came from. A
+    /// session's runs can sit anywhere in the tenant's history and there is no per-session index,
+    /// so the handler pages the whole run prefix filtering by session id, bounded at 50 000 rows;
+    /// `truncated` is `true` when that cap bound before the prefix ran out, which is the difference
+    /// between "this session produced nothing" and "the scan did not reach the end". `404` when the
+    /// session does not exist. The entries carry names, types and sizes — fetch the bytes through
+    /// the files API.
     ///
     /// `GET /api/v1/sessions/{sessionId}/artifacts`
     ///
@@ -298,6 +512,12 @@ public struct SessionsAPI: Sendable {
 
     /// List session branches
     ///
+    /// Lists the session's alternative execution branches together with `active_branch`, the one
+    /// runs currently append to. The branches live inside the session record, so this is a single
+    /// read and there is no paging; a session may hold at most 100. `404` when the session does not
+    /// exist. A session that has never been branched answers with an empty list and `active_branch:
+    /// "main"`.
+    ///
     /// `GET /api/v1/sessions/{sessionId}/branches`
     ///
     /// Required scopes: `sessions:read`.
@@ -310,6 +530,14 @@ public struct SessionsAPI: Sendable {
     }
 
     /// List session todos
+    ///
+    /// Lists this session's todos, up to 500, ordered by `order_index` and then by creation time.
+    /// `from` and `to` (ISO timestamps) narrow the list to todos whose `due_at` falls in that
+    /// window and reorder it by due date — note that a todo with no `due_at` is excluded entirely
+    /// once either bound is given, so the calendar view and the plain list do not return the same
+    /// set. Statuses are normalised to the canonical vocabulary before they go on the wire, so a
+    /// todo an agent stored as `completed` reads as `done`. `items` and `todos` carry the same
+    /// list. `404` when the session does not exist.
     ///
     /// `GET /api/v1/sessions/{sessionId}/todos`
     ///
@@ -332,6 +560,15 @@ public struct SessionsAPI: Sendable {
 
     /// List all todos across sessions
     ///
+    /// Lists every todo in the tenant, across all sessions, enriched with the assigned agent's
+    /// name. `status` and `agent_id` filter (the status filter is compared against the canonical
+    /// spelling, so `?status=done` also finds rows stored as `completed`), and `limit` defaults to
+    /// 200 with a ceiling of 500. Ordering puts the unfinished ones first by soonest due date, then
+    /// the finished and cancelled ones by most recently updated. `items` and `todos` carry the same
+    /// list; `total` counts every matching todo BEFORE `limit` is applied, so it can exceed the
+    /// number of entries returned. The scan over sessions is capped as a runaway backstop rather
+    /// than a result limit.
+    ///
     /// `GET /api/v1/todos`
     public func listTodos(options: RequestOptions = .init()) async throws -> ListTodosResponse {
         return try await client.send(RequestSpec(
@@ -343,6 +580,16 @@ public struct SessionsAPI: Sendable {
 
     /// Resolve shared session (no auth)
     ///
+    /// Resolves a share link into the read-only view of the session behind it. No authentication —
+    /// the share id is the credential — so `404` covers both a link that never existed and one that
+    /// has expired (an expired lookup row is deleted as it is read). The body carries the
+    /// transcript with compacted entries dropped and any file link rewritten to the share-scoped
+    /// path, the plan as titles and statuses only, an execution summary for the last 20 runs (tool
+    /// NAMES, per-step outcome and latency, run status and duration) and the names, types and sizes
+    /// of the artifacts. Nothing that could reach an authenticated resource travels: no run ids, no
+    /// todo ids, no tool arguments or outputs, no instructions. The response is sent
+    /// `Cache-Control: private, no-store`.
+    ///
     /// `GET /api/v1/shared/{shareId}`
     public func resolveSharedSession(shareId: String, options: RequestOptions = .init()) async throws -> ResolveSharedSessionResponse {
         return try await client.send(RequestSpec(
@@ -353,6 +600,10 @@ public struct SessionsAPI: Sendable {
     }
 
     /// Revoke session share link
+    ///
+    /// Deletes the share record and its public lookup, so the `/shared/{shareId}` URL stops
+    /// resolving. The session itself is untouched. Irreversible for that link — a new `POST` mints
+    /// a different share id. 204 whether or not a share existed.
     ///
     /// `DELETE /api/v1/sessions/{sessionId}/share`
     ///
@@ -376,7 +627,7 @@ public struct SessionsAPI: Sendable {
     /// `POST /api/v1/sessions/{sessionId}/todos/{todoId}/run`
     ///
     /// Required scopes: `sessions:write`.
-    public func runSessionTodoNow(sessionId: String, todoId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func runSessionTodoNow(sessionId: String, todoId: String, options: RequestOptions = .init()) async throws -> Todo {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/todos/\(encodePathSegment(todoId))/run",
@@ -406,10 +657,17 @@ public struct SessionsAPI: Sendable {
 
     /// Save feedback/reaction for a session run
     ///
+    /// `message_id` is stored as sent. The canonical form is the id `GET
+    /// /sessions/{sessionId}/messages` serves for the entry (`{run_id}`, `{run_id}-reply[-N]`,
+    /// `{run_id}-user-N`, `{run_id}-tool-N`, `{run_id}-system-N`); any other string is accepted —
+    /// older iOS builds send `{run_id}-{timestamp}-assistant-{hash}` and App Store never retires
+    /// them — but cannot be matched back to the transcript, and each such arrival is counted per
+    /// day (owner's decision 2026-09-11, option A: a 422 comes no earlier than a month of zero).
+    ///
     /// `PUT /api/v1/sessions/{sessionId}/runs/{runId}/feedback`
     ///
     /// Required scopes: `sessions:write`.
-    public func setSessionRunFeedback(sessionId: String, runId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setSessionRunFeedback(sessionId: String, runId: String, body: SetSessionRunFeedbackRequest, options: RequestOptions = .init()) async throws -> RunFeedbackSet {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/runs/\(encodePathSegment(runId))/feedback",
@@ -420,6 +678,13 @@ public struct SessionsAPI: Sendable {
     }
 
     /// Stream session events (SSE)
+    ///
+    /// Server-Sent Events of the session: `connected`, `run_added`, every run event by type,
+    /// `run_done`, `session_closed`, and — for the session's drawings (docs/DESIGNER-CANVAS.md
+    /// §5.4) — `drawing.created` (data: Drawing) and `drawing.ops` (data: { drawing_id, from_seq,
+    /// to_seq, items: DrawingJournalEntry[] }, up to 100 entries a frame). Event ids are
+    /// `<runId>:<seq>` and `drawing:<drawingId>:<seq>`; send the last one as `Last-Event-ID` to
+    /// resume. An unknown event name is ignored by clients, which is how new ones arrive.
     ///
     /// `GET /api/v1/sessions/{sessionId}/events`
     ///
@@ -446,10 +711,18 @@ public struct SessionsAPI: Sendable {
 
     /// Update session metadata
     ///
+    /// WRITE SEMANTICS: merges. Only `metadata` is writable and it merges one level into what is
+    /// stored, so keys the body omits survive and keys accumulate across calls; the merged result
+    /// is checked against the key-count, nesting-depth and byte ceilings and `422` if it would
+    /// exceed one. `model_override` is accepted and deliberately ignored — the runtime always uses
+    /// the platform default model — so old clients that still send it keep working. Malformed JSON
+    /// is `400` and an unknown session is `404`; the write is a read-modify-write under optimistic
+    /// concurrency, retried on conflict so a concurrent branch switch cannot be clobbered.
+    ///
     /// `PUT /api/v1/sessions/{sessionId}`
     ///
     /// Required scopes: `sessions:write`.
-    public func update(sessionId: String, body: UpdateSessionRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func update(sessionId: String, body: UpdateSessionRequest, options: RequestOptions = .init()) async throws -> Session {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))",
@@ -461,10 +734,15 @@ public struct SessionsAPI: Sendable {
 
     /// Update annotation (e.g. resolve)
     ///
+    /// Updates one annotation. `resolved` is the only field applied — `content`, `author` and the
+    /// anchored `message_id` cannot be changed through this route, and a body naming them succeeds
+    /// without changing them. `404` when the session or the annotation does not exist. Returns the
+    /// annotation as stored.
+    ///
     /// `PATCH /api/v1/sessions/{sessionId}/annotations/{annotationId}`
     ///
     /// Required scopes: `sessions:write`.
-    public func updateSessionAnnotation(sessionId: String, annotationId: String, body: UpdateSessionAnnotationRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func updateSessionAnnotation(sessionId: String, annotationId: String, body: UpdateSessionAnnotationRequest? = nil, options: RequestOptions = .init()) async throws -> SessionAnnotation {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "PATCH",
@@ -477,10 +755,18 @@ public struct SessionsAPI: Sendable {
 
     /// Update a todo
     ///
+    /// WRITE SEMANTICS: merges — only the fields present in the body are applied and the rest of
+    /// the todo is kept. `status` is normalised to the canonical spelling before storage; `due_at`,
+    /// `assign_agent_id`, `assign_team_id` and `recurrence` accept `null` to clear them. Any change
+    /// to title, instructions, status, due time, assignee or recurrence re-derives the background
+    /// schedule row from the resulting todo — rescheduling it, re-targeting it, or deleting it when
+    /// the todo becomes unscheduled, terminal, or due more than five minutes in the past. `404`
+    /// when the session or the todo does not exist. Returns the stored todo.
+    ///
     /// `PATCH /api/v1/sessions/{sessionId}/todos/{todoId}`
     ///
     /// Required scopes: `sessions:write`.
-    public func updateSessionTodo(sessionId: String, todoId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateSessionTodo(sessionId: String, todoId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> Todo {
         return try await client.send(RequestSpec(
             method: "PATCH",
             path: "/api/v1/sessions/\(encodePathSegment(sessionId))/todos/\(encodePathSegment(todoId))",

@@ -8,26 +8,19 @@ public struct AdminConfigAPI: Sendable {
 
     init(client: UARPClient) { self.client = client }
 
-    /// Clear rate limit overrides
-    ///
-    /// `DELETE /api/v1/admin/config/rate-limits`
-    ///
-    /// Required scopes: `admin`.
-    public func clearRateLimits(options: RequestOptions = .init()) async throws -> ClearRateLimitsResponse {
-        return try await client.send(RequestSpec(
-            method: "DELETE",
-            path: "/api/v1/admin/config/rate-limits",
-            idempotent: true,
-            options: options
-        ))
-    }
-
     /// Create Stripe Product+Price for plan
+    ///
+    /// Creates a Stripe Product and recurring Price in the configured Stripe account and stores the
+    /// resulting `price_...` id on the plan override so checkout resolves it. It is idempotent per
+    /// plan, amount, currency and interval through a Stripe `lookup_key`, so repeating the same
+    /// call reuses the existing price. An unknown plan id, the `free` plan, or a missing Stripe
+    /// `secret_key` is 400 and a Stripe API failure is 502. Writes a `plan.stripe_price_created`
+    /// audit entry. Super-admin only, like every `/admin/config` route.
     ///
     /// `POST /api/v1/admin/config/plans/{planId}/stripe-price`
     ///
     /// Required scopes: `admin`.
-    public func createPlanStripePrice(planId: CreatePlanStripePricePlanId, body: CreatePlanStripePriceRequest, options: RequestOptions = .init()) async throws -> CreatePlanStripePriceResponse {
+    public func createPlanStripePrice(planId: PlanLLMLimitsTierAccessItem, body: CreatePlanStripePriceRequest, options: RequestOptions = .init()) async throws -> CreatePlanStripePriceResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/admin/config/plans/\(encodePathSegment(String(describing: planId)))/stripe-price",
@@ -37,7 +30,75 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Remove a custom plan
+    ///
+    /// **Refuses while tenants are assigned to the plan.** The answer is 409 naming how many, and
+    /// the caller opts in with `?force=1` — an exact string match, so `?force=true` does NOT force.
+    /// Deleting a plan out from under its tenants leaves them on an id that no longer resolves,
+    /// which is why the guard is there.
+    ///
+    /// The count in the message is a floor, not a census: it is what the tenant scan saw at that
+    /// moment.
+    ///
+    /// `DELETE /api/v1/admin/config/custom-plans/{planId}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteCustomPlan(planId: String, force: ExportDataExplorerIncludeSensitive? = nil, options: RequestOptions = .init()) async throws -> DeleteCustomPlanResponse {
+        var query: [URLQueryItem] = []
+        if let force {
+            query.append(URLQueryItem(name: "force", value: force.rawValue))
+        }
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/config/custom-plans/\(encodePathSegment(planId))",
+            query: query,
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Drop the price override for one model
+    ///
+    /// Removes the override so the model bills at its catalogue rate again. The 404 is keyed on the
+    /// OVERRIDE map, not the model catalogue: deleting an override that was never set is 404 even
+    /// for a model that exists.
+    ///
+    /// `DELETE /api/v1/admin/config/model-pricing/{modelRef}`
+    ///
+    /// Required scopes: `admin`.
+    public func deleteModelPricingOverride(modelRef: String, options: RequestOptions = .init()) async throws -> DeleteModelPricingOverrideResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/config/model-pricing/\(encodePathSegment(modelRef))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Remove a promo code
+    ///
+    /// Removes the code only. Redemption and reward records already written against it are NOT
+    /// cascaded — they remain, keyed by the code string, so a code deleted and later re-created
+    /// inherits the history of its name.
+    ///
+    /// `DELETE /api/v1/admin/config/promo-codes/{code}`
+    ///
+    /// Required scopes: `admin`.
+    public func deletePromoCode(code: String, options: RequestOptions = .init()) async throws -> DeletePromoCodeResponse {
+        return try await client.send(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/admin/config/promo-codes/\(encodePathSegment(code))",
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Bulk download of every admin-config KV override
+    ///
+    /// Returns every admin-config KV override as one snapshot: an `exported_at` timestamp, a
+    /// `section_count`, and a `sections` map keyed by the same section names the per-section URLs
+    /// use. Sections that carry no override are omitted, so the blob shows only what has been
+    /// customised. Read-only. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/export`
     ///
@@ -52,10 +113,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get agent memory overrides (decay, models, embedding dims)
     ///
+    /// Returns the agent-memory settings: whether memory and the shared store are on, the default
+    /// entry cap, retrieval limit and strategy, the decay switch, half-life and job interval, the
+    /// extraction and compression models, the eviction threshold, and the embedding provider, model
+    /// and dimensions. The response is the boot-time defaults with the stored `agent_memory` KV
+    /// override shallow-merged over them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/agent-memory`
     ///
     /// Required scopes: `admin`.
-    public func getAdminAgentMemoryConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminAgentMemoryConfig(options: RequestOptions = .init()) async throws -> AdminConfigAgentMemoryConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/agent-memory",
@@ -65,10 +132,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get auth runtime overrides (super-admin email, OTP/JWKS TTLs)
     ///
+    /// Returns the auth settings an operator may tune at runtime: the super-admin email, the OTP
+    /// and email-verification TTLs, the JWKS cache and grace TTLs, and the API-key cache TTL and
+    /// rotation grace period. The response is the boot-time defaults with the stored `auth` KV
+    /// override shallow-merged over them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/auth`
     ///
     /// Required scopes: `admin`.
-    public func getAdminAuthConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminAuthConfig(options: RequestOptions = .init()) async throws -> AdminConfigAuthConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/auth",
@@ -78,10 +150,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get backpressure overrides (SSE buffers + tool queue watermarks)
     ///
+    /// Returns the backpressure settings: the SSE buffer ceiling with its high and low watermarks,
+    /// and the tool queue's maximum depth and high watermark. The response is the boot-time
+    /// defaults with the stored `backpressure` KV override shallow-merged over them. Super-admin
+    /// only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/backpressure`
     ///
     /// Required scopes: `admin`.
-    public func getAdminBackpressureConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminBackpressureConfig(options: RequestOptions = .init()) async throws -> AdminConfigBackpressureConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/backpressure",
@@ -91,10 +168,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get code-interpreter overrides (isolation, timeout, memory)
     ///
+    /// Returns the code-interpreter settings: the isolation mode (`worker`, `subprocess` or
+    /// `container`), the execution timeout and memory ceiling, the container image, and the Python
+    /// venv path, sandbox image and host directory. The response is the boot-time defaults with the
+    /// stored `code_interpreter` KV override shallow-merged over them. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/code-interpreter`
     ///
     /// Required scopes: `admin`.
-    public func getAdminCodeInterpreterConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminCodeInterpreterConfig(options: RequestOptions = .init()) async throws -> AdminConfigCodeInterpreterConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/code-interpreter",
@@ -102,12 +185,34 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Tool ids disabled platform-wide
+    ///
+    /// Returns the platform-wide list of disabled tool ids, or the built-in default list when no
+    /// override has been stored. Super-admin only, like every `/admin/config` route.
+    ///
+    /// `GET /api/v1/admin/config/disabled-tools`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminDisabledTools(options: RequestOptions = .init()) async throws -> GetAdminDisabledToolsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/disabled-tools",
+            options: options
+        ))
+    }
+
     /// Get evaluation overrides (timeouts, regression threshold, auto-rollback)
+    ///
+    /// Returns the evaluation settings: whether evaluations are enabled, the concurrent-case and
+    /// per-dataset ceilings, the regression threshold, the default scorers, the eval run timeout
+    /// and the auto-rollback switch. The response is the boot-time defaults with the stored
+    /// `evaluation` KV override shallow-merged over them. Super-admin only, like every
+    /// `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/evaluation`
     ///
     /// Required scopes: `admin`.
-    public func getAdminEvaluationConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminEvaluationConfig(options: RequestOptions = .init()) async throws -> AdminConfigEvaluationConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/evaluation",
@@ -115,12 +220,34 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Founder identity, stored and from the environment
+    ///
+    /// Same three-layer read as SMTP, except the third key is `effective` rather than `source`: the
+    /// resolved values themselves, not a label saying where they came from. Resolution is per
+    /// FIELD, so a founder id from storage can sit beside a public key from the environment.
+    ///
+    /// `GET /api/v1/admin/config/founder`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminFounderConfig(options: RequestOptions = .init()) async throws -> AdminFounderConfig {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/founder",
+            options: options
+        ))
+    }
+
     /// Get guardrail config
+    ///
+    /// Lists every guardrail the runtime defines with its effective settings — `default_action`,
+    /// `enabled` and `mandatory` from the stored override where one exists, otherwise the
+    /// guardrail's own defaults — together with its phase, description and a `source` of `kv` or
+    /// `default`. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/guardrails`
     ///
     /// Required scopes: `admin`.
-    public func getAdminGuardrails(options: RequestOptions = .init()) async throws -> GetAdminGuardrailsResponse {
+    public func getAdminGuardrails(options: RequestOptions = .init()) async throws -> AdminGuardrailsConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/guardrails",
@@ -130,10 +257,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get idempotency overrides (enabled, TTL hours, max cache bytes)
     ///
+    /// Returns the idempotency settings: whether replay protection is on, the key TTL in hours, and
+    /// the maximum bytes of a response the platform will cache for a replay. The response is the
+    /// boot-time defaults with the stored `idempotency` KV override shallow-merged over them.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/idempotency`
     ///
     /// Required scopes: `admin`.
-    public func getAdminIdempotencyConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminIdempotencyConfig(options: RequestOptions = .init()) async throws -> AdminConfigIdempotencyConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/idempotency",
@@ -143,10 +275,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get integration toggles
     ///
+    /// Lists every connector in the built-in catalogue with its effective `enabled` and `beta`
+    /// toggles — the stored override merged over the catalogue defaults — and a per-row `source` of
+    /// `kv` or `default`. Served from a 60-second in-process cache. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/integrations`
     ///
     /// Required scopes: `admin`.
-    public func getAdminIntegrations(options: RequestOptions = .init()) async throws -> GetAdminIntegrationsResponse {
+    public func getAdminIntegrations(options: RequestOptions = .init()) async throws -> AdminIntegrationsConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/integrations",
@@ -156,10 +293,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get LLM adapter overrides (retries, circuit breaker, per-provider RPM)
     ///
+    /// Returns the LLM adapter settings: retry count and backoff bounds, the empty-stream timeout,
+    /// the circuit-breaker thresholds, and the per-provider requests-per-minute map. The response
+    /// is the boot-time defaults with the stored `llm_adapters` KV override shallow-merged over
+    /// them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/llm-adapters`
     ///
     /// Required scopes: `admin`.
-    public func getAdminLLMAdaptersConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminLLMAdaptersConfig(options: RequestOptions = .init()) async throws -> AdminConfigLLMAdaptersConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/llm-adapters",
@@ -169,10 +311,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get logging overrides (PII mode, file level, activity verbosity)
     ///
+    /// Returns the logging settings: the PII mode, whether agent responses are logged, the file
+    /// sink's switch, size cap, retention, level and error-file split, and the activity-log
+    /// verbosity. `pii_mode` is stored and echoed but read by no logger or sanitiser in the
+    /// monorepo. The response is the boot-time defaults with the stored `logging` KV override
+    /// shallow-merged over them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/logging`
     ///
     /// Required scopes: `admin`.
-    public func getAdminLoggingConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminLoggingConfig(options: RequestOptions = .init()) async throws -> AdminConfigLoggingConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/logging",
@@ -182,10 +330,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get long-running run overrides
     ///
+    /// Returns the long-running run settings: whether they are enabled, the maximum duration, the
+    /// checkpoint interval, the idle timeout, the continuation-token TTL in days, and the
+    /// per-tenant background-run ceiling. The response is the boot-time defaults with the stored
+    /// `long_running` KV override shallow-merged over them. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/long-running`
     ///
     /// Required scopes: `admin`.
-    public func getAdminLongRunningConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminLongRunningConfig(options: RequestOptions = .init()) async throws -> AdminConfigLongRunningConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/long-running",
@@ -195,10 +349,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get MCP overrides (session limits, idle timeout)
     ///
+    /// Returns the MCP session settings: the per-server session cap, the platform-wide stdio
+    /// session cap, and the idle timeout after which a session is reaped. The response is the
+    /// boot-time defaults with the stored `mcp` KV override shallow-merged over them. Super-admin
+    /// only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/mcp`
     ///
     /// Required scopes: `admin`.
-    public func getAdminMCPConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminMCPConfig(options: RequestOptions = .init()) async throws -> AdminConfigMCPConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/mcp",
@@ -208,10 +367,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get multimodal overrides (size + duration caps + format allowlists)
     ///
+    /// Returns the multimodal settings: whether multimodal input is enabled, the image size cap,
+    /// the audio and video duration caps, the auto-resize switch, and the supported image and audio
+    /// format allowlists. The response is the boot-time defaults with the stored `multimodal` KV
+    /// override shallow-merged over them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/multimodal`
     ///
     /// Required scopes: `admin`.
-    public func getAdminMultimodalConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminMultimodalConfig(options: RequestOptions = .init()) async throws -> AdminConfigMultimodalConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/multimodal",
@@ -219,12 +383,34 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Apple native sign-in identifiers and the OAuth return-to allowlist
+    ///
+    /// Three-layer read with `effective`, as with founder identity. The environment's
+    /// `oauth_return_to_hosts` is a comma-separated variable, split, trimmed and lower-cased before
+    /// it appears here.
+    ///
+    /// `GET /api/v1/admin/config/oauth-identity`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminOAuthIdentityConfig(options: RequestOptions = .init()) async throws -> AdminOAuthIdentityConfig {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/oauth-identity",
+            options: options
+        ))
+    }
+
     /// Get persistence overrides (snapshot interval, KV auto-cap)
+    ///
+    /// Returns the runtime-tunable persistence settings: the snapshot interval in events, whether a
+    /// checkpoint is taken after tool calls, the usage shard count, and the KV value auto-cap
+    /// switch. The response is the boot-time defaults with the stored `persistence` KV override
+    /// shallow-merged over them. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/persistence`
     ///
     /// Required scopes: `admin`.
-    public func getAdminPersistenceConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminPersistenceConfig(options: RequestOptions = .init()) async throws -> AdminConfigPersistenceConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/persistence",
@@ -233,6 +419,12 @@ public struct AdminConfigAPI: Sendable {
     }
 
     /// Get plan overrides
+    ///
+    /// Returns every built-in plan id with its effective configuration: the default quotas merged
+    /// with the stored override, the display name, LLM tier access and rate limits, and the price
+    /// and `stripe_price_id` when set. Each row carries `source` (`kv` when an override exists,
+    /// `default` otherwise) and `llm_defaults`, so the admin form can show what it would be
+    /// overriding. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/plans`
     ///
@@ -245,12 +437,38 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Registration state, setup progress, and the waitlist
+    ///
+    /// Answers three things at once because the admin screen needs all three to decide whether the
+    /// doors CAN open: the effective registration config, how far platform setup has got, and who
+    /// signed up while it was shut.
+    ///
+    /// The waitlist is real registered tenants in status `waitlisted`, not leads — they activate
+    /// lazily on their first login after the doors open.
+    ///
+    /// `GET /api/v1/admin/config/registration`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminRegistrationConfig(options: RequestOptions = .init()) async throws -> AdminRegistrationConfig {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/registration",
+            options: options
+        ))
+    }
+
     /// Get retention overrides (run / event / audit / feed / artifact TTLs)
+    ///
+    /// Returns the retention settings: the completed-run, event, audit-log, feed and artifact TTLs,
+    /// the checkpoint TTL in hours, and the SQLite archive job's switch, interval and batch size.
+    /// `artifact_ttl_days: 0` means user files never expire. The response is the boot-time defaults
+    /// with the stored `retention` KV override shallow-merged over them. Super-admin only, like
+    /// every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/retention`
     ///
     /// Required scopes: `admin`.
-    public func getAdminRetentionConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminRetentionConfig(options: RequestOptions = .init()) async throws -> AdminConfigRetentionConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/retention",
@@ -260,10 +478,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get run_command overrides (enabled, allowed commands, deno_allow)
     ///
+    /// Returns the `run_command` tool settings: whether the tool is enabled at all, its isolation
+    /// mode, timeout and output cap, the allowed command list, the Deno permission flags it may be
+    /// given, and the container image. The response is the boot-time defaults with the stored
+    /// `run_command` KV override shallow-merged over them. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/run-command`
     ///
     /// Required scopes: `admin`.
-    public func getAdminRunCommandConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminRunCommandConfig(options: RequestOptions = .init()) async throws -> AdminConfigRunCommandConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/run-command",
@@ -273,10 +497,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get HTTP server overrides (trust_proxy, body cap, shutdown timeout)
     ///
+    /// Returns the runtime-tunable HTTP server settings: `trust_proxy`, the request body cap, and
+    /// the graceful shutdown timeout. The response is the boot-time defaults with the stored
+    /// `server` KV override shallow-merged over them. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/server`
     ///
     /// Required scopes: `admin`.
-    public func getAdminServerConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminServerConfig(options: RequestOptions = .init()) async throws -> AdminConfigServerConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/server",
@@ -284,12 +513,51 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Platform setup progress
+    ///
+    /// Answers the state plus the two vocabularies needed to read it — which steps exist and which
+    /// are required — so a client does not hard-code either and drift when the list changes.
+    ///
+    /// `GET /api/v1/admin/config/setup-state`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminSetupState(options: RequestOptions = .init()) async throws -> SetupStateResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/setup-state",
+            options: options
+        ))
+    }
+
+    /// Get SMTP config, stored and from the environment
+    ///
+    /// Three-layer read, the shape this whole config family uses: `kv` is what an operator saved,
+    /// `env` is what the process environment supplies, and `source` says which of them is actually
+    /// in force. The password is never in either — only `has_password`, so a UI can show that a
+    /// credential exists without ever holding it.
+    ///
+    /// `GET /api/v1/admin/config/smtp`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminSmtpConfig(options: RequestOptions = .init()) async throws -> AdminSmtpConfig {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/smtp",
+            options: options
+        ))
+    }
+
     /// Get SSE overrides (heartbeat, polling, reconnect hint)
+    ///
+    /// Returns the server-sent-events settings: the heartbeat interval, the KV watch timeout, the
+    /// polling interval and its ceiling, the reconnect hint sent to clients, and the run-wait
+    /// timeout in seconds. The response is the boot-time defaults with the stored `sse` KV override
+    /// shallow-merged over them. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/sse`
     ///
     /// Required scopes: `admin`.
-    public func getAdminSSEConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminSSEConfig(options: RequestOptions = .init()) async throws -> AdminConfigSSEConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/sse",
@@ -299,10 +567,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get Stripe runtime config (keys redacted)
     ///
+    /// Returns the effective Stripe runtime configuration — the enabled switch, mode, publishable
+    /// key and the three plan price ids, each resolved from the stored override or the environment
+    /// — with `secret_key` and `webhook_secret` redacted, plus `has_secret_key` and
+    /// `has_webhook_secret` booleans so the console can say whether a secret exists without
+    /// disclosing it. GET is never a secret-disclosure path here. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/stripe`
     ///
     /// Required scopes: `admin`.
-    public func getAdminStripeConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminStripeConfig(options: RequestOptions = .init()) async throws -> AdminStripeConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/stripe",
@@ -310,12 +585,32 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Per-tool presentation overrides
+    ///
+    /// A map keyed by tool id. Empty object when nothing is stored — never null.
+    ///
+    /// `GET /api/v1/admin/config/tool-overrides`
+    ///
+    /// Required scopes: `admin`.
+    public func getAdminToolOverrides(options: RequestOptions = .init()) async throws -> GetAdminToolOverridesResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/tool-overrides",
+            options: options
+        ))
+    }
+
     /// Get tool security overrides (egress, SSRF, payload caps, concurrency)
+    ///
+    /// Returns the tool-security settings: the per-tenant egress allowlist and the default tool
+    /// timeout, payload cap, concurrency limit and stdio environment-inheritance switch. The
+    /// response is the boot-time defaults with the stored `tool_security` KV override
+    /// shallow-merged over them. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/tool-security`
     ///
     /// Required scopes: `admin`.
-    public func getAdminToolSecurityConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminToolSecurityConfig(options: RequestOptions = .init()) async throws -> AdminConfigToolSecurityConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/tool-security",
@@ -325,10 +620,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get webhook delivery overrides (separate from webhooks-policy)
     ///
+    /// Returns the webhook delivery settings — the feature switch, the per-tenant subscription cap,
+    /// the delivery timeout, the retry ceiling, the HTTPS requirement and the payload cap. This is
+    /// a separate section from `/admin/config/webhooks-policy`, which holds the SSRF and Stripe
+    /// verification half. The response is the boot-time defaults with the stored `webhooks` KV
+    /// override shallow-merged over them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/webhooks`
     ///
     /// Required scopes: `admin`.
-    public func getAdminWebhooksConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminWebhooksConfig(options: RequestOptions = .init()) async throws -> AdminConfigWebhooksConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/webhooks",
@@ -338,10 +639,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get worker pool overrides (max workers, mode, queue size)
     ///
+    /// Returns the worker-pool settings the scheduler enforces: the worker ceiling, the default
+    /// execution mode, the maximum run duration, the reconciliation interval, the schedule retry
+    /// count and base delay, and the queue size. The response is the boot-time defaults with the
+    /// stored `worker_pool` KV override shallow-merged over them. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/worker-pool`
     ///
     /// Required scopes: `admin`.
-    public func getAdminWorkerPoolConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getAdminWorkerPoolConfig(options: RequestOptions = .init()) async throws -> AdminConfigWorkerPoolConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/worker-pool",
@@ -351,10 +658,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get feature flags
     ///
+    /// Lists every platform feature flag with its effective state — `enabled` and the optional
+    /// `rollout_pct` from the stored override, otherwise the flag's default — plus its description
+    /// and a `source` of `kv` or `default`. Served from a 60-second in-process cache. Super-admin
+    /// only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/feature-flags`
     ///
     /// Required scopes: `admin`.
-    public func getFeatureFlags(options: RequestOptions = .init()) async throws -> GetFeatureFlagsResponse {
+    public func getFeatureFlags(options: RequestOptions = .init()) async throws -> AdminFeatureFlagsConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/feature-flags",
@@ -363,6 +675,11 @@ public struct AdminConfigAPI: Sendable {
     }
 
     /// Get markup config
+    ///
+    /// Returns the effective markup configuration — the platform markup percent and any per-model
+    /// overrides — with a `source` field saying whether it came from the KV override or the billing
+    /// defaults. Served from a 60-second in-process cache. Super-admin only, like every
+    /// `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/markup`
     ///
@@ -377,10 +694,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get platform base URLs (public_base_url, webhook_base_url)
     ///
+    /// Returns the effective `public_base_url` and `webhook_base_url` — the stored override first,
+    /// then the boot config, then the environment, with the webhook base falling back to the public
+    /// one — plus the `contact_emails` map merged shallowly over the defaults so a single address
+    /// can be overridden without losing the rest. Super-admin only, like every `/admin/config`
+    /// route.
+    ///
     /// `GET /api/v1/admin/config/platform-urls`
     ///
     /// Required scopes: `admin`.
-    public func getPlatformURLS(options: RequestOptions = .init()) async throws -> GetPlatformURLSResponse {
+    public func getPlatformURLS(options: RequestOptions = .init()) async throws -> AdminPlatformURLSConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/platform-urls",
@@ -390,10 +713,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get rate limit config
     ///
+    /// Lists the per-endpoint request limits the rate-limit middleware enforces: each known
+    /// endpoint pattern with its effective `maxRequests` and `windowSec` and a `source` of `kv` or
+    /// `default`. The set of patterns is fixed in code; this endpoint only reports which of them
+    /// carry an override. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/rate-limits`
     ///
     /// Required scopes: `admin`.
-    public func getRateLimits(options: RequestOptions = .init()) async throws -> GetRateLimitsResponse {
+    public func getRateLimits(options: RequestOptions = .init()) async throws -> AdminRateLimitsConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/rate-limits",
@@ -403,10 +731,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get last reconciliation result
     ///
+    /// Returns the stored cost-reconciliation result for the calling admin's own tenant for the
+    /// current `YYYY-MM` period. When no result has been written for that period it answers 200
+    /// with `reconciliation: null` and a message, not 404. The tenant is taken from the auth
+    /// context, not from a parameter. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/reconciliation`
     ///
     /// Required scopes: `admin`.
-    public func getReconciliation(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getReconciliation(options: RequestOptions = .init()) async throws -> GetReconciliationResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/reconciliation",
@@ -415,6 +748,10 @@ public struct AdminConfigAPI: Sendable {
     }
 
     /// Get runtime config
+    ///
+    /// Returns the effective runtime tunables — the KV overrides merged over the boot config —
+    /// together with a parallel `sources` map naming, per key, whether the value came from `kv`,
+    /// `config` or a built-in default. Super-admin only, like every `/admin/config` route.
     ///
     /// `GET /api/v1/admin/config/runtime`
     ///
@@ -429,10 +766,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get CORS / SSRF / upload / admin-RBAC policies
     ///
+    /// Returns the effective CORS origin list, webhook URL denylist and upload policy.
+    /// `admin_provider_settings_require_super_admin` is reported as the constant `true` because
+    /// every `/admin` handler requires super-admin unconditionally, so the field states what the
+    /// platform does rather than offering a switch; a stored `false` is ignored. The two
+    /// file-upload fields are stored and echoed here but no upload path reads them. Super-admin
+    /// only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/security-policies`
     ///
     /// Required scopes: `admin`.
-    public func getSecurityPolicies(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getSecurityPolicies(options: RequestOptions = .init()) async throws -> AdminConfigSecurityPoliciesConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/security-policies",
@@ -442,10 +786,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Get webhook delivery + Stripe verification policy
     ///
+    /// Returns the effective webhook policy: `ssrf_check_at_subscription`,
+    /// `stripe_signature_tolerance_sec`, and the three delivery retry fields, each resolved from
+    /// the stored override, then the boot config, then a built-in default. The three `delivery_*`
+    /// fields are stored and echoed, but the delivery manager in `@uarp/webhooks` keeps its own
+    /// retry schedule and never reads them. Super-admin only, like every `/admin/config` route.
+    ///
     /// `GET /api/v1/admin/config/webhooks-policy`
     ///
     /// Required scopes: `admin`.
-    public func getWebhooksPolicy(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getWebhooksPolicy(options: RequestOptions = .init()) async throws -> AdminConfigWebhooksPolicyConfig {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/admin/config/webhooks-policy",
@@ -455,10 +805,20 @@ public struct AdminConfigAPI: Sendable {
 
     /// Bulk-apply a previously exported snapshot
     ///
+    /// Applies a previously exported snapshot: for each entry in `sections`, a name that matches a
+    /// registry entry has its value validated against the same schema that section's own PUT
+    /// enforces and then replaces the KV override, a null value deletes the override, and an
+    /// unknown name is reported in `skipped` rather than failing the call. A section its schema
+    /// refuses is listed in `rejected` with the field errors and the rest of the import still
+    /// applies, so the response says exactly which rows landed. Afterwards every in-process config
+    /// cache is flushed and the epoch-backed sections are bumped for sibling replicas, and one
+    /// `admin.config_updated` audit entry is written per applied section. Super-admin only, like
+    /// every `/admin/config` route.
+    ///
     /// `POST /api/v1/admin/config/import`
     ///
     /// Required scopes: `admin`.
-    public func `import`(body: ImportAdminConfigRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func `import`(body: ImportAdminConfigRequest, options: RequestOptions = .init()) async throws -> ImportAdminConfigResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/admin/config/import",
@@ -468,12 +828,71 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// The admin-authored plan catalogue
+    ///
+    /// Custom plans layer over the four built-in tiers. Ordered by `program` ascending — rows with
+    /// no program sort FIRST, because an absent program compares as the empty string — then by
+    /// `id`. `count` is `plans.length`, not a total across pages: there is no paging, the catalogue
+    /// is one stored record.
+    ///
+    /// Optional fields are ABSENT rather than null throughout, so a client must test presence and
+    /// not compare against null.
+    ///
+    /// `GET /api/v1/admin/config/custom-plans`
+    ///
+    /// Required scopes: `admin`.
+    public func listCustomPlans(options: RequestOptions = .init()) async throws -> ListCustomPlansResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/custom-plans",
+            options: options
+        ))
+    }
+
+    /// Referral and promo codes
+    ///
+    /// A promo code pays its owner tenant bonus tokens for every paid subscription redeemed with
+    /// it, and grants the subscriber a welcome balance. `count` is the array length; there is no
+    /// paging.
+    ///
+    /// `GET /api/v1/admin/config/promo-codes`
+    ///
+    /// Required scopes: `admin`.
+    public func listPromoCodes(options: RequestOptions = .init()) async throws -> ListPromoCodesResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/promo-codes",
+            options: options
+        ))
+    }
+
+    /// What one promo code has paid out
+    ///
+    /// One entry per reward actually granted — the audit trail behind a code's `uses`. Matched
+    /// before the `{code}` route, so a code literally named `rewards` cannot shadow it.
+    ///
+    /// `GET /api/v1/admin/config/promo-codes/{code}/rewards`
+    ///
+    /// Required scopes: `admin`.
+    public func listPromoRewards(code: String, options: RequestOptions = .init()) async throws -> ListPromoRewardsResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/admin/config/promo-codes/\(encodePathSegment(code))/rewards",
+            options: options
+        ))
+    }
+
     /// Run reconciliation
+    ///
+    /// Runs the cost reconciler over the calling admin's own tenant now and returns the result,
+    /// rather than waiting for the scheduled pass; the reconciler persists the result under the
+    /// period key that the GET reads back. The tenant is taken from the auth context, not from a
+    /// parameter or body. Super-admin only, like every `/admin/config` route.
     ///
     /// `POST /api/v1/admin/config/reconciliation`
     ///
     /// Required scopes: `admin`.
-    public func runReconciliation(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func runReconciliation(options: RequestOptions = .init()) async throws -> RunReconciliationResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/admin/config/reconciliation",
@@ -484,10 +903,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Set feature flags
     ///
+    /// Replaces the stored feature-flag overrides with the body's map, dropping ids the platform
+    /// does not define; a flag the body omits loses its override and returns to its default. The
+    /// in-process cache is refreshed and an `admin.config_updated` audit entry names the flag ids.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/feature-flags`
     ///
     /// Required scopes: `admin`.
-    public func setFeatureFlags(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setFeatureFlags(body: JSONObject, options: RequestOptions = .init()) async throws -> SetFeatureFlagsResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/feature-flags",
@@ -497,12 +921,46 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Override the billed price of one model
+    ///
+    /// Sets what the platform charges for a model, independent of the catalogue. Validated by hand
+    /// rather than by a schema, so the failures are worth stating: a body that is not JSON is 400;
+    /// `input_per_million` or `output_per_million` missing, negative, or not coercible to a finite
+    /// number is 400; `cached_input_per_million`, when present, must be a non-negative number or
+    /// 400.
+    ///
+    /// WRITE SEMANTICS: the entry replaces, the map merges. This overwrites the override for this
+    /// model only and leaves every other model's override untouched. Omitting
+    /// `cached_input_per_million` removes it, and cached tokens then bill at the full input rate.
+    ///
+    /// Note the response key is `modelRef` — camelCase, an outlier in a snake_case API, and
+    /// documented as sent.
+    ///
+    /// `PUT /api/v1/admin/config/model-pricing/{modelRef}`
+    ///
+    /// Required scopes: `admin`.
+    public func setModelPricingOverride(modelRef: String, body: SetModelPricingOverrideRequest, options: RequestOptions = .init()) async throws -> SetModelPricingOverrideResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/model-pricing/\(encodePathSegment(modelRef))",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Set rate limits
+    ///
+    /// Replaces the stored endpoint rate-limit overrides from the body's `endpoints` map. A pattern
+    /// the platform does not define is dropped, and a known pattern the body omits loses its
+    /// override and returns to the built-in limit. The cache the middleware reads is refreshed and
+    /// an `admin.config_updated` audit entry names the patterns. Super-admin only, like every
+    /// `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/rate-limits`
     ///
     /// Required scopes: `admin`.
-    public func setRateLimits(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setRateLimits(body: JSONObject, options: RequestOptions = .init()) async throws -> SetRateLimitsResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/rate-limits",
@@ -512,12 +970,39 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Send a test email through the effective SMTP config
+    ///
+    /// Sends for real, using whichever layer `source` reports — this is not a dry run. A delivery
+    /// failure is **500** carrying the SMTP error text, not a 200 with `ok: false`, so a client
+    /// must read the status rather than a field.
+    ///
+    /// `POST /api/v1/admin/config/smtp/test`
+    ///
+    /// Required scopes: `admin`.
+    public func testAdminSmtpConfig(body: TestAdminSmtpConfigRequest, options: RequestOptions = .init()) async throws -> TestAdminSmtpConfigResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/admin/config/smtp/test",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Verify stored secret_key authenticates against Stripe (read-only)
+    ///
+    /// Verifies the stored `secret_key` by calling Stripe's `GET /v1/account`, which is read-only
+    /// and free, under a 10-second timeout. It always answers 200 and reports the outcome in `ok`:
+    /// on success it returns the account id, business name, country and default currency, derives
+    /// `livemode` from the key prefix, and — because a green test on a key the running billing
+    /// manager is not using is exactly the failure this exists to catch — compares the stored key's
+    /// fingerprint with the one the live manager holds and says so when they differ. Super-admin
+    /// only, like every `/admin/config` route.
     ///
     /// `POST /api/v1/admin/config/stripe/test`
     ///
     /// Required scopes: `admin`.
-    public func testAdminStripeConfig(options: RequestOptions = .init()) async throws -> JSONObject {
+    public func testAdminStripeConfig(options: RequestOptions = .init()) async throws -> JSONValue {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/admin/config/stripe/test",
@@ -528,10 +1013,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update agent memory overrides
     ///
+    /// Updates the agent-memory overrides. `embedding_dimensions`, `embedding_provider` and
+    /// `embedding_model` decide how new vectors are written, so changing them after entries exist
+    /// leaves the stored vectors as they were. Shallow-merges the body's defined fields into the
+    /// stored `agent_memory` override, so a field the body omits keeps its stored value; every
+    /// field is optional and range-checked, and an out-of-bounds value is refused 422 with nothing
+    /// written. After the write the section is re-hydrated into the live config through the same
+    /// function boot uses, so the change applies without a restart, and an `admin.config_updated`
+    /// audit entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/agent-memory`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminAgentMemoryConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminAgentMemoryConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminAgentMemoryConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/agent-memory",
@@ -543,10 +1037,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update auth runtime overrides
     ///
+    /// Updates the runtime auth overrides. `super_admin_email` decides who is stamped super-admin
+    /// at first OTP login, so a wrong value here is how an operator locks themselves out of every
+    /// admin route. Shallow-merges the body's defined fields into the stored `auth` override, so a
+    /// field the body omits keeps its stored value; every field is optional and range-checked, and
+    /// an out-of-bounds value is refused 422 with nothing written. After the write the section is
+    /// re-hydrated into the live config through the same function boot uses, so the change applies
+    /// without a restart, and an `admin.config_updated` audit entry names the changed keys.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/auth`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminAuthConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminAuthConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminAuthConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/auth",
@@ -558,10 +1061,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update backpressure overrides
     ///
+    /// Updates the backpressure overrides. Shallow-merges the body's defined fields into the stored
+    /// `backpressure` override, so a field the body omits keeps its stored value; every field is
+    /// optional and range-checked, and an out-of-bounds value is refused 422 with nothing written.
+    /// After the write the section is re-hydrated into the live config through the same function
+    /// boot uses, so the change applies without a restart, and an `admin.config_updated` audit
+    /// entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/backpressure`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminBackpressureConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminBackpressureConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminBackpressureConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/backpressure",
@@ -573,10 +1083,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update code-interpreter overrides
     ///
+    /// Updates the code-interpreter overrides. Shallow-merges the body's defined fields into the
+    /// stored `code_interpreter` override, so a field the body omits keeps its stored value; every
+    /// field is optional and range-checked, and an out-of-bounds value is refused 422 with nothing
+    /// written. After the write the section is re-hydrated into the live config through the same
+    /// function boot uses, so the change applies without a restart, and an `admin.config_updated`
+    /// audit entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/code-interpreter`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminCodeInterpreterConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminCodeInterpreterConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminCodeInterpreterConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/code-interpreter",
@@ -586,12 +1103,43 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Replace the platform-wide disabled tool list
+    ///
+    /// **The body is a bare JSON ARRAY, not an object** — an outlier on a surface where every other
+    /// write takes an object, and a client that wraps it in `{disabled_tools: […]}` gets 400.
+    ///
+    /// Gated on a FRESH MFA challenge.
+    ///
+    /// WRITE SEMANTICS: replaces. The array given becomes the list. It must be NON-EMPTY and every
+    /// element a non-empty string, so there is no way to disable nothing through this route —
+    /// clearing the list is not expressible here.
+    ///
+    /// `PUT /api/v1/admin/config/disabled-tools`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminDisabledTools(body: [String], options: RequestOptions = .init()) async throws -> UpdateAdminDisabledToolsResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/disabled-tools",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update evaluation overrides
+    ///
+    /// Updates the evaluation overrides. Shallow-merges the body's defined fields into the stored
+    /// `evaluation` override, so a field the body omits keeps its stored value; every field is
+    /// optional and range-checked, and an out-of-bounds value is refused 422 with nothing written.
+    /// After the write the section is re-hydrated into the live config through the same function
+    /// boot uses, so the change applies without a restart, and an `admin.config_updated` audit
+    /// entry names the changed keys. Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/evaluation`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminEvaluationConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminEvaluationConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminEvaluationConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/evaluation",
@@ -601,12 +1149,39 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Set the stored founder identity
+    ///
+    /// Answers the same body the GET does.
+    ///
+    /// WRITE SEMANTICS: merges. Omitted fields keep their stored values. Unlike SMTP, an empty
+    /// string IS accepted on every field here and means "leave unset" — deliberately, because the
+    /// admin UI echoes current values back and a no-op save of an unset identity must not 422.
+    ///
+    /// `PUT /api/v1/admin/config/founder`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminFounderConfig(body: UpdateAdminFounderConfigRequest, options: RequestOptions = .init()) async throws -> AdminFounderConfig {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/founder",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update guardrail config
+    ///
+    /// Replaces the stored guardrail overrides with the body's map, dropping any id the runtime
+    /// does not define; a guardrail the body omits loses its override and returns to its code
+    /// default. The in-process cache the guardrail runner reads is rebuilt from the write, so the
+    /// change takes effect without a restart, and an `admin.config_updated` audit entry names the
+    /// ids. Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/guardrails`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminGuardrails(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminGuardrails(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminGuardrailsResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/guardrails",
@@ -618,10 +1193,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update idempotency overrides
     ///
+    /// Updates the idempotency overrides. Shallow-merges the body's defined fields into the stored
+    /// `idempotency` override, so a field the body omits keeps its stored value; every field is
+    /// optional and range-checked, and an out-of-bounds value is refused 422 with nothing written.
+    /// After the write the section is re-hydrated into the live config through the same function
+    /// boot uses, so the change applies without a restart, and an `admin.config_updated` audit
+    /// entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/idempotency`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminIdempotencyConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminIdempotencyConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminIdempotencyConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/idempotency",
@@ -633,10 +1215,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update integrations
     ///
+    /// Replaces the stored connector toggles with the body's map. An id that is not in the built-in
+    /// connector catalogue is dropped silently, and a connector the body omits loses its override
+    /// and returns to the catalogue default — this is a whole-map replace, not a merge. The
+    /// in-process cache is refreshed, an `admin.config_updated` audit entry names the connector
+    /// ids, and the response is the same merged view the GET returns. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/integrations`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminIntegrations(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminIntegrations(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminIntegrationsResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/integrations",
@@ -648,10 +1237,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update LLM adapter overrides
     ///
+    /// Updates the LLM adapter overrides; `circuit_breaker` and `provider_rate_limits` are replaced
+    /// whole when present, because the merge is one level deep. Shallow-merges the body's defined
+    /// fields into the stored `llm_adapters` override, so a field the body omits keeps its stored
+    /// value; every field is optional and range-checked, and an out-of-bounds value is refused 422
+    /// with nothing written. After the write the section is re-hydrated into the live config
+    /// through the same function boot uses, so the change applies without a restart, and an
+    /// `admin.config_updated` audit entry names the changed keys. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/llm-adapters`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminLLMAdaptersConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminLLMAdaptersConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminLLMAdaptersConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/llm-adapters",
@@ -663,10 +1261,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update logging overrides
     ///
+    /// Updates the logging overrides. `pii_mode` is validated and persisted but changes nothing —
+    /// no logger reads it; the redaction that does happen is unconditional and lives in the audit
+    /// logger's own sanitiser. Shallow-merges the body's defined fields into the stored `logging`
+    /// override, so a field the body omits keeps its stored value; every field is optional and
+    /// range-checked, and an out-of-bounds value is refused 422 with nothing written. After the
+    /// write the section is re-hydrated into the live config through the same function boot uses,
+    /// so the change applies without a restart, and an `admin.config_updated` audit entry names the
+    /// changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/logging`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminLoggingConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminLoggingConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminLoggingConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/logging",
@@ -678,10 +1285,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update long-running overrides
     ///
+    /// Updates the long-running overrides. Shallow-merges the body's defined fields into the stored
+    /// `long_running` override, so a field the body omits keeps its stored value; every field is
+    /// optional and range-checked, and an out-of-bounds value is refused 422 with nothing written.
+    /// After the write the section is re-hydrated into the live config through the same function
+    /// boot uses, so the change applies without a restart, and an `admin.config_updated` audit
+    /// entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/long-running`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminLongRunningConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminLongRunningConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminLongRunningConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/long-running",
@@ -693,10 +1307,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update MCP overrides
     ///
+    /// Updates the MCP overrides. Shallow-merges the body's defined fields into the stored `mcp`
+    /// override, so a field the body omits keeps its stored value; every field is optional and
+    /// range-checked, and an out-of-bounds value is refused 422 with nothing written. After the
+    /// write the section is re-hydrated into the live config through the same function boot uses,
+    /// so the change applies without a restart, and an `admin.config_updated` audit entry names the
+    /// changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/mcp`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminMCPConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminMCPConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminMCPConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/mcp",
@@ -708,10 +1329,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update multimodal overrides
     ///
+    /// Updates the multimodal overrides. Shallow-merges the body's defined fields into the stored
+    /// `multimodal` override, so a field the body omits keeps its stored value; every field is
+    /// optional and range-checked, and an out-of-bounds value is refused 422 with nothing written.
+    /// After the write the section is re-hydrated into the live config through the same function
+    /// boot uses, so the change applies without a restart, and an `admin.config_updated` audit
+    /// entry names the changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/multimodal`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminMultimodalConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminMultimodalConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminMultimodalConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/multimodal",
@@ -721,12 +1349,41 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Set Apple identifiers and the return-to allowlist
+    ///
+    /// Answers the same body the GET does.
+    ///
+    /// WRITE SEMANTICS: merges. Omitted fields keep their stored values; a present
+    /// `oauth_return_to_hosts` REPLACES the stored list rather than adding to it.
+    ///
+    /// `PUT /api/v1/admin/config/oauth-identity`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminOAuthIdentityConfig(body: UpdateAdminOAuthIdentityConfigRequest, options: RequestOptions = .init()) async throws -> AdminOAuthIdentityConfig {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/oauth-identity",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update persistence overrides
+    ///
+    /// Updates the persistence overrides; only the subset that is safe to change at runtime is
+    /// accepted, and anything else in the body is stripped. Shallow-merges the body's defined
+    /// fields into the stored `persistence` override, so a field the body omits keeps its stored
+    /// value; every field is optional and range-checked, and an out-of-bounds value is refused 422
+    /// with nothing written. After the write the section is re-hydrated into the live config
+    /// through the same function boot uses, so the change applies without a restart, and an
+    /// `admin.config_updated` audit entry names the changed keys. Super-admin only, like every
+    /// `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/persistence`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminPersistenceConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminPersistenceConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminPersistenceConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/persistence",
@@ -737,6 +1394,14 @@ public struct AdminConfigAPI: Sendable {
     }
 
     /// Update plans
+    ///
+    /// Replaces the stored plan overrides with the plans named in `plans` (name, quotas, price,
+    /// `stripe_price_id`, LLM limits); an id the body omits loses its override. A plan that
+    /// currently has a wired `stripe_price_id` and is absent from the payload is refused with 422
+    /// until it is re-sent or named in `?confirm_drop=`, because a partial save once unwired
+    /// checkout for every plan it dropped. On success the plan cache is cleared for every replica,
+    /// a `plan.updated` audit entry is written, and the response is the same shape as the GET.
+    /// Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/plans`
     ///
@@ -751,12 +1416,51 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Open or close registration, and set signup defaults
+    ///
+    /// **Opening registration when it is currently CLOSED requires `confirm_open: true`.** Without
+    /// it the answer is 400, and the message says so. This is not ceremony: on 2026-06-11 a
+    /// long-lived admin tab running a stale bundle re-submitted its whole form four times in one
+    /// day, each time carrying a stale `registration_open: true`, and silently re-opened doors an
+    /// operator had ordered shut. An explicit confirm is something no stale form can send by
+    /// accident. Closing, and a no-op re-save while already open, need no confirm.
+    ///
+    /// A second 400 refuses opening while required setup steps are outstanding, and names them.
+    ///
+    /// Answers the same body the GET does.
+    ///
+    /// WRITE SEMANTICS: merges. Omitted fields keep their stored values. `default_signup_plan` and
+    /// `allowed_email_domains` are stored only when present; an empty `default_signup_plan` clears
+    /// it back to the `free` default.
+    ///
+    /// `PUT /api/v1/admin/config/registration`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminRegistrationConfig(body: UpdateAdminRegistrationConfigRequest, options: RequestOptions = .init()) async throws -> AdminRegistrationConfig {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/registration",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update retention overrides
+    ///
+    /// Updates the retention overrides. `artifact_ttl_days` accepts 0 as the documented opt-out —
+    /// no expiry, files persist until an explicit delete — where every other TTL has a minimum of
+    /// one day. Shallow-merges the body's defined fields into the stored `retention` override, so a
+    /// field the body omits keeps its stored value; every field is optional and range-checked, and
+    /// an out-of-bounds value is refused 422 with nothing written. After the write the section is
+    /// re-hydrated into the live config through the same function boot uses, so the change applies
+    /// without a restart, and an `admin.config_updated` audit entry names the changed keys.
+    /// Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/retention`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminRetentionConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminRetentionConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminRetentionConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/retention",
@@ -768,10 +1472,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update run_command overrides
     ///
+    /// Updates the `run_command` overrides. `enabled`, `allowed_commands` and `deno_allow` decide
+    /// what the platform will execute on a host, so widening them widens what an agent can run.
+    /// Shallow-merges the body's defined fields into the stored `run_command` override, so a field
+    /// the body omits keeps its stored value; every field is optional and range-checked, and an
+    /// out-of-bounds value is refused 422 with nothing written. After the write the section is
+    /// re-hydrated into the live config through the same function boot uses, so the change applies
+    /// without a restart, and an `admin.config_updated` audit entry names the changed keys.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/run-command`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminRunCommandConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminRunCommandConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminRunCommandConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/run-command",
@@ -783,10 +1496,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update server overrides
     ///
+    /// Updates the server overrides. Only this runtime-safe subset is accepted; `max_body_bytes`
+    /// applies to every request with a body, so setting it too low refuses writes platform-wide.
+    /// Shallow-merges the body's defined fields into the stored `server` override, so a field the
+    /// body omits keeps its stored value; every field is optional and range-checked, and an
+    /// out-of-bounds value is refused 422 with nothing written. After the write the section is
+    /// re-hydrated into the live config through the same function boot uses, so the change applies
+    /// without a restart, and an `admin.config_updated` audit entry names the changed keys.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/server`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminServerConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminServerConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminServerConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/server",
@@ -796,12 +1518,83 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Mark setup steps complete, or flip the registration gate
+    ///
+    /// WRITE SEMANTICS: mixed, and the mixed half is the point. `completed_steps` is a UNION — the
+    /// steps given are ADDED to the stored list and never removed — so re-sending the same PATCH is
+    /// idempotent and there is no way to un-complete a step through this route. `registration_open`
+    /// is a plain overwrite.
+    ///
+    /// **Opening registration requires `confirm_open: true`** when it is currently closed, exactly
+    /// as `PUT /api/v1/admin/config/registration` does. The guard lives in both places on purpose:
+    /// without it here, the lower-level endpoint was a way around the confirm that the launch-day
+    /// incident of 2026-06-11 put there.
+    ///
+    /// Opening also refuses with 400 while any required step is outstanding, naming them.
+    ///
+    /// `status` reaching `live` is a ONE-WAY latch. Once setup has completed, CLOSING registration
+    /// is an operational mode — a pre-registration wave — and does NOT return the platform to
+    /// `in_progress`. Before that was fixed, closing sent the super admin back into the setup
+    /// wizard on every page, and the wizard's only exit was the very switch they had just turned
+    /// off.
+    ///
+    /// The write is a compare-and-set retried up to six times; a persistently contended record
+    /// answers **503** rather than overwriting a concurrent change.
+    ///
+    /// `PATCH /api/v1/admin/config/setup-state`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminSetupState(body: UpdateAdminSetupStateRequest, options: RequestOptions = .init()) async throws -> SetupStateResponse {
+        return try await client.send(RequestSpec(
+            method: "PATCH",
+            path: "/api/v1/admin/config/setup-state",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Update stored SMTP config
+    ///
+    /// Answers the same body the GET does, so a client does not re-read to see what took effect.
+    ///
+    /// WRITE SEMANTICS: merges. A field the body omits keeps its stored value. An empty string
+    /// CLEARS, but only where the validator admits one: `password` and `from_name` accept `""`,
+    /// while `host`, `user` and `from` are rejected with 422 before the merge is reached — `host`
+    /// and `user` require at least one character and `from` must parse as an email. So a stored
+    /// host cannot be blanked through this route, only overwritten.
+    ///
+    /// `password: ""` is the operator-initiated clear: it drops both the encrypted and plaintext
+    /// fields so the next read falls back to the environment. A password is stored
+    /// AES-GCM-encrypted when an encryption key is configured; without one it is stored in
+    /// plaintext and the server logs a warning rather than refusing.
+    ///
+    /// `PUT /api/v1/admin/config/smtp`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminSmtpConfig(body: UpdateAdminSmtpConfigRequest, options: RequestOptions = .init()) async throws -> AdminSmtpConfig {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/smtp",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update SSE overrides
+    ///
+    /// Updates the SSE overrides. Shallow-merges the body's defined fields into the stored `sse`
+    /// override, so a field the body omits keeps its stored value; every field is optional and
+    /// range-checked, and an out-of-bounds value is refused 422 with nothing written. After the
+    /// write the section is re-hydrated into the live config through the same function boot uses,
+    /// so the change applies without a restart, and an `admin.config_updated` audit entry names the
+    /// changed keys. Super-admin only, like every `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/sse`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminSSEConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminSSEConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminSSEConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/sse",
@@ -813,10 +1606,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update Stripe keys/mode/price IDs; rebuilds BillingManager
     ///
+    /// Merges the body into the stored Stripe override with three rules: a value that is still the
+    /// redacted mask is ignored, so echoing back a GET does not overwrite a secret with asterisks;
+    /// an empty string clears that field; anything else is taken at face value. The billing manager
+    /// is then rebuilt so the next checkout uses the new keys, and an `admin.config_updated` audit
+    /// entry records which field names changed but never their values. The response redacts the
+    /// secrets again. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/stripe`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminStripeConfig(body: UpdateAdminStripeConfigRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminStripeConfig(body: UpdateAdminStripeConfigRequest, options: RequestOptions = .init()) async throws -> UpdateAdminStripeConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/stripe",
@@ -826,12 +1626,54 @@ public struct AdminConfigAPI: Sendable {
         ))
     }
 
+    /// Replace the per-tool presentation overrides
+    ///
+    /// These affect PRESENTATION only. The runtime tool catalogue is code-defined, so an override
+    /// changes what the catalogue page shows and nothing about what an agent can call — including
+    /// `hidden`, which hides the row by default while the runtime still serves the tool. An
+    /// operator reaching for `hidden` to switch a tool OFF wants `disabled-tools` instead.
+    ///
+    /// Gated on a FRESH MFA challenge.
+    ///
+    /// WRITE SEMANTICS: replaces. The map given becomes the whole map, so an id omitted from the
+    /// body is deleted. Two further rules follow from that: an entry whose fields are all empty is
+    /// DROPPED rather than stored — sending `{}` for an id is how the client deletes just that one
+    /// — and `hidden` is stored only when literally `true`, so `hidden: false` deletes the flag
+    /// rather than recording it.
+    ///
+    /// Every key is checked against the runtime's built-in tool ids: an unknown id is **422**,
+    /// distinct from the 400 a malformed body gets. The outer object is strict — an unexpected
+    /// top-level key is rejected, not stripped.
+    ///
+    /// `PUT /api/v1/admin/config/tool-overrides`
+    ///
+    /// Required scopes: `admin`.
+    public func updateAdminToolOverrides(body: UpdateAdminToolOverridesRequest, options: RequestOptions = .init()) async throws -> UpdateAdminToolOverridesResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/tool-overrides",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Update tool security overrides
+    ///
+    /// Updates the tool-security overrides. `default_egress_policy` and `ssrf_deny_private_ranges`
+    /// are no longer accepted — the schema strips them rather than refusing, so an older admin UI
+    /// still sending them gets a 200 with those fields ignored. Shallow-merges the body's defined
+    /// fields into the stored `tool_security` override, so a field the body omits keeps its stored
+    /// value; every field is optional and range-checked, and an out-of-bounds value is refused 422
+    /// with nothing written. After the write the section is re-hydrated into the live config
+    /// through the same function boot uses, so the change applies without a restart, and an
+    /// `admin.config_updated` audit entry names the changed keys. Super-admin only, like every
+    /// `/admin/config` route.
     ///
     /// `PUT /api/v1/admin/config/tool-security`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminToolSecurityConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminToolSecurityConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminToolSecurityConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/tool-security",
@@ -843,10 +1685,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update webhook delivery overrides
     ///
+    /// Updates the webhook delivery overrides. It is a different KV section from
+    /// `/admin/config/webhooks-policy`; the two are not merged with each other. Shallow-merges the
+    /// body's defined fields into the stored `webhooks` override, so a field the body omits keeps
+    /// its stored value; every field is optional and range-checked, and an out-of-bounds value is
+    /// refused 422 with nothing written. After the write the section is re-hydrated into the live
+    /// config through the same function boot uses, so the change applies without a restart, and an
+    /// `admin.config_updated` audit entry names the changed keys. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/webhooks`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminWebhooksConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminWebhooksConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminWebhooksConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/webhooks",
@@ -858,10 +1709,20 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update worker pool overrides
     ///
+    /// Updates the worker-pool overrides and then pushes the new effective config into the running
+    /// scheduler, so concurrency, queue size, retry and sweep changes take effect without a
+    /// restart; that live apply is best-effort and its failure does not fail the save.
+    /// Shallow-merges the body's defined fields into the stored `worker_pool` override, so a field
+    /// the body omits keeps its stored value; every field is optional and range-checked, and an
+    /// out-of-bounds value is refused 422 with nothing written. After the write the section is
+    /// re-hydrated into the live config through the same function boot uses, so the change applies
+    /// without a restart, and an `admin.config_updated` audit entry names the changed keys.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/worker-pool`
     ///
     /// Required scopes: `admin`.
-    public func updateAdminWorkerPoolConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAdminWorkerPoolConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateAdminWorkerPoolConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/worker-pool",
@@ -873,10 +1734,15 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update markup
     ///
+    /// Writes `platform_markup_percent` and `model_markup_overrides`, each falling back to the
+    /// current effective value when the body omits it, so a partial body does not clear the other
+    /// half. The cache the cost path reads is refreshed and an `admin.config_updated` audit entry
+    /// carries the new values. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/markup`
     ///
     /// Required scopes: `admin`.
-    public func updateMarkupConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateMarkupConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateMarkupConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/markup",
@@ -888,10 +1754,16 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update public_base_url and webhook_base_url
     ///
+    /// Replaces the stored platform-URL override with the validated body, refreshes the local cache
+    /// and bumps a KV epoch so sibling replicas invalidate on their next throttled check. Setting
+    /// `public_base_url` also marks the `public_url` step of the first-run setup wizard complete.
+    /// Writes an `admin.config_updated` audit entry and responds with the re-read effective values.
+    /// Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/platform-urls`
     ///
     /// Required scopes: `admin`.
-    public func updatePlatformURLS(body: UpdatePlatformURLSRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updatePlatformURLS(body: UpdatePlatformURLSRequest, options: RequestOptions = .init()) async throws -> UpdatePlatformURLSResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/platform-urls",
@@ -903,10 +1775,19 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update runtime
     ///
+    /// Merges the body's declared keys into the stored runtime override and mirrors the result into
+    /// the live `container.config.runtime`, so the runtime and tool layers see it without a
+    /// restart. A key owned by another config section (the voice and image settings) is refused
+    /// with 400 naming the endpoint that owns it, because a value written here would be overwritten
+    /// by the next boot's reapply; a key the schema does not declare is still stripped but is named
+    /// back in `ignored_keys` rather than silently dropped. `vision_model: ""` clears that override
+    /// instead of storing an empty string. Writes an `admin.config_updated` audit entry naming the
+    /// changed keys. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/runtime`
     ///
     /// Required scopes: `admin`.
-    public func updateRuntimeConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateRuntimeConfig(body: JSONObject, options: RequestOptions = .init()) async throws -> UpdateRuntimeConfigResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/runtime",
@@ -918,10 +1799,17 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update security policies
     ///
+    /// Merges the body's defined fields into the stored security-policy override: an omitted field
+    /// means no change, while an explicit `[]` is a deliberate clear and merges through. The local
+    /// cache is refreshed, a cross-replica epoch bumped and an `admin.config_updated` audit entry
+    /// written. `file_upload_max_size_bytes` and `file_upload_allowed_mime_types` are validated and
+    /// persisted but read by no upload path, and `admin_provider_settings_require_super_admin` is
+    /// not accepted at all. Super-admin only, like every `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/security-policies`
     ///
     /// Required scopes: `admin`.
-    public func updateSecurityPolicies(body: UpdateSecurityPoliciesRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateSecurityPolicies(body: UpdateSecurityPoliciesRequest, options: RequestOptions = .init()) async throws -> UpdateSecurityPoliciesResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/security-policies",
@@ -933,13 +1821,75 @@ public struct AdminConfigAPI: Sendable {
 
     /// Update webhooks policy
     ///
+    /// Stores the validated body as the whole webhooks-policy override — unlike the sibling
+    /// sections this one does not read-then-merge, so a field the body omits loses its override and
+    /// falls back to the boot default. The local cache is refreshed, a cross-replica epoch bumped
+    /// and an `admin.config_updated` audit entry written. The three `delivery_*` fields are
+    /// accepted and persisted but no delivery path reads them. Super-admin only, like every
+    /// `/admin/config` route.
+    ///
     /// `PUT /api/v1/admin/config/webhooks-policy`
     ///
     /// Required scopes: `admin`.
-    public func updateWebhooksPolicy(body: UpdateWebhooksPolicyRequest, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateWebhooksPolicy(body: UpdateWebhooksPolicyRequest, options: RequestOptions = .init()) async throws -> UpdateWebhooksPolicyResponse {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/admin/config/webhooks-policy",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Create or replace one custom plan
+    ///
+    /// WRITE SEMANTICS: replaces. The stored record is rebuilt from this body; only `created_at`
+    /// survives from the previous version. An omitted field does NOT keep its stored value — it
+    /// takes the schema's default or disappears.
+    ///
+    /// **Two defaults make an omission destructive, and the dangerous one is `active`.** It is
+    /// `default(true)`, so re-saving a DEACTIVATED plan without sending `active` silently
+    /// reactivates it. `visibility` is `default("hidden")`, so re-saving a public plan without
+    /// sending it hides the plan from every tenant. Neither reports anything: the answer is 200 and
+    /// the record looks freshly written.
+    ///
+    /// Unknown keys are stripped rather than rejected, so a typo'd field name is accepted and
+    /// dropped with a 200.
+    ///
+    /// A built-in plan id (`free`, `starter`, `pro`, `enterprise`) is **409**, pointing at `PUT
+    /// /api/v1/admin/config/plans` — the route that does own those.
+    ///
+    /// `PUT /api/v1/admin/config/custom-plans/{planId}`
+    ///
+    /// Required scopes: `admin`.
+    public func upsertCustomPlan(planId: String, body: CustomPlanInput, options: RequestOptions = .init()) async throws -> UpsertCustomPlanResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/custom-plans/\(encodePathSegment(planId))",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// Create or replace one promo code
+    ///
+    /// WRITE SEMANTICS: replaces. Only `uses` and `created_at` survive from the previous version;
+    /// every other field comes from this body, and an omitted field is dropped.
+    ///
+    /// **`target_plan_id` is the omission that costs money.** It scopes the code to one plan, and
+    /// the reward path returns early when it is set and does not match the plan being paid for.
+    /// Replace a scoped code without resending it and the code becomes redeemable on EVERY plan —
+    /// 200, no warning, and the stored row looks the same size as before. `active` behaves the same
+    /// way as on custom plans: `default(true)`, so omitting it reactivates a deactivated code.
+    ///
+    /// `PUT /api/v1/admin/config/promo-codes/{code}`
+    ///
+    /// Required scopes: `admin`.
+    public func upsertPromoCode(code: String, body: PromoCodeInput, options: RequestOptions = .init()) async throws -> UpsertPromoCodeResponse {
+        return try await client.send(RequestSpec(
+            method: "PUT",
+            path: "/api/v1/admin/config/promo-codes/\(encodePathSegment(code))",
             body: try client.encode(body),
             idempotent: true,
             options: options

@@ -10,6 +10,10 @@ public struct MemoryAPI: Sendable {
 
     /// Delete memory entry
     ///
+    /// Deletes one memory entry and answers `204`. Idempotent and unconditional: the handler does
+    /// not check that the entry existed, so a repeat call, or one naming an id that never existed,
+    /// also answers `204`. Irreversible.
+    ///
     /// `DELETE /api/v1/agents/{agentId}/memory/{entryId}`
     ///
     /// Required scopes: `memory:write`.
@@ -24,6 +28,10 @@ public struct MemoryAPI: Sendable {
 
     /// Get a core memory block
     ///
+    /// Returns the agent's core memory block with this label — the always-resident text injected
+    /// into its system prompt — or `404` when no block by that label has been written. Labels are
+    /// matched exactly.
+    ///
     /// `GET /api/v1/agents/{agentId}/memory/core/{label}`
     ///
     /// Required scopes: `memory:read`.
@@ -36,6 +44,9 @@ public struct MemoryAPI: Sendable {
     }
 
     /// Get memory entries associated with an entity
+    ///
+    /// Returns the agent's memory entries associated with one extracted entity, with `total`. An
+    /// entity the agent has never recorded yields an empty list rather than `404`.
     ///
     /// `GET /api/v1/agents/{agentId}/memory/entities/{entityId}`
     ///
@@ -50,13 +61,37 @@ public struct MemoryAPI: Sendable {
 
     /// Get memory entry
     ///
+    /// Returns one memory entry of this agent, or `404` when there is no such entry. Before
+    /// 2026-09-10 this path had no handler of its own and was answered with the agent's recency
+    /// list, so a client written against the old behaviour will see a shape change here.
+    ///
     /// `GET /api/v1/agents/{agentId}/memory/{entryId}`
     ///
     /// Required scopes: `memory:read`.
-    public func getMemoryEntry(agentId: String, entryId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func getMemoryEntry(agentId: String, entryId: String, options: RequestOptions = .init()) async throws -> MemoryEntry {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/memory/\(encodePathSegment(entryId))",
+            options: options
+        ))
+    }
+
+    /// Put back what an export took out
+    ///
+    /// Accepts the `memory.json` an account export writes: a flat `entries` array, or
+    /// `agents[].entries` (every agent's entries are imported into THIS agent). Each entry is
+    /// tagged `imported`. Dedup is the store's: re-importing the same file returns the existing
+    /// entries as `duplicates` instead of doubling them. A file with no entries is 400.
+    ///
+    /// `POST /api/v1/agents/{agentId}/memory/import`
+    ///
+    /// Required scopes: `memory:write`.
+    public func importAgentMemory(agentId: String, body: ImportAgentMemoryRequest, options: RequestOptions = .init()) async throws -> ImportAgentMemoryResponse {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/memory/import",
+            body: try client.encode(body),
+            idempotent: true,
             options: options
         ))
     }
@@ -80,12 +115,35 @@ public struct MemoryAPI: Sendable {
         ))
     }
 
+    /// List core memory blocks
+    ///
+    /// Every core memory block stored for the agent, whatever its label. `enabled` is the agent's
+    /// `core_memory.enabled`: the runtime injects blocks into the system prompt only when it is
+    /// true, so a block listed under `enabled: false` is stored but not seen by any run. `404` when
+    /// the agent does not exist.
+    ///
+    /// `GET /api/v1/agents/{agentId}/memory/core`
+    ///
+    /// Required scopes: `memory:read`.
+    public func listCoreMemoryBlocks(agentId: String, options: RequestOptions = .init()) async throws -> ListCoreMemoryBlocksResponse {
+        return try await client.send(RequestSpec(
+            method: "GET",
+            path: "/api/v1/agents/\(encodePathSegment(agentId))/memory/core",
+            options: options
+        ))
+    }
+
     /// List recent memories for an agent
+    ///
+    /// Returns the agent's most recent memory entries, newest first. `limit` (or its alias `top_k`)
+    /// defaults to 20 and is clamped to 1..200, so an oversized value narrows silently rather than
+    /// returning the whole corpus. This is a recency listing with no query — use `POST
+    /// /api/v1/agents/{agentId}/memory/search` to retrieve by relevance.
     ///
     /// `GET /api/v1/agents/{agentId}/memory`
     ///
     /// Required scopes: `memory:read`.
-    public func listMemories(agentId: String, limit: Int? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listMemories(agentId: String, limit: Int? = nil, options: RequestOptions = .init()) async throws -> ListMemoriesResponse {
         var query: [URLQueryItem] = []
         if let limit {
             query.append(URLQueryItem(name: "limit", value: String(limit)))
@@ -100,10 +158,18 @@ public struct MemoryAPI: Sendable {
 
     /// Search agent memories
     ///
+    /// Retrieves the agent's memories most relevant to `text` (`query` is accepted as an alias);
+    /// one of the two is required, otherwise `422`. `strategy` is `hybrid` by default — keyword and
+    /// vector recall combined — or `recency`; `limit` (alias `top_k`) defaults to 20 and `types`
+    /// narrows to `episodic`, `semantic` and/or `procedural`. Nothing is written, but because the
+    /// route family gates on HTTP method this POST requires the WRITE permission and the
+    /// `memory:write` scope, not the read ones. Semantic recall only contributes when the platform
+    /// has an embeddings key configured.
+    ///
     /// `POST /api/v1/agents/{agentId}/memory/search`
     ///
     /// Required scopes: `memory:write`.
-    public func search(agentId: String, body: SearchMemoryRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func search(agentId: String, body: JSONValue, options: RequestOptions = .init()) async throws -> SearchMemoryResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/memory/search",
@@ -115,10 +181,19 @@ public struct MemoryAPI: Sendable {
 
     /// Update memory entry
     ///
+    /// Updates one memory entry. Only `content`, `tags` and `relevance_score` are read from the
+    /// body and each is applied only when present, so the rest of the entry is kept. `tags` must be
+    /// at most 20 strings of at most 64 characters each, otherwise `422` — the same shape the
+    /// ingest path enforces, so an entry cannot be updated into something ingest would have
+    /// refused. `content` is capped at 2 MB, and an update that GROWS the entry is charged against
+    /// the plan's memory storage quota under the same per-agent lock the ingest path uses, so it
+    /// can be refused `403` (shrinking or same-size updates never reach that gate) and the refusal
+    /// is audit-logged.
+    ///
     /// `PUT /api/v1/agents/{agentId}/memory/{entryId}`
     ///
     /// Required scopes: `memory:write`.
-    public func updateAgentMemoryEntry(agentId: String, entryId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func updateAgentMemoryEntry(agentId: String, entryId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> MemoryEntry {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/agents/\(encodePathSegment(agentId))/memory/\(encodePathSegment(entryId))",
@@ -129,6 +204,16 @@ public struct MemoryAPI: Sendable {
     }
 
     /// Update a core memory block
+    ///
+    /// Creates or replaces the agent's core memory block with this label; `content` is required
+    /// (`400` otherwise) and replaces the block's text whole. `max_tokens` is a per-block ceiling
+    /// defaulting to 1000 and is CLAMPED to the platform's aggregate core-memory budget — a block
+    /// larger than the whole budget could never be injected into a prompt, so the request is not
+    /// allowed to raise its own limit. Content that exceeds the resulting ceiling is rejected by
+    /// the store rather than silently truncated. Writing a block also makes it one the runtime
+    /// injects: the agent's `core_memory` is enabled and the label is added to `core_memory.blocks`
+    /// when it is not declared there yet (while fewer than 10 are declared). `404` when the agent
+    /// does not exist.
     ///
     /// `PUT /api/v1/agents/{agentId}/memory/core/{label}`
     ///

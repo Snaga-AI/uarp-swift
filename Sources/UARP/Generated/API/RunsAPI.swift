@@ -16,7 +16,7 @@ public struct RunsAPI: Sendable {
     /// `POST /api/v1/runs/{runId}/approve`
     ///
     /// Required scopes: `runs:create`.
-    public func approveRun(runId: String, body: RunApproveRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func approveRun(runId: String, body: RunApproveRequest? = nil, options: RequestOptions = .init()) async throws -> ApproveRunResponse {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -29,10 +29,19 @@ public struct RunsAPI: Sendable {
 
     /// Cancel a run
     ///
+    /// Asks for the run to stop. Requires the `runs.cancel` permission. A run executing on a local
+    /// bridge is cancelled through the bridge, since the in-process scheduler has no hold on it;
+    /// otherwise the scheduler aborts it, and a run the scheduler does not hold — queued but
+    /// unclaimed, or stranded by a crashed worker — is flipped to `cancelled` directly in storage
+    /// under CAS, with a `run.cancelled` event appended. The CAS retries on a lost race and reports
+    /// the completion rather than overwriting it. Always answers `200`: `{cancelled: true, run_id}`
+    /// when something was stopped and `{cancelled: false, message}` when the run is unknown or
+    /// already finished — there is no `404` here, and a repeat call is safe.
+    ///
     /// `POST /api/v1/runs/{runId}/cancel`
     ///
     /// Required scopes: `runs:create`.
-    public func cancel(runId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func cancel(runId: String, options: RequestOptions = .init()) async throws -> CancelRunResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/cancel",
@@ -48,7 +57,7 @@ public struct RunsAPI: Sendable {
     /// `POST /api/v1/runs/{runId}/continue`
     ///
     /// Required scopes: `runs:create`.
-    public func continueRun(runId: String, body: ContinueRunRequest, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func continueRun(runId: String, body: ContinueRunRequest, options: RequestOptions = .init()) async throws -> ContinueRunResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/continue",
@@ -80,10 +89,16 @@ public struct RunsAPI: Sendable {
 
     /// Create checkpoint for a run
     ///
+    /// Forces a checkpoint of a long-running run and returns it with `202`. `404` when the run does
+    /// not exist and `422` when its status is anything other than `running` — a finished run cannot
+    /// be checkpointed after the fact. The checkpoint records the run's status, step sequence and
+    /// metrics at that moment; it is a marker for inspection and for `POST
+    /// /api/v1/runs/{runId}/continue`, and taking one does not pause or otherwise disturb the run.
+    ///
     /// `POST /api/v1/runs/{runId}/checkpoint`
     ///
     /// Required scopes: `runs:create`.
-    public func createRunCheckpoint(runId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func createRunCheckpoint(runId: String, options: RequestOptions = .init()) async throws -> CreateRunCheckpointResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/checkpoint",
@@ -92,7 +107,59 @@ public struct RunsAPI: Sendable {
         ))
     }
 
+    /// Take back a reaction
+    ///
+    /// Removes the caller's own reaction on one message. Until 2026-09-13 there was no way back —
+    /// the reaction was required and enumerated, `null` and `""` answered 422 and DELETE answered
+    /// 405, so a reader who pressed thumbs-down by mistake had it recorded for ever and the web
+    /// chat hid its own toggle rather than lie about it. Only the row for THIS caller and this
+    /// `message_id` goes; another person's reaction on the same message is untouched. 204 whether
+    /// or not a reaction was there, so a retry is safe.
+    ///
+    /// `DELETE /api/v1/runs/{runId}/feedback`
+    ///
+    /// Required scopes: `runs:create`.
+    public func deleteRunFeedback(runId: String, messageId: String, options: RequestOptions = .init()) async throws {
+        var query: [URLQueryItem] = []
+        query.append(URLQueryItem(name: "message_id", value: messageId))
+        try await client.sendVoid(RequestSpec(
+            method: "DELETE",
+            path: "/api/v1/runs/\(encodePathSegment(runId))/feedback",
+            query: query,
+            idempotent: true,
+            options: options
+        ))
+    }
+
+    /// What will this run cost
+    ///
+    /// Prices a run before it happens, from the agent's own recent runs. Read-only: it dispatches
+    /// nothing and stores nothing, and it needs only `runs:read`.
+    ///
+    /// When the model has no known rate the answer is still 200 with `estimated_cost_usd: 0` and
+    /// `pricing: "unknown"` — read `basis.pricing` before showing the figure, or a client will
+    /// present “free” for “we have no idea”.
+    ///
+    /// `POST /api/v1/runs/estimate`
+    ///
+    /// Required scopes: `runs:read`.
+    public func estimateRunCost(body: EstimateRunCostRequest, options: RequestOptions = .init()) async throws -> RunCostEstimate {
+        return try await client.send(RequestSpec(
+            method: "POST",
+            path: "/api/v1/runs/estimate",
+            body: try client.encode(body),
+            idempotent: true,
+            options: options
+        ))
+    }
+
     /// Export run events as JSONL
+    ///
+    /// Streams the run's complete event log as newline-delimited JSON — one event per line,
+    /// `Content-Type: application/x-ndjson`, sent with a `Content-Disposition: attachment` filename
+    /// so a browser saves it. `404` when the run does not exist. Unlike the SSE stream this is the
+    /// whole recorded log in one response, not a live subscription, and there is no filtering or
+    /// paging.
     ///
     /// `GET /api/v1/runs/{runId}/events/export`
     ///
@@ -107,23 +174,42 @@ public struct RunsAPI: Sendable {
 
     /// Get run status and result
     ///
+    /// Returns the run — its status, input, resource limits, metrics and, once it has finished, its
+    /// output — or `404`. The platform's own provider cost and margin are stripped from the metrics
+    /// before they go out. `changed_files=true` adds the files the run touched. Two fields appear
+    /// only when the run is blocked on a person: for `awaiting_approval` the handler scans back
+    /// through the event log for the most recent approval prompt and returns `pending_approvals`,
+    /// and for `awaiting_input` it returns `pending_input` with the question, its options and
+    /// context — so a client whose SSE stream dropped can rebuild the card by polling instead of
+    /// replaying the stream. Both are best-effort; a failed scan returns the bare run.
+    ///
     /// `GET /api/v1/runs/{runId}`
     ///
     /// Required scopes: `runs:read`.
-    public func get(runId: String, options: RequestOptions = .init()) async throws -> Run {
+    public func get(runId: String, changedFiles: GetRunChangedFiles? = nil, options: RequestOptions = .init()) async throws -> GetRunResponse {
+        var query: [URLQueryItem] = []
+        if let changedFiles {
+            query.append(URLQueryItem(name: "changed_files", value: changedFiles.rawValue))
+        }
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/runs/\(encodePathSegment(runId))",
+            query: query,
             options: options
         ))
     }
 
     /// Get audit trail for a run
     ///
+    /// Returns the audit entries recorded against this run, with `total`. `404` when the run does
+    /// not exist. Scoped by audit target, so it carries the acts performed ON the run — approvals,
+    /// rejections, cancellations — rather than the run's own execution events, which are read
+    /// through the events export or the SSE stream.
+    ///
     /// `GET /api/v1/runs/{runId}/audit-log`
     ///
     /// Required scopes: `runs:read`.
-    public func getRunAuditLog(runId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getRunAuditLog(runId: String, options: RequestOptions = .init()) async throws -> GetRunAuditLogResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/runs/\(encodePathSegment(runId))/audit-log",
@@ -133,10 +219,18 @@ public struct RunsAPI: Sendable {
 
     /// Get user feedback for a run
     ///
+    /// Returns the message reactions THIS caller left on this run. With `message_id` the answer is
+    /// that one message's `{reaction, reason?}`, with `reaction: null` when there is none; without
+    /// `message_id` it is `{feedbacks}` — every reaction this caller left anywhere in the run,
+    /// which is how a client seeds its per-message cache in one request instead of one per bubble.
+    /// The bulk form scans up to 500 stored rows. `404` when the run does not exist. Reactions are
+    /// keyed by caller identity, so another person's reaction to the same message is never reported
+    /// here.
+    ///
     /// `GET /api/v1/runs/{runId}/feedback`
     ///
     /// Required scopes: `runs:read`.
-    public func getRunFeedback(runId: String, messageId: String? = nil, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func getRunFeedback(runId: String, messageId: String? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
         var query: [URLQueryItem] = []
         if let messageId {
             query.append(URLQueryItem(name: "message_id", value: messageId))
@@ -150,6 +244,11 @@ public struct RunsAPI: Sendable {
     }
 
     /// Get run queue position
+    ///
+    /// Reports where the run sits in this worker's scheduling queue. The answer comes from the
+    /// in-process scheduler, not from storage, so the handler does not verify that the run exists —
+    /// an unknown or already-started run answers `200` with whatever the scheduler reports for it
+    /// rather than `404`.
     ///
     /// `GET /api/v1/runs/{runId}/queue-position`
     ///
@@ -180,10 +279,18 @@ public struct RunsAPI: Sendable {
 
     /// List all runs for tenant
     ///
+    /// Ordered NEWEST FIRST, and that is a guarantee, not an accident of storage: page one is the
+    /// most recent runs. Do not page toward the end to find recent activity — a client that walks
+    /// `has_more` looking for the newest page now walks away from it. This was previously true only
+    /// of the handler, so clients hedged by paging or by re-sorting, and one shipped a twelve-hop
+    /// walk that reversed meaning the day the order changed. Note the sibling
+    /// `/api/v1/teams/{teamId}/runs` is deliberately the other way round — oldest first — because a
+    /// team transcript reads forward.
+    ///
     /// `GET /api/v1/runs`
     ///
     /// Required scopes: `runs:read`.
-    public func list(agentId: String? = nil, sessionId: String? = nil, status: String? = nil, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) async throws -> ListRunsResponse {
+    public func list(agentId: String? = nil, sessionId: String? = nil, status: String? = nil, limit: Int? = nil, cursor: String? = nil, order: ListRunsOrder? = nil, options: RequestOptions = .init()) async throws -> ListRunsResponse {
         var query: [URLQueryItem] = []
         if let agentId {
             query.append(URLQueryItem(name: "agent_id", value: agentId))
@@ -200,6 +307,9 @@ public struct RunsAPI: Sendable {
         if let cursor {
             query.append(URLQueryItem(name: "cursor", value: cursor))
         }
+        if let order {
+            query.append(URLQueryItem(name: "order", value: order.rawValue))
+        }
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/runs",
@@ -210,9 +320,9 @@ public struct RunsAPI: Sendable {
 
     /// Stream every item returned by `listRuns`, following the `cursor` cursor until the server
     /// reports no further pages.
-    public func listAll(agentId: String? = nil, sessionId: String? = nil, status: String? = nil, limit: Int? = nil, cursor: String? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<Run, Error> {
+    public func listAll(agentId: String? = nil, sessionId: String? = nil, status: String? = nil, limit: Int? = nil, cursor: String? = nil, order: ListRunsOrder? = nil, options: RequestOptions = .init()) -> AsyncThrowingStream<Run, Error> {
         autoPaginate(
-            fetch: { cursor in try await self.list(agentId: agentId, sessionId: sessionId, status: status, limit: limit, cursor: cursor, options: options) },
+            fetch: { cursor in try await self.list(agentId: agentId, sessionId: sessionId, status: status, limit: limit, cursor: cursor, order: order, options: options) },
             items: { $0.items },
             cursor: { $0.cursor },
             hasMore: { $0.hasMore }
@@ -221,10 +331,14 @@ public struct RunsAPI: Sendable {
 
     /// List run artifacts
     ///
+    /// Lists the artifacts the run produced, read straight off the run record, with `total`. `404`
+    /// when the run does not exist. The entries carry ids, names, types and sizes; the bytes are
+    /// fetched through the files API.
+    ///
     /// `GET /api/v1/runs/{runId}/artifacts`
     ///
     /// Required scopes: `runs:read`.
-    public func listRunArtifacts(runId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func listRunArtifacts(runId: String, options: RequestOptions = .init()) async throws -> ListRunArtifactsResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/runs/\(encodePathSegment(runId))/artifacts",
@@ -233,6 +347,10 @@ public struct RunsAPI: Sendable {
     }
 
     /// List checkpoints for a run
+    ///
+    /// Lists the run's checkpoints, up to 500, with `total`. `404` when the run does not exist.
+    /// Both the checkpoints forced through `POST /api/v1/runs/{runId}/checkpoint` and any the
+    /// runtime took appear here.
     ///
     /// `GET /api/v1/runs/{runId}/checkpoints`
     ///
@@ -247,10 +365,18 @@ public struct RunsAPI: Sendable {
 
     /// Pause a run
     ///
+    /// Suspends a run that is currently executing, leaving it at `paused` until `POST
+    /// /api/v1/runs/{runId}/resume`. `404` when the run does not exist and `409` when it is in any
+    /// status other than `running`; the transition is a CAS, so losing the race to a concurrent
+    /// write is also `409`. A `run.checkpoint` event with reason `manual_pause` is appended. The
+    /// run stops at its next step boundary (a step already in flight finishes first) and emits
+    /// `run.paused`; if that in-flight step produced the final answer, the answer is held and the
+    /// run stays `paused` instead of completing.
+    ///
     /// `POST /api/v1/runs/{runId}/pause`
     ///
     /// Required scopes: `runs:create`.
-    public func pauseRun(runId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func pauseRun(runId: String, options: RequestOptions = .init()) async throws -> PauseRunResponse {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/pause",
@@ -261,10 +387,21 @@ public struct RunsAPI: Sendable {
 
     /// Reject a pending tool call (HITL)
     ///
+    /// Refuses a tool call the run is waiting on, requiring the `runs.approve` permission. `404`
+    /// when the run does not exist and `409` unless its status is `awaiting_approval`. The
+    /// rejection — with `reason`, defaulted when absent — is stored as the run's approval signal,
+    /// the run is transitioned to `failed` under CAS (a lost race is `409`, and nothing is mirrored
+    /// outward in that case) with `error` set to the reason and `error_code` set to
+    /// `approval_rejected`, a `run.failed` event marked `rejected` and carrying the same
+    /// `error_code` is appended, and the pending approval notifications are retired. For a run
+    /// executing on a local bridge the decision is also written into the bridge's slot so the
+    /// prompt there is torn down. This ends the run; it is not a way to decline one tool and
+    /// continue.
+    ///
     /// `POST /api/v1/runs/{runId}/reject`
     ///
     /// Required scopes: `runs:create`.
-    public func rejectRun(runId: String, body: RejectRunRequest? = nil, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func rejectRun(runId: String, body: RejectRunRequest? = nil, options: RequestOptions = .init()) async throws -> RejectRunResponse {
         let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
@@ -277,10 +414,15 @@ public struct RunsAPI: Sendable {
 
     /// Replay a run for determinism check
     ///
+    /// Re-executes the recorded run from its event log and reports whether the result matches,
+    /// which is how a determinism regression is caught. It takes only the `runs:read` scope and the
+    /// `runs.read` permission, because it reads the recording rather than dispatching new work
+    /// against the agent.
+    ///
     /// `POST /api/v1/runs/{runId}/replay`
     ///
     /// Required scopes: `runs:read`.
-    public func replayRun(runId: String, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func replayRun(runId: String, options: RequestOptions = .init()) async throws -> ReplayResult {
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/replay",
@@ -290,6 +432,13 @@ public struct RunsAPI: Sendable {
     }
 
     /// Send user input response to a paused run
+    ///
+    /// Delivers the user's answer to a run that asked a question with `ask_user`. `404` when the
+    /// run does not exist, `409` unless its status is `awaiting_input` or when a concurrent write
+    /// wins the CAS, and `400` when `response` is empty or missing. The answer is stored for the
+    /// runtime to read on resume, the run is returned to `queued` and rescheduled at realtime
+    /// priority, and a `run.input_received` event is appended. Returns `{status, run_id}` — the run
+    /// resumes asynchronously.
     ///
     /// `POST /api/v1/runs/{runId}/respond`
     ///
@@ -306,13 +455,26 @@ public struct RunsAPI: Sendable {
 
     /// Resume a run
     ///
+    /// Returns a paused run to the queue and reschedules it, answering `202`. `404` when the run
+    /// does not exist and `409` when it is not `paused`, including when a concurrent write wins the
+    /// CAS. The body is optional: a bare POST with no body resumes the run (until 2026-09-22 that
+    /// answered `422 _body: Required`). An optional `input` object in the body is stored on the
+    /// run's metadata as `_resume_input` for the runtime to pick up, and a string `input.note` (or
+    /// `input.message`) reaches the model as a user turn. A run paused while its last step was
+    /// already producing the final answer holds that answer, and a resume without a note releases
+    /// it without calling the model again; a `run.started` event records that this was a resume.
+    /// The rescheduling is fire-and-forget, so the `202` means the run was re-queued, not that it
+    /// has restarted.
+    ///
     /// `POST /api/v1/runs/{runId}/resume`
     ///
     /// Required scopes: `runs:create`.
-    public func resume(runId: String, options: RequestOptions = .init()) async throws -> JSONValue {
+    public func resume(runId: String, body: ResumeRunRequest? = nil, options: RequestOptions = .init()) async throws -> ResumeRunResponse {
+        let encodedBody: RequestBody? = try body.map { try client.encode($0) }
         return try await client.send(RequestSpec(
             method: "POST",
             path: "/api/v1/runs/\(encodePathSegment(runId))/resume",
+            body: encodedBody,
             idempotent: true,
             options: options
         ))
@@ -320,10 +482,23 @@ public struct RunsAPI: Sendable {
 
     /// Save user feedback/reaction for a run
     ///
+    /// One reaction per (message, caller); a second PUT for the same `message_id` replaces the
+    /// first. `message_id` is whatever string the client attaches to a message — the platform
+    /// stores it verbatim (max 256 chars) and does not check it against the transcript, which today
+    /// carries no message identifier (see `getSessionMessages`). Unknown body fields are dropped;
+    /// `reason` is not one of them since 2026-09-13. `null` and `""` are still rejected with 422;
+    /// to remove a reaction use DELETE on this path with `?message_id=` (added 2026-09-13 — before
+    /// it, there was no way back). `message_id` is stored as sent. The canonical form is the id
+    /// `GET /sessions/{sessionId}/messages` serves for the entry (`{run_id}`, `{run_id}-reply[-N]`,
+    /// `{run_id}-user-N`, `{run_id}-tool-N`, `{run_id}-system-N`); any other string is accepted —
+    /// older iOS builds send `{run_id}-{timestamp}-assistant-{hash}` and App Store never retires
+    /// them — but cannot be matched back to the transcript, and each such arrival is counted per
+    /// day (owner's decision 2026-09-11, option A: a 422 comes no earlier than a month of zero).
+    ///
     /// `PUT /api/v1/runs/{runId}/feedback`
     ///
     /// Required scopes: `runs:create`.
-    public func setRunFeedback(runId: String, body: JSONObject, options: RequestOptions = .init()) async throws -> JSONObject {
+    public func setRunFeedback(runId: String, body: SetRunFeedbackRequest, options: RequestOptions = .init()) async throws -> RunFeedbackSet {
         return try await client.send(RequestSpec(
             method: "PUT",
             path: "/api/v1/runs/\(encodePathSegment(runId))/feedback",

@@ -505,6 +505,8 @@ public struct AarObjectiveOutcome: Codable, Hashable, Sendable {
     public var strikesUsed: Int
     /// The objective record's `abort_reason`, copied. Absent when it has none.
     public var abortReason: String?
+    /// The failed objective's recorded result: the verifier or execution reason.
+    public var failureReason: String?
     public var finalAgentId: String?
     public var finalModel: String?
     public var durationMs: Int?
@@ -512,11 +514,12 @@ public struct AarObjectiveOutcome: Codable, Hashable, Sendable {
     /// Whether the success criteria were checked and held.
     public var verified: Bool
 
-    public init(objectiveId: String, finalStatus: String, strikesUsed: Int, abortReason: String? = nil, finalAgentId: String? = nil, finalModel: String? = nil, durationMs: Int? = nil, costUsd: Double? = nil, verified: Bool) {
+    public init(objectiveId: String, finalStatus: String, strikesUsed: Int, abortReason: String? = nil, failureReason: String? = nil, finalAgentId: String? = nil, finalModel: String? = nil, durationMs: Int? = nil, costUsd: Double? = nil, verified: Bool) {
         self.objectiveId = objectiveId
         self.finalStatus = finalStatus
         self.strikesUsed = strikesUsed
         self.abortReason = abortReason
+        self.failureReason = failureReason
         self.finalAgentId = finalAgentId
         self.finalModel = finalModel
         self.durationMs = durationMs
@@ -529,6 +532,7 @@ public struct AarObjectiveOutcome: Codable, Hashable, Sendable {
         case finalStatus = "final_status"
         case strikesUsed = "strikes_used"
         case abortReason = "abort_reason"
+        case failureReason = "failure_reason"
         case finalAgentId = "final_agent_id"
         case finalModel = "final_model"
         case durationMs = "duration_ms"
@@ -588,9 +592,11 @@ public struct AarPhaseRecordPhase: RawRepresentable, Codable, Hashable, Sendable
 /// `AarRootCause` model.
 public struct AarRootCause: Codable, Hashable, Sendable {
     public var objectiveId: String
-    /// Coarse and closed. Derived from the objective's `abort_reason`: `budget_exhausted` and
-    /// `exhausted_strikes_<n>` → `max_duration_exceeded`; `dependency_failed`, `not_dispatchable`
-    /// and `verifier_error` → `external_error`. Branch on `code` for the precise reason.
+    /// Coarse and closed. `exhausted_strikes_<n>` → `verification_failed`; `budget_exhausted` →
+    /// `unknown`; `dependency_failed`, `not_dispatchable` and `verifier_error` → `external_error`.
+    /// Only an explicit duration cause yields `max_duration_exceeded`. `code` preserves the precise
+    /// abort reason and `details` includes the recorded failure reason. Existing finalized AARs are
+    /// presented with corrected diagnostics without rewriting their stored audit record.
     public var category: AarRootCauseCategory
     public var details: String
     /// The objective's `abort_reason` verbatim (e.g. `budget_exhausted`, `verifier_error`). Absent
@@ -612,9 +618,11 @@ public struct AarRootCause: Codable, Hashable, Sendable {
     }
 }
 
-/// Coarse and closed. Derived from the objective's `abort_reason`: `budget_exhausted` and
-/// `exhausted_strikes_<n>` → `max_duration_exceeded`; `dependency_failed`, `not_dispatchable`
-/// and `verifier_error` → `external_error`. Branch on `code` for the precise reason.
+/// Coarse and closed. `exhausted_strikes_<n>` → `verification_failed`; `budget_exhausted` →
+/// `unknown`; `dependency_failed`, `not_dispatchable` and `verifier_error` → `external_error`.
+/// Only an explicit duration cause yields `max_duration_exceeded`. `code` preserves the precise
+/// abort reason and `details` includes the recorded failure reason. Existing finalized AARs are
+/// presented with corrected diagnostics without rewriting their stored audit record.
 ///
 /// Values the API adds later decode into this type unchanged, so a new
 /// server-side case never breaks an existing client.
@@ -1160,6 +1168,7 @@ public struct AdminAnalyticsOverviewResponse: Codable, Hashable, Sendable {
 
 /// `AdminAnalyticsOverviewResponseProductCohorts` model.
 public struct AdminAnalyticsOverviewResponseProductCohorts: Codable, Hashable, Sendable {
+    /// When tracking began; null before the first cohort row exists.
     public var trackingSince: String?
     public var asOf: String
     public var complete: Bool
@@ -1379,15 +1388,15 @@ public struct AdminConfigAgentMemoryConfigAgentMemory: Codable, Hashable, Sendab
     public var extractionMaxTokens: Int
     /// The model memory extraction calls after a run. On PUT, `null` clears the stored override so
     /// the platform default applies again; GET then omits the field. Added 2026-09-23.
-    public var extractionModel: String
+    public var extractionModel: String?
     public var evictionThreshold: Int
     public var embeddingDimensions: Int
-    public var embeddingProvider: String
-    public var embeddingModel: String
+    public var embeddingProvider: String?
+    public var embeddingModel: String?
     /// On PUT, `null` clears the stored override; GET then omits the field. Added 2026-09-23.
-    public var compressionModel: String
+    public var compressionModel: String?
 
-    public init(enabled: Bool, useSharedStore: Bool, defaultMaxEntries: Int, defaultRetrievalLimit: Int, defaultRetrievalStrategy: String, decayEnabled: Bool, decayHalfLifeDays: Int, decayJobIntervalMs: Int, extractionMaxTokens: Int, extractionModel: String, evictionThreshold: Int, embeddingDimensions: Int, embeddingProvider: String, embeddingModel: String, compressionModel: String) {
+    public init(enabled: Bool, useSharedStore: Bool, defaultMaxEntries: Int, defaultRetrievalLimit: Int, defaultRetrievalStrategy: String, decayEnabled: Bool, decayHalfLifeDays: Int, decayJobIntervalMs: Int, extractionMaxTokens: Int, extractionModel: String? = nil, evictionThreshold: Int, embeddingDimensions: Int, embeddingProvider: String? = nil, embeddingModel: String? = nil, compressionModel: String? = nil) {
         self.enabled = enabled
         self.useSharedStore = useSharedStore
         self.defaultMaxEntries = defaultMaxEntries
@@ -5374,19 +5383,34 @@ public struct AgentHire: Codable, Hashable, Sendable {
     public var iconURL: String
     /// `pending`: a command was issued and nothing has connected with it; `connected`: the agent
     /// connected with its current command; `disconnected`: the person disconnected it — POST
-    /// /agents/{agentId}/hire/command brings it back.
+    /// /agents/{agentId}/hire/command brings it back. A one-way record of what happened, not
+    /// presence: it is written on the first authenticated request and never cleared, so it still
+    /// reads `connected` after the agent's process has stopped. Show `online` for "is it working
+    /// now".
     public var status: AgentHireStatus
     public var connectedAt: String?
     /// Pending only: when the current command stops working if still unused.
     public var expiresAt: String?
+    /// Whether the agent is polling right now: a bridge connection with a heartbeat in the last two
+    /// minutes. Derived on every read and always agrees with the agent's `bridge_status`. Added
+    /// 2026-10-20 — before it, a client had only `status` and kept calling a stopped agent
+    /// "connected".
+    public var online: Bool
+    /// The agent's most recent heartbeat, read from its bridge connection; `null` when it has never
+    /// been seen, or when that connection record was deregistered or swept. While the record exists
+    /// it keeps the time of the last sighting, so a screen can say when the agent was last alive.
+    /// Added 2026-10-20.
+    public var lastSeenAt: String?
 
-    public init(catalogId: String, catalogName: String, iconURL: String, status: AgentHireStatus, connectedAt: String? = nil, expiresAt: String? = nil) {
+    public init(catalogId: String, catalogName: String, iconURL: String, status: AgentHireStatus, connectedAt: String? = nil, expiresAt: String? = nil, online: Bool, lastSeenAt: String? = nil) {
         self.catalogId = catalogId
         self.catalogName = catalogName
         self.iconURL = iconURL
         self.status = status
         self.connectedAt = connectedAt
         self.expiresAt = expiresAt
+        self.online = online
+        self.lastSeenAt = lastSeenAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -5396,12 +5420,17 @@ public struct AgentHire: Codable, Hashable, Sendable {
         case status = "status"
         case connectedAt = "connected_at"
         case expiresAt = "expires_at"
+        case online = "online"
+        case lastSeenAt = "last_seen_at"
     }
 }
 
 /// `pending`: a command was issued and nothing has connected with it; `connected`: the agent
 /// connected with its current command; `disconnected`: the person disconnected it — POST
-/// /agents/{agentId}/hire/command brings it back.
+/// /agents/{agentId}/hire/command brings it back. A one-way record of what happened, not
+/// presence: it is written on the first authenticated request and never cleared, so it still
+/// reads `connected` after the agent's process has stopped. Show `online` for "is it working
+/// now".
 ///
 /// Values the API adds later decode into this type unchanged, so a new
 /// server-side case never breaks an existing client.
@@ -7303,14 +7332,14 @@ public struct AgentVersion: Codable, Hashable, Sendable {
     /// (agent-factory + discovery)`, `Head Agent promoted`, `Head Agent system prompt synced to
     /// canonical`, `Head Agent system prompt restored from backup`, `Tier SPECs synced`, `Model
     /// provider healed to the platform default`, `Core memory enabled`, `Guardrail deleted and
-    /// detached`, `Workspace tools enabled`, `Tool trust override updated`, `Platform agent
-    /// provisioned`, `Platform agent config migrated on boot`, `Qualification evaluator template
-    /// revision N` (N = the template revision), `Hired`, `Registered from a local app`, `Token cap
-    /// removed (platform budget applies)`, `Head Agent renamed to Chief of Staff`, `Token cap
-    /// removed and Head Agent renamed to Chief of Staff`, `Rollback to version N` (N = the version
-    /// rolled back to), `Self-improvement: N changes based on N analysis` (the self-improvement
-    /// loop: the first N is a count, the second is one of errors, ratings or feedback — words, not
-    /// a number). A reason code beside the prose is the owner's decision (DEC 11).
+    /// detached`, `Workspace tools enabled`, `Tool trust override updated`, `Qualification
+    /// evaluator template revision N` (N = the template revision), `Hired`, `Registered from a
+    /// local app`, `Token cap removed (platform budget applies)`, `Head Agent renamed to Chief of
+    /// Staff`, `Token cap removed and Head Agent renamed to Chief of Staff`, `Destructive tools
+    /// removed from auto-approval (template v2)`, `Rollback to version N` (N = the version rolled
+    /// back to), `Self-improvement: N changes based on N analysis` (the self-improvement loop: the
+    /// first N is a count, the second is one of errors, ratings or feedback — words, not a number).
+    /// A reason code beside the prose is the owner's decision (DEC 11).
     public var changelog: String?
     public var createdAt: String
     public var createdBy: String?
@@ -7698,6 +7727,56 @@ public struct AnalyticsTopValue: Codable, Hashable, Sendable {
         case value = "value"
         case count = "count"
     }
+}
+
+/// A place in a result (2026-10-19): a text range, a point or box on an image, or lines of
+/// code. `kind` says which. Every kind is a closed object: an unknown key inside an anchor is
+/// refused with `422`, never dropped — a dropped coordinate would turn "this corner" into "the
+/// whole picture". The same shape is used by session annotations and by `POST
+/// /runs/{runId}/review`.
+public typealias Anchor = JSONValue
+
+/// What an annotation or anchor is on: a chat `message` (the id `GET
+/// /sessions/{sessionId}/messages` serves), an `artifact`, a `file` (a file id), or a run's
+/// output (`run_output`, the run id). Stored as sent; the id is not looked up.
+public struct AnchorTarget: Codable, Hashable, Sendable {
+    public var type: AnchorTargetType
+    public var id: String
+
+    public init(type: AnchorTargetType, id: String) {
+        self.type = type
+        self.id = id
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type = "type"
+        case id = "id"
+    }
+}
+
+/// `AnchorTargetType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct AnchorTargetType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let message = AnchorTargetType(rawValue: "message")
+    public static let artifact = AnchorTargetType(rawValue: "artifact")
+    public static let file = AnchorTargetType(rawValue: "file")
+    public static let runOutput = AnchorTargetType(rawValue: "run_output")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [AnchorTargetType] = [.message, .artifact, .file, .runOutput]
 }
 
 /// `AndroidTester` model.
@@ -8426,6 +8505,118 @@ public struct ApplicationCvMimeType: RawRepresentable, Codable, Hashable, Sendab
     public static let knownValues: [ApplicationCvMimeType] = [.applicationPDF, .applicationVndOpenxmlformatsOfficedocumentWordprocessingmlDocument, .textMarkdown, .textPlain]
 }
 
+/// `ApplyAppStoreTransactionRequest` model.
+public struct ApplyAppStoreTransactionRequest: Codable, Hashable, Sendable {
+    /// `Transaction.jwsRepresentation` — a compact JWS.
+    public var signedTransaction: String
+    /// Where StoreKit says the transaction came from; must match the signed payload. `Xcode` is
+    /// refused in production.
+    public var environment: ApplyAppStoreTransactionRequestEnvironment
+
+    public init(signedTransaction: String, environment: ApplyAppStoreTransactionRequestEnvironment) {
+        self.signedTransaction = signedTransaction
+        self.environment = environment
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case signedTransaction = "signed_transaction"
+        case environment = "environment"
+    }
+}
+
+/// Where StoreKit says the transaction came from; must match the signed payload. `Xcode` is
+/// refused in production.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ApplyAppStoreTransactionRequestEnvironment: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let production = ApplyAppStoreTransactionRequestEnvironment(rawValue: "Production")
+    public static let sandbox = ApplyAppStoreTransactionRequestEnvironment(rawValue: "Sandbox")
+    public static let xcode = ApplyAppStoreTransactionRequestEnvironment(rawValue: "Xcode")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ApplyAppStoreTransactionRequestEnvironment] = [.production, .sandbox, .xcode]
+}
+
+/// `ApplyAppStoreTransactionResponse` model.
+public struct ApplyAppStoreTransactionResponse: Codable, Hashable, Sendable {
+    public var plan: ApplyAppStoreTransactionResponsePlan
+    public var planSource: ApplyAppStoreTransactionResponsePlanSource
+    /// Paid up to: the latest verified `expiresDate`.
+    public var expiresAt: String
+    public var originalTransactionId: String
+
+    public init(plan: ApplyAppStoreTransactionResponsePlan, planSource: ApplyAppStoreTransactionResponsePlanSource, expiresAt: String, originalTransactionId: String) {
+        self.plan = plan
+        self.planSource = planSource
+        self.expiresAt = expiresAt
+        self.originalTransactionId = originalTransactionId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case plan = "plan"
+        case planSource = "plan_source"
+        case expiresAt = "expires_at"
+        case originalTransactionId = "original_transaction_id"
+    }
+}
+
+/// `ApplyAppStoreTransactionResponsePlan` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ApplyAppStoreTransactionResponsePlan: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let starter = ApplyAppStoreTransactionResponsePlan(rawValue: "starter")
+    public static let pro = ApplyAppStoreTransactionResponsePlan(rawValue: "pro")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ApplyAppStoreTransactionResponsePlan] = [.starter, .pro]
+}
+
+/// `ApplyAppStoreTransactionResponsePlanSource` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ApplyAppStoreTransactionResponsePlanSource: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let appStore = ApplyAppStoreTransactionResponsePlanSource(rawValue: "app_store")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ApplyAppStoreTransactionResponsePlanSource] = [.appStore]
+}
+
 /// `ApplyProgramRequest` model.
 public struct ApplyProgramRequest: Codable, Hashable, Sendable {
     public var sessionId: String
@@ -8819,6 +9010,78 @@ public struct AuthVerifyCodeResponse: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case apiKey = "api_key"
+    }
+}
+
+/// `BackfillSessionTitlesRequest` model.
+public struct BackfillSessionTitlesRequest: Codable, Hashable, Sendable {
+    public var dryRun: Bool?
+    public var limit: Int?
+
+    public init(dryRun: Bool? = nil, limit: Int? = nil) {
+        self.dryRun = dryRun
+        self.limit = limit
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case limit = "limit"
+    }
+}
+
+/// `BackfillSessionTitlesResponse` model.
+public struct BackfillSessionTitlesResponse: Codable, Hashable, Sendable {
+    public var dryRun: Bool
+    /// Tenants scanned.
+    public var tenants: Int
+    /// Sessions still without a title, across all tenants.
+    public var candidates: Int
+    /// Candidates this pass reached: the newest, at most `limit`.
+    public var attempted: Int
+    /// Titles written. Always 0 with `dry_run`.
+    public var titled: Int
+    /// Attempted but not titled: no platform model or key, the model failed or answered nothing
+    /// usable, or the session was renamed meanwhile.
+    public var skipped: Int
+    public var errors: [BackfillSessionTitlesResponseError]
+
+    public init(dryRun: Bool, tenants: Int, candidates: Int, attempted: Int, titled: Int, skipped: Int, errors: [BackfillSessionTitlesResponseError]) {
+        self.dryRun = dryRun
+        self.tenants = tenants
+        self.candidates = candidates
+        self.attempted = attempted
+        self.titled = titled
+        self.skipped = skipped
+        self.errors = errors
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case tenants = "tenants"
+        case candidates = "candidates"
+        case attempted = "attempted"
+        case titled = "titled"
+        case skipped = "skipped"
+        case errors = "errors"
+    }
+}
+
+/// `BackfillSessionTitlesResponseError` model.
+public struct BackfillSessionTitlesResponseError: Codable, Hashable, Sendable {
+    public var tenantId: String?
+    public var sessionId: String?
+    public var error: String?
+
+    public init(tenantId: String? = nil, sessionId: String? = nil, error: String? = nil) {
+        self.tenantId = tenantId
+        self.sessionId = sessionId
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tenantId = "tenant_id"
+        case sessionId = "session_id"
+        case error = "error"
     }
 }
 
@@ -10557,6 +10820,24 @@ public struct CheckSpawnPermissionRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// A voice for the Chief of Staff: a TTS model and one of its voices from `GET /voices`.
+public struct ChiefVoice: Codable, Hashable, Sendable {
+    /// The catalog entry's `model`, e.g. `cartesia/sonic-3`.
+    public var model: String
+    /// The catalog entry's `id` — what TTS takes as `voice`.
+    public var voice: String
+
+    public init(model: String, voice: String) {
+        self.model = model
+        self.voice = voice
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case model = "model"
+        case voice = "voice"
+    }
+}
+
 /// `ClearBillingBudgetResponse` model.
 public struct ClearBillingBudgetResponse: Codable, Hashable, Sendable {
     public var configured: Bool?
@@ -10587,6 +10868,51 @@ public struct CloseSessionResponse: Codable, Hashable, Sendable {
         case deleted = "deleted"
         case sessionId = "session_id"
     }
+}
+
+/// Lines of code, 1-based and inclusive: `line_end` must not be before `line_start` (`422`
+/// otherwise). `path` names the file when the result has more than one.
+public struct CodeAnchor: Codable, Hashable, Sendable {
+    public var kind: CodeAnchorKind
+    public var path: String?
+    public var lineStart: Int
+    public var lineEnd: Int
+
+    public init(kind: CodeAnchorKind, path: String? = nil, lineStart: Int, lineEnd: Int) {
+        self.kind = kind
+        self.path = path
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case path = "path"
+        case lineStart = "line_start"
+        case lineEnd = "line_end"
+    }
+}
+
+/// `CodeAnchorKind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct CodeAnchorKind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let code = CodeAnchorKind(rawValue: "code")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [CodeAnchorKind] = [.code]
 }
 
 /// An **initiative** (`/initiatives`; until 2026-10-12 called a company): a long-running goal
@@ -10747,42 +11073,43 @@ public struct CompanyChangeSource: RawRepresentable, Codable, Hashable, Sendable
 /// Body for `POST /api/v1/companies` (`CreateCompanySchema`).
 public struct CompanyCreate: Codable, Hashable, Sendable {
     public var name: String
-    /// What the company exists to do.
     public var mission: String
-    /// Spend ceiling and pacing for the company.
-    public var budget: CompanyCreateBudget
     public var `description`: String?
-    public var strategicGoals: [String]?
-    public var config: JSONObject?
+    public var strategicGoals: [CompanyCreateStrategicGoal]?
+    public var budget: CompanyCreateBudget
+    public var config: CompanyCreateConfig?
+    public var strategistModel: String?
     public var workspaceId: String?
 
-    public init(name: String, mission: String, budget: CompanyCreateBudget, `description`: String? = nil, strategicGoals: [String]? = nil, config: JSONObject? = nil, workspaceId: String? = nil) {
+    public init(name: String, mission: String, `description`: String? = nil, strategicGoals: [CompanyCreateStrategicGoal]? = nil, budget: CompanyCreateBudget, config: CompanyCreateConfig? = nil, strategistModel: String? = nil, workspaceId: String? = nil) {
         self.name = name
         self.mission = mission
-        self.budget = budget
         self.`description` = `description`
         self.strategicGoals = strategicGoals
+        self.budget = budget
         self.config = config
+        self.strategistModel = strategistModel
         self.workspaceId = workspaceId
     }
 
     private enum CodingKeys: String, CodingKey {
         case name = "name"
         case mission = "mission"
-        case budget = "budget"
         case `description` = "description"
         case strategicGoals = "strategic_goals"
+        case budget = "budget"
         case config = "config"
+        case strategistModel = "strategist_model"
         case workspaceId = "workspace_id"
     }
 }
 
-/// Spend ceiling and pacing for the company.
+/// `CompanyCreateBudget` model.
 public struct CompanyCreateBudget: Codable, Hashable, Sendable {
     public var totalUsd: Double
     public var dailyLimitUsd: Double
     public var alertThresholdPct: Double
-    /// Metered by the platform. Ignored on create (set to 0) and on update.
+    /// Metered by the platform. Ignored on create and update.
     public var spentUsd: Double?
 
     public init(totalUsd: Double, dailyLimitUsd: Double, alertThresholdPct: Double, spentUsd: Double? = nil) {
@@ -10797,6 +11124,94 @@ public struct CompanyCreateBudget: Codable, Hashable, Sendable {
         case dailyLimitUsd = "daily_limit_usd"
         case alertThresholdPct = "alert_threshold_pct"
         case spentUsd = "spent_usd"
+    }
+}
+
+/// `CompanyCreateConfig` model.
+public struct CompanyCreateConfig: Codable, Hashable, Sendable {
+    public var reviewIntervalMs: Double?
+    public var escalationOn: [CompanyCreateConfigEscalationOnItem]?
+
+    public init(reviewIntervalMs: Double? = nil, escalationOn: [CompanyCreateConfigEscalationOnItem]? = nil) {
+        self.reviewIntervalMs = reviewIntervalMs
+        self.escalationOn = escalationOn
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reviewIntervalMs = "review_interval_ms"
+        case escalationOn = "escalation_on"
+    }
+}
+
+/// `CompanyCreateConfigEscalationOnItem` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct CompanyCreateConfigEscalationOnItem: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let budget80pct = CompanyCreateConfigEscalationOnItem(rawValue: "budget_80pct")
+    public static let objectiveFailed = CompanyCreateConfigEscalationOnItem(rawValue: "objective_failed")
+    public static let goalCompleted = CompanyCreateConfigEscalationOnItem(rawValue: "goal_completed")
+    public static let stuck = CompanyCreateConfigEscalationOnItem(rawValue: "stuck")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [CompanyCreateConfigEscalationOnItem] = [.budget80pct, .objectiveFailed, .goalCompleted, .stuck]
+}
+
+/// `CompanyCreateStrategicGoal` model.
+public struct CompanyCreateStrategicGoal: Codable, Hashable, Sendable {
+    public var goalId: String?
+    public var title: String
+    public var `description`: String?
+    public var kpis: [CompanyCreateStrategicGoalKpisItem]?
+    public var rootObjectiveId: String?
+    public var deadline: String?
+
+    public init(goalId: String? = nil, title: String, `description`: String? = nil, kpis: [CompanyCreateStrategicGoalKpisItem]? = nil, rootObjectiveId: String? = nil, deadline: String? = nil) {
+        self.goalId = goalId
+        self.title = title
+        self.`description` = `description`
+        self.kpis = kpis
+        self.rootObjectiveId = rootObjectiveId
+        self.deadline = deadline
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case goalId = "goal_id"
+        case title = "title"
+        case `description` = "description"
+        case kpis = "kpis"
+        case rootObjectiveId = "root_objective_id"
+        case deadline = "deadline"
+    }
+}
+
+/// `CompanyCreateStrategicGoalKpisItem` model.
+public struct CompanyCreateStrategicGoalKpisItem: Codable, Hashable, Sendable {
+    public var name: String?
+    public var target: String?
+    public var current: JSONValue?
+
+    public init(name: String? = nil, target: String? = nil, current: JSONValue? = nil) {
+        self.name = name
+        self.target = target
+        self.current = current
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name = "name"
+        case target = "target"
+        case current = "current"
     }
 }
 
@@ -11882,27 +12297,141 @@ public struct CompanyTestRun: Codable, Hashable, Sendable {
 public struct CompanyUpdate: Codable, Hashable, Sendable {
     public var name: String?
     public var mission: String?
-    public var budget: Double?
     public var `description`: String?
-    public var strategicGoals: [String]?
-    public var config: JSONObject?
+    public var status: CompanyUpdateStatus?
+    public var strategicGoals: [CompanyUpdateStrategicGoal]?
+    public var budget: CompanyUpdateBudget?
+    public var config: CompanyUpdateConfig?
 
-    public init(name: String? = nil, mission: String? = nil, budget: Double? = nil, `description`: String? = nil, strategicGoals: [String]? = nil, config: JSONObject? = nil) {
+    public init(name: String? = nil, mission: String? = nil, `description`: String? = nil, status: CompanyUpdateStatus? = nil, strategicGoals: [CompanyUpdateStrategicGoal]? = nil, budget: CompanyUpdateBudget? = nil, config: CompanyUpdateConfig? = nil) {
         self.name = name
         self.mission = mission
-        self.budget = budget
         self.`description` = `description`
+        self.status = status
         self.strategicGoals = strategicGoals
+        self.budget = budget
         self.config = config
     }
 
     private enum CodingKeys: String, CodingKey {
         case name = "name"
         case mission = "mission"
-        case budget = "budget"
         case `description` = "description"
+        case status = "status"
         case strategicGoals = "strategic_goals"
+        case budget = "budget"
         case config = "config"
+    }
+}
+
+/// `CompanyUpdateBudget` model.
+public struct CompanyUpdateBudget: Codable, Hashable, Sendable {
+    public var totalUsd: Double
+    public var dailyLimitUsd: Double
+    public var alertThresholdPct: Double
+    /// Metered by the platform. Ignored on create and update.
+    public var spentUsd: Double?
+
+    public init(totalUsd: Double, dailyLimitUsd: Double, alertThresholdPct: Double, spentUsd: Double? = nil) {
+        self.totalUsd = totalUsd
+        self.dailyLimitUsd = dailyLimitUsd
+        self.alertThresholdPct = alertThresholdPct
+        self.spentUsd = spentUsd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case totalUsd = "total_usd"
+        case dailyLimitUsd = "daily_limit_usd"
+        case alertThresholdPct = "alert_threshold_pct"
+        case spentUsd = "spent_usd"
+    }
+}
+
+/// `CompanyUpdateConfig` model.
+public struct CompanyUpdateConfig: Codable, Hashable, Sendable {
+    public var reviewIntervalMs: Double?
+    public var escalationOn: [CompanyCreateConfigEscalationOnItem]?
+
+    public init(reviewIntervalMs: Double? = nil, escalationOn: [CompanyCreateConfigEscalationOnItem]? = nil) {
+        self.reviewIntervalMs = reviewIntervalMs
+        self.escalationOn = escalationOn
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reviewIntervalMs = "review_interval_ms"
+        case escalationOn = "escalation_on"
+    }
+}
+
+/// `CompanyUpdateStatus` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct CompanyUpdateStatus: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let active = CompanyUpdateStatus(rawValue: "active")
+    public static let paused = CompanyUpdateStatus(rawValue: "paused")
+    public static let completed = CompanyUpdateStatus(rawValue: "completed")
+    public static let archived = CompanyUpdateStatus(rawValue: "archived")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [CompanyUpdateStatus] = [.active, .paused, .completed, .archived]
+}
+
+/// `CompanyUpdateStrategicGoal` model.
+public struct CompanyUpdateStrategicGoal: Codable, Hashable, Sendable {
+    public var goalId: String?
+    public var title: String
+    public var `description`: String?
+    public var kpis: [CompanyUpdateStrategicGoalKpisItem]?
+    public var rootObjectiveId: String?
+    public var deadline: String?
+
+    public init(goalId: String? = nil, title: String, `description`: String? = nil, kpis: [CompanyUpdateStrategicGoalKpisItem]? = nil, rootObjectiveId: String? = nil, deadline: String? = nil) {
+        self.goalId = goalId
+        self.title = title
+        self.`description` = `description`
+        self.kpis = kpis
+        self.rootObjectiveId = rootObjectiveId
+        self.deadline = deadline
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case goalId = "goal_id"
+        case title = "title"
+        case `description` = "description"
+        case kpis = "kpis"
+        case rootObjectiveId = "root_objective_id"
+        case deadline = "deadline"
+    }
+}
+
+/// `CompanyUpdateStrategicGoalKpisItem` model.
+public struct CompanyUpdateStrategicGoalKpisItem: Codable, Hashable, Sendable {
+    public var name: String?
+    public var target: String?
+    public var current: JSONValue?
+
+    public init(name: String? = nil, target: String? = nil, current: JSONValue? = nil) {
+        self.name = name
+        self.target = target
+        self.current = current
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name = "name"
+        case target = "target"
+        case current = "current"
     }
 }
 
@@ -12735,6 +13264,11 @@ public struct ConversationEntry: Codable, Hashable, Sendable {
     public var thinking: String?
     public var importance: ConversationEntryImportance?
     public var attachments: [ConversationEntryAttachment]?
+    /// Present only on an entry that is not an ordinary turn. Today: the morning summary — an
+    /// assistant entry the head agent posts at 08:00 tenant-local time (since 2026-10-19) with
+    /// `kind: "daily_summary"` and the local `date` it summarises from; no run produced it, so its
+    /// `run_id` is `morning-summary-<date>`.
+    public var metadata: ConversationEntryMetadata?
     /// On an assistant entry: the run's metrics as served by GET /runs/{runId} (sessions.ts
     /// publicRunMetrics).
     public var runMetrics: ConversationEntryRunMetrics?
@@ -12758,7 +13292,7 @@ public struct ConversationEntry: Codable, Hashable, Sendable {
     /// e.g. `limit_tokens` and `used_tokens`.
     public var errorDetails: JSONObject?
 
-    public init(messageId: String, role: PublicSessionViewMessageRole, content: JSONValue, runId: String, timestamp: String, compacted: Bool? = nil, toolCalls: [ConversationEntryToolCall]? = nil, thinking: String? = nil, importance: ConversationEntryImportance? = nil, attachments: [ConversationEntryAttachment]? = nil, runMetrics: ConversationEntryRunMetrics? = nil, costUsd: Double? = nil, fromTodo: Bool? = nil, outputTruncated: Bool? = nil, authorAgentId: String? = nil, authorName: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil) {
+    public init(messageId: String, role: PublicSessionViewMessageRole, content: JSONValue, runId: String, timestamp: String, compacted: Bool? = nil, toolCalls: [ConversationEntryToolCall]? = nil, thinking: String? = nil, importance: ConversationEntryImportance? = nil, attachments: [ConversationEntryAttachment]? = nil, metadata: ConversationEntryMetadata? = nil, runMetrics: ConversationEntryRunMetrics? = nil, costUsd: Double? = nil, fromTodo: Bool? = nil, outputTruncated: Bool? = nil, authorAgentId: String? = nil, authorName: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil) {
         self.messageId = messageId
         self.role = role
         self.content = content
@@ -12769,6 +13303,7 @@ public struct ConversationEntry: Codable, Hashable, Sendable {
         self.thinking = thinking
         self.importance = importance
         self.attachments = attachments
+        self.metadata = metadata
         self.runMetrics = runMetrics
         self.costUsd = costUsd
         self.fromTodo = fromTodo
@@ -12790,6 +13325,7 @@ public struct ConversationEntry: Codable, Hashable, Sendable {
         case thinking = "thinking"
         case importance = "importance"
         case attachments = "attachments"
+        case metadata = "metadata"
         case runMetrics = "run_metrics"
         case costUsd = "cost_usd"
         case fromTodo = "from_todo"
@@ -12884,6 +13420,47 @@ public struct ConversationEntryImportance: RawRepresentable, Codable, Hashable, 
     public static let knownValues: [ConversationEntryImportance] = [.high, .normal]
 }
 
+/// Present only on an entry that is not an ordinary turn. Today: the morning summary — an
+/// assistant entry the head agent posts at 08:00 tenant-local time (since 2026-10-19) with
+/// `kind: "daily_summary"` and the local `date` it summarises from; no run produced it, so its
+/// `run_id` is `morning-summary-<date>`.
+public struct ConversationEntryMetadata: Codable, Hashable, Sendable {
+    public var kind: ConversationEntryMetadataKind
+    public var date: String
+
+    public init(kind: ConversationEntryMetadataKind, date: String) {
+        self.kind = kind
+        self.date = date
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case date = "date"
+    }
+}
+
+/// `ConversationEntryMetadataKind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ConversationEntryMetadataKind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let dailySummary = ConversationEntryMetadataKind(rawValue: "daily_summary")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ConversationEntryMetadataKind] = [.dailySummary]
+}
+
 /// On an assistant entry: the run's metrics as served by GET /runs/{runId} (sessions.ts
 /// publicRunMetrics).
 public struct ConversationEntryRunMetrics: Codable, Hashable, Sendable {
@@ -12911,10 +13488,18 @@ public struct ConversationEntryRunMetrics: Codable, Hashable, Sendable {
     public var guardrailViolations: Int?
     public var memoryRetrievals: Int?
     public var memoryExtractions: Int?
-    /// Estimated total cost in USD
+    /// Estimated total cost in USD — the tenant's bill, except when `cost_attribution` says
+    /// otherwise.
     public var totalCostUsd: Double?
+    /// Present only on a sponsored qualification run (since 2026-10-19). `total_cost_usd` is then
+    /// execution telemetry at the platform's catalog rate: never billed to the company the run
+    /// executed in, and never counted in its usage, quotas, daily share, run count, spend budget or
+    /// overage. The sponsor's debit is the grant's `charged_microusd`, accounted at the program's
+    /// frozen pricing revision, and the two differ (production run 01a151cf…: telemetry $0.010312,
+    /// sponsor debit 5414 micro-USD). Absent on every other run.
+    public var costAttribution: RunMetricsCostAttribution?
 
-    public init(contextWindowTokens: Int? = nil, lastInputTokens: Int? = nil, pricingConfidence: String? = nil, durationMs: Double? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil) {
+    public init(contextWindowTokens: Int? = nil, lastInputTokens: Int? = nil, pricingConfidence: String? = nil, durationMs: Double? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil, costAttribution: RunMetricsCostAttribution? = nil) {
         self.contextWindowTokens = contextWindowTokens
         self.lastInputTokens = lastInputTokens
         self.pricingConfidence = pricingConfidence
@@ -12931,6 +13516,7 @@ public struct ConversationEntryRunMetrics: Codable, Hashable, Sendable {
         self.memoryRetrievals = memoryRetrievals
         self.memoryExtractions = memoryExtractions
         self.totalCostUsd = totalCostUsd
+        self.costAttribution = costAttribution
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -12950,6 +13536,7 @@ public struct ConversationEntryRunMetrics: Codable, Hashable, Sendable {
         case memoryRetrievals = "memory_retrievals"
         case memoryExtractions = "memory_extractions"
         case totalCostUsd = "total_cost_usd"
+        case costAttribution = "cost_attribution"
     }
 }
 
@@ -14846,15 +15433,21 @@ public struct CreateRunRequestResourceLimits: Codable, Hashable, Sendable {
 public struct CreateSessionAnnotationRequest: Codable, Hashable, Sendable {
     public var messageId: String
     public var content: String
+    public var anchor: Anchor?
+    public var target: AnchorTarget?
 
-    public init(messageId: String, content: String) {
+    public init(messageId: String, content: String, anchor: Anchor? = nil, target: AnchorTarget? = nil) {
         self.messageId = messageId
         self.content = content
+        self.anchor = anchor
+        self.target = target
     }
 
     private enum CodingKeys: String, CodingKey {
         case messageId = "message_id"
         case content = "content"
+        case anchor = "anchor"
+        case target = "target"
     }
 }
 
@@ -14866,14 +15459,18 @@ public struct CreateSessionAnnotationResponse: Codable, Hashable, Sendable {
     public var author: String?
     public var createdAt: String?
     public var resolved: Bool?
+    public var anchor: Anchor?
+    public var target: AnchorTarget?
 
-    public init(id: String? = nil, messageId: String? = nil, content: String? = nil, author: String? = nil, createdAt: String? = nil, resolved: Bool? = nil) {
+    public init(id: String? = nil, messageId: String? = nil, content: String? = nil, author: String? = nil, createdAt: String? = nil, resolved: Bool? = nil, anchor: Anchor? = nil, target: AnchorTarget? = nil) {
         self.id = id
         self.messageId = messageId
         self.content = content
         self.author = author
         self.createdAt = createdAt
         self.resolved = resolved
+        self.anchor = anchor
+        self.target = target
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -14883,6 +15480,8 @@ public struct CreateSessionAnnotationResponse: Codable, Hashable, Sendable {
         case author = "author"
         case createdAt = "created_at"
         case resolved = "resolved"
+        case anchor = "anchor"
+        case target = "target"
     }
 }
 
@@ -16209,6 +16808,10 @@ public struct DeleteMeResponse: Codable, Hashable, Sendable {
     public var deleted: Bool
     public var tenants: [DeleteMeResponseTenant]
     public var sessionsRevoked: Int
+    /// Additional account data removed across all memberships. Legacy devices without ownership
+    /// evidence retain their original tokens and expiry, but delivery is disabled until an active
+    /// member re-registers them.
+    public var accountCleanup: DeleteMeResponseAccountCleanup?
     /// Sign in with Apple refresh tokens revoked at Apple (App Store 5.1.1(v)). Tokens exist only
     /// for sign-ins that sent `authorization_code`.
     public var appleTokensRevoked: Int?
@@ -16221,10 +16824,11 @@ public struct DeleteMeResponse: Codable, Hashable, Sendable {
     /// `/data-subject/erasure`.
     public var notErased: [String]
 
-    public init(deleted: Bool, tenants: [DeleteMeResponseTenant], sessionsRevoked: Int, appleTokensRevoked: Int? = nil, erased: DeleteMeResponseErased, notErased: [String]) {
+    public init(deleted: Bool, tenants: [DeleteMeResponseTenant], sessionsRevoked: Int, accountCleanup: DeleteMeResponseAccountCleanup? = nil, appleTokensRevoked: Int? = nil, erased: DeleteMeResponseErased, notErased: [String]) {
         self.deleted = deleted
         self.tenants = tenants
         self.sessionsRevoked = sessionsRevoked
+        self.accountCleanup = accountCleanup
         self.appleTokensRevoked = appleTokensRevoked
         self.erased = erased
         self.notErased = notErased
@@ -16234,9 +16838,37 @@ public struct DeleteMeResponse: Codable, Hashable, Sendable {
         case deleted = "deleted"
         case tenants = "tenants"
         case sessionsRevoked = "sessions_revoked"
+        case accountCleanup = "account_cleanup"
         case appleTokensRevoked = "apple_tokens_revoked"
         case erased = "erased"
         case notErased = "not_erased"
+    }
+}
+
+/// Additional account data removed across all memberships. Legacy devices without ownership
+/// evidence retain their original tokens and expiry, but delivery is disabled until an active
+/// member re-registers them.
+public struct DeleteMeResponseAccountCleanup: Codable, Hashable, Sendable {
+    public var notifications: Int?
+    public var deviceTargets: Int?
+    public var legacyDeviceTargetsDisabled: Int?
+    public var providerKeys: Int?
+    public var apiKeys: Int?
+
+    public init(notifications: Int? = nil, deviceTargets: Int? = nil, legacyDeviceTargetsDisabled: Int? = nil, providerKeys: Int? = nil, apiKeys: Int? = nil) {
+        self.notifications = notifications
+        self.deviceTargets = deviceTargets
+        self.legacyDeviceTargetsDisabled = legacyDeviceTargetsDisabled
+        self.providerKeys = providerKeys
+        self.apiKeys = apiKeys
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case notifications = "notifications"
+        case deviceTargets = "device_targets"
+        case legacyDeviceTargetsDisabled = "legacy_device_targets_disabled"
+        case providerKeys = "provider_keys"
+        case apiKeys = "api_keys"
     }
 }
 
@@ -16625,8 +17257,12 @@ public struct DeploymentFeatures: Codable, Hashable, Sendable {
     public var specSigning: Bool
     /// Published marketplace listings can be invoked. Always false today: no executor runs them.
     public var marketplaceInvoke: Bool
+    /// App Store in-app purchases are accepted: the app's bundle id is configured
+    /// (`apple_bundle_id` / `APPLE_BUNDLE_ID`), which every signed transaction and notification is
+    /// checked against.
+    public var appStore: Bool
 
-    public init(governance: Bool, billing: Bool, mfa: Bool, webSearch: Bool, speechToText: Bool, textToSpeech: Bool, embeddings: Bool, specSigning: Bool, marketplaceInvoke: Bool) {
+    public init(governance: Bool, billing: Bool, mfa: Bool, webSearch: Bool, speechToText: Bool, textToSpeech: Bool, embeddings: Bool, specSigning: Bool, marketplaceInvoke: Bool, appStore: Bool) {
         self.governance = governance
         self.billing = billing
         self.mfa = mfa
@@ -16636,6 +17272,7 @@ public struct DeploymentFeatures: Codable, Hashable, Sendable {
         self.embeddings = embeddings
         self.specSigning = specSigning
         self.marketplaceInvoke = marketplaceInvoke
+        self.appStore = appStore
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -16648,6 +17285,7 @@ public struct DeploymentFeatures: Codable, Hashable, Sendable {
         case embeddings = "embeddings"
         case specSigning = "spec_signing"
         case marketplaceInvoke = "marketplace_invoke"
+        case appStore = "app_store"
     }
 }
 
@@ -18242,6 +18880,7 @@ public struct ErrorCode: RawRepresentable, Codable, Hashable, Sendable, Expressi
     public static let notYanked = ErrorCode(rawValue: "NOT_YANKED")
     public static let noRunnableTarget = ErrorCode(rawValue: "NO_RUNNABLE_TARGET")
     public static let oauthFailed = ErrorCode(rawValue: "OAUTH_FAILED")
+    public static let outputContractViolation = ErrorCode(rawValue: "OUTPUT_CONTRACT_VIOLATION")
     public static let outputTooLarge = ErrorCode(rawValue: "OUTPUT_TOO_LARGE")
     public static let payloadTooLarge = ErrorCode(rawValue: "PAYLOAD_TOO_LARGE")
     public static let persistenceError = ErrorCode(rawValue: "PERSISTENCE_ERROR")
@@ -18271,6 +18910,7 @@ public struct ErrorCode: RawRepresentable, Codable, Hashable, Sendable, Expressi
     public static let searchUpstreamFailed = ErrorCode(rawValue: "SEARCH_UPSTREAM_FAILED")
     public static let searchUpstreamTimeout = ErrorCode(rawValue: "SEARCH_UPSTREAM_TIMEOUT")
     public static let securityScanFailed = ErrorCode(rawValue: "SECURITY_SCAN_FAILED")
+    public static let serviceUnavailable = ErrorCode(rawValue: "SERVICE_UNAVAILABLE")
     public static let sessionNotActive = ErrorCode(rawValue: "SESSION_NOT_ACTIVE")
     public static let shareListConflict = ErrorCode(rawValue: "SHARE_LIST_CONFLICT")
     public static let signingNotConfigured = ErrorCode(rawValue: "SIGNING_NOT_CONFIGURED")
@@ -18293,11 +18933,16 @@ public struct ErrorCode: RawRepresentable, Codable, Hashable, Sendable, Expressi
     public static let sponsorshipScopeRequired = ErrorCode(rawValue: "SPONSORSHIP_SCOPE_REQUIRED")
     public static let startedByAnotherUser = ErrorCode(rawValue: "STARTED_BY_ANOTHER_USER")
     public static let strategistModelUnconfigured = ErrorCode(rawValue: "STRATEGIST_MODEL_UNCONFIGURED")
+    public static let superAdminRequired = ErrorCode(rawValue: "SUPER_ADMIN_REQUIRED")
     public static let taskGraphFailed = ErrorCode(rawValue: "TASK_GRAPH_FAILED")
     public static let teamAbort = ErrorCode(rawValue: "TEAM_ABORT")
     public static let termsNotAccepted = ErrorCode(rawValue: "TERMS_NOT_ACCEPTED")
     public static let textExtractionFailed = ErrorCode(rawValue: "TEXT_EXTRACTION_FAILED")
     public static let unauthenticated = ErrorCode(rawValue: "UNAUTHENTICATED")
+    public static let usageCorrectionExceedsCounters = ErrorCode(rawValue: "USAGE_CORRECTION_EXCEEDS_COUNTERS")
+    public static let usageCorrectionInProgress = ErrorCode(rawValue: "USAGE_CORRECTION_IN_PROGRESS")
+    public static let usageCorrectionNotSettled = ErrorCode(rawValue: "USAGE_CORRECTION_NOT_SETTLED")
+    public static let usageCorrectionNotSponsored = ErrorCode(rawValue: "USAGE_CORRECTION_NOT_SPONSORED")
     public static let userRequired = ErrorCode(rawValue: "USER_REQUIRED")
     public static let validationError = ErrorCode(rawValue: "VALIDATION_ERROR")
     public static let verificationFailed = ErrorCode(rawValue: "VERIFICATION_FAILED")
@@ -18341,6 +18986,7 @@ public struct ErrorCode: RawRepresentable, Codable, Hashable, Sendable, Expressi
     public static let quotaExceeded_ = ErrorCode(rawValue: "quota_exceeded")
     public static let rateLimited_ = ErrorCode(rawValue: "rate_limited")
     public static let resourceLimitReached = ErrorCode(rawValue: "resource_limit_reached")
+    public static let runAgentStopped = ErrorCode(rawValue: "run_agent_stopped")
     public static let runApprovalExpired = ErrorCode(rawValue: "run_approval_expired")
     public static let runInputTimeout = ErrorCode(rawValue: "run_input_timeout")
     public static let runNeverClaimed = ErrorCode(rawValue: "run_never_claimed")
@@ -18356,7 +19002,7 @@ public struct ErrorCode: RawRepresentable, Codable, Hashable, Sendable, Expressi
     public static let videoSlotInvalid = ErrorCode(rawValue: "video_slot_invalid")
 
     /// Every value the spec declared at generation time.
-    public static let knownValues: [ErrorCode] = [.aarNotAvailable, .activeTenantNotSupported, .alreadyExists, .anonBusy, .artifactIntegrityError, .assessmentIsolationRequired, .authError, .billingCancelled, .billingDisputed, .billingPastDue, .budgetExceeded, .checksumMismatch, .clientRequestConflict, .companyNotReady, .companyPaused, .concurrencyLimit, .concurrentModification, .configurationError, .confirmationRequired, .conflict, .contextLengthExceeded, .countLimitReached, .dailyLimit, .dependencyExists, .eventStoreError, .executionProfileUnverifiable, .executionReceiptPending, .externalServiceError, .featuredSetContended, .featureDisabled, .fileNotFound, .fileTypeNotAllowed, .forbidden, .guardrailViolation, .idempotencyConflict, .idempotencyKeyReused, .initiativeBudgetExhausted, .initiativePaused, .internalError, .invalidArchive, .invalidBody, .invalidCursor, .invalidManifest, .invalidQuery, .invalidRequest, .invalidShareList, .invalidShareTarget, .invalidStateTransition, .isolationViolation, .llmError, .managedAgent, .maxDurationExceeded, .maxTokensExceeded, .methodNotAllowed, .migrationConflict, .missingField, .missingScope, .missionAlreadyRunning, .missionConcurrencyLimit, .missionNotFound, .missionNotRunnable, .missionNotRunning, .missionRouteNotFound, .notBridgeAgent, .notFound, .notYanked, .noRunnableTarget, .oauthFailed, .outputTooLarge, .payloadTooLarge, .persistenceError, .plannerOutputInvalid, .plannerRefused, .preconditionFailed, .prerequisiteMissing, .pricingUnavailable, .privateNotShared, .processingPolicyChanged, .processingPolicyNotReady, .promoRedemptionFailed, .proposalExpired, .qualificationBudgetStop, .qualificationRouteMismatch, .qualificationVersionUnavailable, .quotaExceeded, .rateLimited, .rateLimitExceeded, .referenceNotFound, .reservedScope, .runActive, .runCancelled, .scopeMismatch, .scopeTaken, .searchProviderNotConfigured, .searchUpstreamFailed, .searchUpstreamTimeout, .securityScanFailed, .sessionNotActive, .shareListConflict, .signingNotConfigured, .sizeLimit, .specNotFound, .sponsorshipBudgetBelowCommitted, .sponsorshipBudgetExhausted, .sponsorshipCandidateLimit, .sponsorshipConcurrencyLimit, .sponsorshipFundingUnavailable, .sponsorshipGrantConflict, .sponsorshipGrantInUse, .sponsorshipGrantMismatch, .sponsorshipGrantUnavailable, .sponsorshipOutcomeUnknown, .sponsorshipProgramImmutable, .sponsorshipProgramInactive, .sponsorshipProgramRevisionConflict, .sponsorshipRequired, .sponsorshipScopeRequired, .startedByAnotherUser, .strategistModelUnconfigured, .taskGraphFailed, .teamAbort, .termsNotAccepted, .textExtractionFailed, .unauthenticated, .userRequired, .validationError, .verificationFailed, .versionConflict, .versionNotFound, .workspaceStorageLimit, .wouldOrphan, .yankConflict, .agentDeleted, .agentNotFound, .alreadyBootstrapped, .approvalRejected, .billingNotConfigured, .consentRequired, .cvInvalid, .cvTooLarge, .duplicateApplication, .governanceNotEnabled, .hireCatalogUnknown, .incompleteRecord, .inertPolicyField, .inertPublicConfigField, .jobApplyElsewhere, .jobClosed, .kbChunkLimit, .kbDocumentBodyInvalid, .kbDocumentTooLarge, .kbEmbeddingFailed, .kbStorageLimit, .kbTextExtractionFailed, .limitReached, .mfaRequired, .noEligibleArbiter, .notHired, .planUpgradeRequired, .proposalRequired, .providerAuthFailed, .providerCircuitOpen, .providerNotConfigured, .providerRateLimited, .quotaExceeded_, .rateLimited_, .resourceLimitReached, .runApprovalExpired, .runInputTimeout, .runNeverClaimed, .runOrphanedRestart, .runQuotaExceeded, .runStalled, .secretWouldMove, .videoConsentRequired, .videoOrderState, .videoPhotoInvalid, .videoPhotoRejected, .videoRegenUnavailable, .videoSlotInvalid]
+    public static let knownValues: [ErrorCode] = [.aarNotAvailable, .activeTenantNotSupported, .alreadyExists, .anonBusy, .artifactIntegrityError, .assessmentIsolationRequired, .authError, .billingCancelled, .billingDisputed, .billingPastDue, .budgetExceeded, .checksumMismatch, .clientRequestConflict, .companyNotReady, .companyPaused, .concurrencyLimit, .concurrentModification, .configurationError, .confirmationRequired, .conflict, .contextLengthExceeded, .countLimitReached, .dailyLimit, .dependencyExists, .eventStoreError, .executionProfileUnverifiable, .executionReceiptPending, .externalServiceError, .featuredSetContended, .featureDisabled, .fileNotFound, .fileTypeNotAllowed, .forbidden, .guardrailViolation, .idempotencyConflict, .idempotencyKeyReused, .initiativeBudgetExhausted, .initiativePaused, .internalError, .invalidArchive, .invalidBody, .invalidCursor, .invalidManifest, .invalidQuery, .invalidRequest, .invalidShareList, .invalidShareTarget, .invalidStateTransition, .isolationViolation, .llmError, .managedAgent, .maxDurationExceeded, .maxTokensExceeded, .methodNotAllowed, .migrationConflict, .missingField, .missingScope, .missionAlreadyRunning, .missionConcurrencyLimit, .missionNotFound, .missionNotRunnable, .missionNotRunning, .missionRouteNotFound, .notBridgeAgent, .notFound, .notYanked, .noRunnableTarget, .oauthFailed, .outputContractViolation, .outputTooLarge, .payloadTooLarge, .persistenceError, .plannerOutputInvalid, .plannerRefused, .preconditionFailed, .prerequisiteMissing, .pricingUnavailable, .privateNotShared, .processingPolicyChanged, .processingPolicyNotReady, .promoRedemptionFailed, .proposalExpired, .qualificationBudgetStop, .qualificationRouteMismatch, .qualificationVersionUnavailable, .quotaExceeded, .rateLimited, .rateLimitExceeded, .referenceNotFound, .reservedScope, .runActive, .runCancelled, .scopeMismatch, .scopeTaken, .searchProviderNotConfigured, .searchUpstreamFailed, .searchUpstreamTimeout, .securityScanFailed, .serviceUnavailable, .sessionNotActive, .shareListConflict, .signingNotConfigured, .sizeLimit, .specNotFound, .sponsorshipBudgetBelowCommitted, .sponsorshipBudgetExhausted, .sponsorshipCandidateLimit, .sponsorshipConcurrencyLimit, .sponsorshipFundingUnavailable, .sponsorshipGrantConflict, .sponsorshipGrantInUse, .sponsorshipGrantMismatch, .sponsorshipGrantUnavailable, .sponsorshipOutcomeUnknown, .sponsorshipProgramImmutable, .sponsorshipProgramInactive, .sponsorshipProgramRevisionConflict, .sponsorshipRequired, .sponsorshipScopeRequired, .startedByAnotherUser, .strategistModelUnconfigured, .superAdminRequired, .taskGraphFailed, .teamAbort, .termsNotAccepted, .textExtractionFailed, .unauthenticated, .usageCorrectionExceedsCounters, .usageCorrectionInProgress, .usageCorrectionNotSettled, .usageCorrectionNotSponsored, .userRequired, .validationError, .verificationFailed, .versionConflict, .versionNotFound, .workspaceStorageLimit, .wouldOrphan, .yankConflict, .agentDeleted, .agentNotFound, .alreadyBootstrapped, .approvalRejected, .billingNotConfigured, .consentRequired, .cvInvalid, .cvTooLarge, .duplicateApplication, .governanceNotEnabled, .hireCatalogUnknown, .incompleteRecord, .inertPolicyField, .inertPublicConfigField, .jobApplyElsewhere, .jobClosed, .kbChunkLimit, .kbDocumentBodyInvalid, .kbDocumentTooLarge, .kbEmbeddingFailed, .kbStorageLimit, .kbTextExtractionFailed, .limitReached, .mfaRequired, .noEligibleArbiter, .notHired, .planUpgradeRequired, .proposalRequired, .providerAuthFailed, .providerCircuitOpen, .providerNotConfigured, .providerRateLimited, .quotaExceeded_, .rateLimited_, .resourceLimitReached, .runAgentStopped, .runApprovalExpired, .runInputTimeout, .runNeverClaimed, .runOrphanedRestart, .runQuotaExceeded, .runStalled, .secretWouldMove, .videoConsentRequired, .videoOrderState, .videoPhotoInvalid, .videoPhotoRejected, .videoRegenUnavailable, .videoSlotInvalid]
 }
 
 /// `ErrorError` model.
@@ -19200,8 +19846,14 @@ public struct FileEntry: Codable, Hashable, Sendable {
     public var sha256: String
     public var sizeBytes: Int
     public var tenantId: String
+    /// The agent whose run wrote this file (since 2026-10-19). Absent for a person's or an API
+    /// caller's upload and for every older record, which is not attributed after the fact.
+    public var agentId: String?
+    /// The run that wrote it; present only with `agent_id`, and only when the write happened inside
+    /// a run.
+    public var runId: String?
 
-    public init(createdAt: String, fileId: String, filename: String, mimeType: String, sha256: String, sizeBytes: Int, tenantId: String) {
+    public init(createdAt: String, fileId: String, filename: String, mimeType: String, sha256: String, sizeBytes: Int, tenantId: String, agentId: String? = nil, runId: String? = nil) {
         self.createdAt = createdAt
         self.fileId = fileId
         self.filename = filename
@@ -19209,6 +19861,8 @@ public struct FileEntry: Codable, Hashable, Sendable {
         self.sha256 = sha256
         self.sizeBytes = sizeBytes
         self.tenantId = tenantId
+        self.agentId = agentId
+        self.runId = runId
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -19219,6 +19873,8 @@ public struct FileEntry: Codable, Hashable, Sendable {
         case sha256 = "sha256"
         case sizeBytes = "size_bytes"
         case tenantId = "tenant_id"
+        case agentId = "agent_id"
+        case runId = "run_id"
     }
 }
 
@@ -19232,8 +19888,14 @@ public struct FileRecord: Codable, Hashable, Sendable {
     public var sizeBytes: Int
     public var sha256: String
     public var createdAt: String
+    /// The agent whose run wrote this file (since 2026-10-19). Absent for a person's or an API
+    /// caller's upload and for every older record, which is not attributed after the fact.
+    public var agentId: String?
+    /// The run that wrote it; present only with `agent_id`, and only when the write happened inside
+    /// a run.
+    public var runId: String?
 
-    public init(fileId: String, tenantId: String, filename: String, mimeType: String, sizeBytes: Int, sha256: String, createdAt: String) {
+    public init(fileId: String, tenantId: String, filename: String, mimeType: String, sizeBytes: Int, sha256: String, createdAt: String, agentId: String? = nil, runId: String? = nil) {
         self.fileId = fileId
         self.tenantId = tenantId
         self.filename = filename
@@ -19241,6 +19903,8 @@ public struct FileRecord: Codable, Hashable, Sendable {
         self.sizeBytes = sizeBytes
         self.sha256 = sha256
         self.createdAt = createdAt
+        self.agentId = agentId
+        self.runId = runId
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -19251,6 +19915,8 @@ public struct FileRecord: Codable, Hashable, Sendable {
         case sizeBytes = "size_bytes"
         case sha256 = "sha256"
         case createdAt = "created_at"
+        case agentId = "agent_id"
+        case runId = "run_id"
     }
 }
 
@@ -19913,6 +20579,7 @@ public struct GenerateAdminBlogPostResponse: Codable, Hashable, Sendable {
 /// `GetActivityFeedResponse` model.
 public struct GetActivityFeedResponse: Codable, Hashable, Sendable {
     public var entries: [FeedEntry]?
+    /// Cursor for the next page; null on the last page — which is what the handler sends.
     public var cursor: String?
     public var total: Int?
 
@@ -20504,6 +21171,84 @@ public struct GetAgentObligationsResponse: Codable, Hashable, Sendable {
         case rules = "rules"
         case count = "count"
     }
+}
+
+/// `GetAgentsOverviewResponse` model.
+public struct GetAgentsOverviewResponse: Codable, Hashable, Sendable {
+    public var items: [GetAgentsOverviewResponseItem]
+
+    public init(items: [GetAgentsOverviewResponseItem]) {
+        self.items = items
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case items = "items"
+    }
+}
+
+/// `GetAgentsOverviewResponseItem` model.
+public struct GetAgentsOverviewResponseItem: Codable, Hashable, Sendable {
+    public var agentId: String
+    public var name: String
+    /// A hired agent's catalog icon, else `metadata.avatar_url` when it is a string, else null —
+    /// draw the agent from `metadata.ui.avatar` then.
+    public var avatarURL: String?
+    public var ring: GetAgentsOverviewResponseItemRing
+    /// The last run failed; `ring` is then `needs_you`.
+    public var failed: Bool
+    public var pendingCount: Int
+    /// The last run's `completed_at`, else `started_at`, else `created_at`; null when no run is in
+    /// the window.
+    public var lastActivityAt: String?
+    /// When the newest completed run in the window completed.
+    public var lastCompletedAt: String?
+
+    public init(agentId: String, name: String, avatarURL: String? = nil, ring: GetAgentsOverviewResponseItemRing, failed: Bool, pendingCount: Int, lastActivityAt: String? = nil, lastCompletedAt: String? = nil) {
+        self.agentId = agentId
+        self.name = name
+        self.avatarURL = avatarURL
+        self.ring = ring
+        self.failed = failed
+        self.pendingCount = pendingCount
+        self.lastActivityAt = lastActivityAt
+        self.lastCompletedAt = lastCompletedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
+        case name = "name"
+        case avatarURL = "avatar_url"
+        case ring = "ring"
+        case failed = "failed"
+        case pendingCount = "pending_count"
+        case lastActivityAt = "last_activity_at"
+        case lastCompletedAt = "last_completed_at"
+    }
+}
+
+/// `GetAgentsOverviewResponseItemRing` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct GetAgentsOverviewResponseItemRing: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let needsYou = GetAgentsOverviewResponseItemRing(rawValue: "needs_you")
+    public static let working = GetAgentsOverviewResponseItemRing(rawValue: "working")
+    public static let done = GetAgentsOverviewResponseItemRing(rawValue: "done")
+    public static let idle = GetAgentsOverviewResponseItemRing(rawValue: "idle")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [GetAgentsOverviewResponseItemRing] = [.needsYou, .working, .done, .idle]
 }
 
 /// `GetAgentSystemCardFormat` values.
@@ -21139,7 +21884,8 @@ public struct GetDataExplorerValueResponse: Codable, Hashable, Sendable {
 /// `GetGovernanceLedgerResponse` model.
 public struct GetGovernanceLedgerResponse: Codable, Hashable, Sendable {
     public var entries: [GovernanceLedgerEntry]
-    public var head: GovernanceLedgerHead
+    /// Newest entry of the global ledger; null when the ledger is empty.
+    public var head: GovernanceLedgerHead?
     /// Number of entries IN THIS RESPONSE, not the size of the ledger. Measured 2026-08-20: `total`
     /// was 16 while `GET /governance/ledger/verify` reported `entries_checked: 6698` against the
     /// same ledger a second later. Rendering this as "events recorded" understates the ledger by
@@ -21150,7 +21896,7 @@ public struct GetGovernanceLedgerResponse: Codable, Hashable, Sendable {
     /// `/governance/ledger/verify` (that walks every tenant) and not `head.seq` (global sequence).
     public var tenantTotal: Int
 
-    public init(entries: [GovernanceLedgerEntry], head: GovernanceLedgerHead, total: Int, tenantTotal: Int) {
+    public init(entries: [GovernanceLedgerEntry], head: GovernanceLedgerHead? = nil, total: Int, tenantTotal: Int) {
         self.entries = entries
         self.head = head
         self.total = total
@@ -21202,31 +21948,39 @@ public struct GetHealthResponse: Codable, Hashable, Sendable {
     /// `run_revise`, `run_sources`, `mission_schedules`, `mission_analytics`, `company_profile`,
     /// `company_pause`, `company_blueprint`, `company_pause_preview`, `company_proposals`,
     /// `company_launch`, `company_overview`, `company_fit`, `company_templates`, `company_export`,
-    /// `company_import`, `company_versions` (since 2026-10-12). A NAME ALONE DOES NOT SAY WHAT IT
-    /// COVERS, so here is the coverage — added 2026-10-13 because a client asked which name gates
-    /// `POST /tenants/me/company/restore` and the answer existed only in prose no client can read:
-    /// `initiatives` = `/initiatives/*` (`/companies` is its deprecated old name);
-    /// `initiative_pause` = pausing an initiative; `mission_review` = objectives with
-    /// `review_required` and `POST /missions/{id}/objectives/{oid}/review`; `run_revise` = `POST
-    /// /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`; `mission_schedules` =
-    /// `/missions/schedules`; `mission_analytics` = `GET /analytics/missions` and the inbox
-    /// `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and `/company/changes`;
-    /// `company_pause` = `POST /company/pause` and `/resume`; `company_blueprint` = `GET
-    /// /tenants/me/blueprint`; `company_pause_preview` = `GET /company/pause-scope`;
-    /// `company_proposals` = `/tenants/me/proposals` with apply and reject; `company_launch` =
-    /// `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET /tenants/me/overview`;
-    /// `company_fit` = `GET /tenants/me/fit` (template fit is `company_templates`);
-    /// `company_templates` = `/company-templates`, `/company-templates/{id}/fit`, `POST
-    /// /company/apply-template`, `POST /me/tenants/create` with `template_id`; `company_export` =
-    /// `GET /company/export`; `company_import` = `POST /company/import`; `company_versions` = `GET
-    /// /company/versions` AND `POST /company/restore` — there is deliberately no separate
-    /// `company_restore`, since a snapshot and the rollback to it ship together.
+    /// `company_import`, `company_versions` (since 2026-10-12), `run_review` (since 2026-10-19). A
+    /// NAME ALONE DOES NOT SAY WHAT IT COVERS, so here is the coverage — added 2026-10-13 because a
+    /// client asked which name gates `POST /tenants/me/company/restore` and the answer existed only
+    /// in prose no client can read: `initiatives` = `/initiatives/*` (`/companies` is its
+    /// deprecated old name); `initiative_pause` = pausing an initiative; `mission_review` =
+    /// objectives with `review_required` and `POST /missions/{id}/objectives/{oid}/review`;
+    /// `run_revise` = `POST /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`;
+    /// `mission_schedules` = `/missions/schedules`; `mission_analytics` = `GET /analytics/missions`
+    /// and the inbox `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and
+    /// `/company/changes`; `company_pause` = `POST /company/pause` and `/resume`;
+    /// `company_blueprint` = `GET /tenants/me/blueprint`; `company_pause_preview` = `GET
+    /// /company/pause-scope`; `company_proposals` = `/tenants/me/proposals` with apply and reject;
+    /// `company_launch` = `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET
+    /// /tenants/me/overview`; `company_fit` = `GET /tenants/me/fit` (template fit is
+    /// `company_templates`); `company_templates` = `/company-templates`,
+    /// `/company-templates/{id}/fit`, `POST /company/apply-template`, `POST /me/tenants/create`
+    /// with `template_id`; `company_export` = `GET /company/export`; `company_import` = `POST
+    /// /company/import`; `company_versions` = `GET /company/versions` AND `POST /company/restore` —
+    /// there is deliberately no separate `company_restore`, since a snapshot and the rollback to it
+    /// ship together. `run_review` = `POST` and `GET /runs/{id}/review`, and `anchor`/`target` on
+    /// session annotations.
     public var capabilities: [String]?
     /// Runs currently queued. After a restart this includes runs reconciliation re-queued, so it
     /// falls as they are picked up — but it is a queue depth, not a count of recoveries.
     public var runsQueued: Int?
+    /// Runs in flight in THIS process right now — the scheduler's own live count, the same field
+    /// that answers `degraded` at 90% of its ceiling. This is the number to read when you want to
+    /// know whether work is happening: `runs_queued` is zero whenever everything is running rather
+    /// than waiting, and `pending_resumes` is a constant zero. It counts runs, not users — one run
+    /// may serve many turns.
+    public var runsActive: Int?
 
-    public init(status: GetHealthResponseStatus? = nil, timestamp: String? = nil, kvConnected: Bool? = nil, uptimeSeconds: Double? = nil, version: String? = nil, buildSha: String? = nil, buildTime: String? = nil, pendingResumes: Int? = nil, capabilities: [String]? = nil, runsQueued: Int? = nil) {
+    public init(status: GetHealthResponseStatus? = nil, timestamp: String? = nil, kvConnected: Bool? = nil, uptimeSeconds: Double? = nil, version: String? = nil, buildSha: String? = nil, buildTime: String? = nil, pendingResumes: Int? = nil, capabilities: [String]? = nil, runsQueued: Int? = nil, runsActive: Int? = nil) {
         self.status = status
         self.timestamp = timestamp
         self.kvConnected = kvConnected
@@ -21237,6 +21991,7 @@ public struct GetHealthResponse: Codable, Hashable, Sendable {
         self.pendingResumes = pendingResumes
         self.capabilities = capabilities
         self.runsQueued = runsQueued
+        self.runsActive = runsActive
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -21250,6 +22005,7 @@ public struct GetHealthResponse: Codable, Hashable, Sendable {
         case pendingResumes = "pending_resumes"
         case capabilities = "capabilities"
         case runsQueued = "runs_queued"
+        case runsActive = "runs_active"
     }
 }
 
@@ -21667,16 +22423,23 @@ public struct GetMeResponseUser: Codable, Hashable, Sendable {
     public var role: String?
     public var status: String?
     public var avatarURL: String?
+    /// The person's interface language (canonical BCP-47), null when unset — set with `PATCH /me`.
+    public var interfaceLanguage: String?
+    /// The person's Chief of Staff voice, null when unset — set with `PATCH /me`. A value stored in
+    /// an older shape reads as null.
+    public var chiefVoice: ChiefVoice?
     public var lastLoginAt: String?
     public var createdAt: String?
 
-    public init(userId: String? = nil, email: String? = nil, name: String? = nil, role: String? = nil, status: String? = nil, avatarURL: String? = nil, lastLoginAt: String? = nil, createdAt: String? = nil) {
+    public init(userId: String? = nil, email: String? = nil, name: String? = nil, role: String? = nil, status: String? = nil, avatarURL: String? = nil, interfaceLanguage: String? = nil, chiefVoice: ChiefVoice? = nil, lastLoginAt: String? = nil, createdAt: String? = nil) {
         self.userId = userId
         self.email = email
         self.name = name
         self.role = role
         self.status = status
         self.avatarURL = avatarURL
+        self.interfaceLanguage = interfaceLanguage
+        self.chiefVoice = chiefVoice
         self.lastLoginAt = lastLoginAt
         self.createdAt = createdAt
     }
@@ -21688,6 +22451,8 @@ public struct GetMeResponseUser: Codable, Hashable, Sendable {
         case role = "role"
         case status = "status"
         case avatarURL = "avatar_url"
+        case interfaceLanguage = "interface_language"
+        case chiefVoice = "chief_voice"
         case lastLoginAt = "last_login_at"
         case createdAt = "created_at"
     }
@@ -22147,6 +22912,22 @@ public struct GetMyHeadAgentTemplateResponseTierTierResourceLimits: Codable, Has
         case maxSteps = "max_steps"
         case maxTokensPerRun = "max_tokens_per_run"
         case thinkingBudgetTokens = "thinking_budget_tokens"
+    }
+}
+
+/// `GetMyRailAgentsResponse` model.
+public struct GetMyRailAgentsResponse: Codable, Hashable, Sendable {
+    public var agentIds: [String]
+    public var updatedAt: String?
+
+    public init(agentIds: [String], updatedAt: String? = nil) {
+        self.agentIds = agentIds
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentIds = "agent_ids"
+        case updatedAt = "updated_at"
     }
 }
 
@@ -22631,6 +23412,10 @@ public struct GetRunResponse: Codable, Hashable, Sendable {
     /// run never waited for one. Recorded since 2026-09-22; before that an approved call left no
     /// trace on the run.
     public var approvals: [GetRunResponseApproval]?
+    /// The latest person's verdict on this run's RESULT (`POST /runs/{runId}/review`, since
+    /// 2026-10-19) — not a tool approval, which is `approvals`. Absent until the result is
+    /// reviewed. The full record, with the comment and anchors, is `GET /runs/{runId}/review`.
+    public var review: GetRunResponseReview?
     public var createdAt: String
     public var startedAt: String?
     public var completedAt: String?
@@ -22665,7 +23450,7 @@ public struct GetRunResponse: Codable, Hashable, Sendable {
     /// running.
     public var pendingInput: GetRunResponsePendingInput?
 
-    public init(executionRequirements: QualificationExecutionRequirementsV2? = nil, recoveryExpiresAtUnix: Int? = nil, sponsorshipGrantId: String? = nil, executionMode: RunExecutionMode? = nil, runId: String, tenantId: String, agentId: String, sessionId: String? = nil, status: RunStatus, input: JSONObject? = nil, output: RunOutput? = nil, metrics: RunMetrics? = nil, error: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil, approvals: [GetRunResponseApproval]? = nil, createdAt: String, startedAt: String? = nil, completedAt: String? = nil, teamRunId: String? = nil, metadata: JSONObject? = nil, stepSeq: Int? = nil, artifacts: [Artifact]? = nil, resourceLimits: GetRunResponseResourceLimits? = nil, changedFiles: [String]? = nil, pendingApprovals: [PendingApproval]? = nil, pendingInput: GetRunResponsePendingInput? = nil) {
+    public init(executionRequirements: QualificationExecutionRequirementsV2? = nil, recoveryExpiresAtUnix: Int? = nil, sponsorshipGrantId: String? = nil, executionMode: RunExecutionMode? = nil, runId: String, tenantId: String, agentId: String, sessionId: String? = nil, status: RunStatus, input: JSONObject? = nil, output: RunOutput? = nil, metrics: RunMetrics? = nil, error: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil, approvals: [GetRunResponseApproval]? = nil, review: GetRunResponseReview? = nil, createdAt: String, startedAt: String? = nil, completedAt: String? = nil, teamRunId: String? = nil, metadata: JSONObject? = nil, stepSeq: Int? = nil, artifacts: [Artifact]? = nil, resourceLimits: GetRunResponseResourceLimits? = nil, changedFiles: [String]? = nil, pendingApprovals: [PendingApproval]? = nil, pendingInput: GetRunResponsePendingInput? = nil) {
         self.executionRequirements = executionRequirements
         self.recoveryExpiresAtUnix = recoveryExpiresAtUnix
         self.sponsorshipGrantId = sponsorshipGrantId
@@ -22682,6 +23467,7 @@ public struct GetRunResponse: Codable, Hashable, Sendable {
         self.errorCode = errorCode
         self.errorDetails = errorDetails
         self.approvals = approvals
+        self.review = review
         self.createdAt = createdAt
         self.startedAt = startedAt
         self.completedAt = completedAt
@@ -22712,6 +23498,7 @@ public struct GetRunResponse: Codable, Hashable, Sendable {
         case errorCode = "error_code"
         case errorDetails = "error_details"
         case approvals = "approvals"
+        case review = "review"
         case createdAt = "created_at"
         case startedAt = "started_at"
         case completedAt = "completed_at"
@@ -22787,6 +23574,12 @@ public struct GetRunResponseResourceLimits: Codable, Hashable, Sendable {
     public var maxDurationMs: Int?
     public var maxSteps: Int?
     public var maxToolCalls: Int?
+    /// Input + output tokens summed over every model call of the run. Since 2026-10-19 it is held
+    /// before each call, not only after: each call is sent with `max_tokens` no more than the cap
+    /// minus what the run has spent minus the last call's input (which the next call resends), and
+    /// once that is nothing the run stops before sending, failing with `MAX_TOKENS_EXCEEDED` and
+    /// `used_tokens` at or under the limit. Before, the last call could spend past the cap by up to
+    /// a whole step.
     public var maxTokensPerRun: Int?
     /// In-run cost ceiling in USD; 0 or absent means no cap from this field. A run that crosses it
     /// fails with error_code BUDGET_EXCEEDED and error_details.cap_source "resource_limits".
@@ -22808,6 +23601,35 @@ public struct GetRunResponseResourceLimits: Codable, Hashable, Sendable {
         case maxToolCalls = "max_tool_calls"
         case maxTokensPerRun = "max_tokens_per_run"
         case maxCostUsd = "max_cost_usd"
+    }
+}
+
+/// The latest person's verdict on this run's RESULT (`POST /runs/{runId}/review`, since
+/// 2026-10-19) — not a tool approval, which is `approvals`. Absent until the result is
+/// reviewed. The full record, with the comment and anchors, is `GET /runs/{runId}/review`.
+public struct GetRunResponseReview: Codable, Hashable, Sendable {
+    public var reviewId: String
+    public var verdict: RunReviewVerdict
+    public var decidedAt: String
+    /// User id of the person who decided; the credential id when no person stands behind it.
+    public var decidedBy: String?
+    /// On `redo`: the run started to do the work again.
+    public var followUpRunId: String?
+
+    public init(reviewId: String, verdict: RunReviewVerdict, decidedAt: String, decidedBy: String? = nil, followUpRunId: String? = nil) {
+        self.reviewId = reviewId
+        self.verdict = verdict
+        self.decidedAt = decidedAt
+        self.decidedBy = decidedBy
+        self.followUpRunId = followUpRunId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reviewId = "review_id"
+        case verdict = "verdict"
+        case decidedAt = "decided_at"
+        case decidedBy = "decided_by"
+        case followUpRunId = "follow_up_run_id"
     }
 }
 
@@ -23042,6 +23864,17 @@ public struct GetSessionResponse: Codable, Hashable, Sendable {
     public var pinned: Bool?
     /// When it was pinned; order the pinned group by it.
     public var pinnedAt: String?
+    /// The chat's name: the stored title, else the `metadata.title` clients wrote before the field
+    /// existed (2026-10-19), else `null`. A title the person cleared stays `null` even if that
+    /// legacy key is still there. At most 80 characters when a person sets it; a generated one is
+    /// at most 60, in the language of the first message. Present on every read — the list, the
+    /// detail, create and update.
+    public var title: String?
+    /// `user` when a person set or cleared the title (`PUT|PATCH /sessions/{id} {title}`) — a
+    /// generated title never replaces it; `generated` when the platform named the chat after its
+    /// first completed run. Absent when no title was ever stored as a field (none, or only the
+    /// legacy `metadata.title`).
+    public var titleSource: SessionTitleSource?
     public var createdBy: String?
     public var sessionId: String
     public var tenantId: String
@@ -23070,11 +23903,13 @@ public struct GetSessionResponse: Codable, Hashable, Sendable {
     public var modelOverride: GetSessionResponseModelOverride?
     public var context: SessionContext
 
-    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: GetSessionResponseModelOverride? = nil, context: SessionContext) {
+    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, title: String? = nil, titleSource: SessionTitleSource? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: GetSessionResponseModelOverride? = nil, context: SessionContext) {
         self.archived = archived
         self.archivedAt = archivedAt
         self.pinned = pinned
         self.pinnedAt = pinnedAt
+        self.title = title
+        self.titleSource = titleSource
         self.createdBy = createdBy
         self.sessionId = sessionId
         self.tenantId = tenantId
@@ -23099,6 +23934,8 @@ public struct GetSessionResponse: Codable, Hashable, Sendable {
         case archivedAt = "archived_at"
         case pinned = "pinned"
         case pinnedAt = "pinned_at"
+        case title = "title"
+        case titleSource = "title_source"
         case createdBy = "created_by"
         case sessionId = "session_id"
         case tenantId = "tenant_id"
@@ -24161,13 +24998,19 @@ public struct GetTenantCompanyOverviewResponseProblems: Codable, Hashable, Senda
     /// Missions in the window the PLATFORM stopped (`aborted` or `failed`, not
     /// `aborted_by_operator`) — the watchdog, a failed plan, failed objectives. Since 2026-10-15.
     public var stoppedMissions: Int?
+    /// Schedules the quota gate refused to fire, since 2026-10-24. A scheduled agent that does not
+    /// run because its tenant is over quota left no trace on any product surface before this field;
+    /// the count leads, the list names the agents. `next_fire_at` is when the schedule would next
+    /// be due.
+    public var quotaGatedSchedules: GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedules?
     /// The newest 5 of them.
     public var missions: [GetTenantCompanyOverviewResponseProblemsMission]?
 
-    public init(failedRuns: Int? = nil, recent: [GetTenantCompanyOverviewResponseProblemsRecentItem]? = nil, stoppedMissions: Int? = nil, missions: [GetTenantCompanyOverviewResponseProblemsMission]? = nil) {
+    public init(failedRuns: Int? = nil, recent: [GetTenantCompanyOverviewResponseProblemsRecentItem]? = nil, stoppedMissions: Int? = nil, quotaGatedSchedules: GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedules? = nil, missions: [GetTenantCompanyOverviewResponseProblemsMission]? = nil) {
         self.failedRuns = failedRuns
         self.recent = recent
         self.stoppedMissions = stoppedMissions
+        self.quotaGatedSchedules = quotaGatedSchedules
         self.missions = missions
     }
 
@@ -24175,6 +25018,7 @@ public struct GetTenantCompanyOverviewResponseProblems: Codable, Hashable, Senda
         case failedRuns = "failed_runs"
         case recent = "recent"
         case stoppedMissions = "stopped_missions"
+        case quotaGatedSchedules = "quota_gated_schedules"
         case missions = "missions"
     }
 }
@@ -24229,6 +25073,50 @@ public struct GetTenantCompanyOverviewResponseProblemsMissionStatus: RawRepresen
 
     /// Every value the spec declared at generation time.
     public static let knownValues: [GetTenantCompanyOverviewResponseProblemsMissionStatus] = [.aborted, .failed]
+}
+
+/// Schedules the quota gate refused to fire, since 2026-10-24. A scheduled agent that does not
+/// run because its tenant is over quota left no trace on any product surface before this field;
+/// the count leads, the list names the agents. `next_fire_at` is when the schedule would next
+/// be due.
+public struct GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedules: Codable, Hashable, Sendable {
+    public var count: Int?
+    public var byAgent: [GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedulesByAgentItem]?
+
+    public init(count: Int? = nil, byAgent: [GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedulesByAgentItem]? = nil) {
+        self.count = count
+        self.byAgent = byAgent
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case count = "count"
+        case byAgent = "by_agent"
+    }
+}
+
+/// `GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedulesByAgentItem` model.
+public struct GetTenantCompanyOverviewResponseProblemsQuotaGatedSchedulesByAgentItem: Codable, Hashable, Sendable {
+    public var agentId: String?
+    public var agentName: String?
+    public var reason: String?
+    public var skippedAt: String?
+    public var nextFireAt: String?
+
+    public init(agentId: String? = nil, agentName: String? = nil, reason: String? = nil, skippedAt: String? = nil, nextFireAt: String? = nil) {
+        self.agentId = agentId
+        self.agentName = agentName
+        self.reason = reason
+        self.skippedAt = skippedAt
+        self.nextFireAt = nextFireAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case reason = "reason"
+        case skippedAt = "skipped_at"
+        case nextFireAt = "next_fire_at"
+    }
 }
 
 /// `GetTenantCompanyOverviewResponseProblemsRecentItem` model.
@@ -24907,6 +25795,78 @@ public struct GuardrailConfigItemSource: RawRepresentable, Codable, Hashable, Se
     public static let knownValues: [GuardrailConfigItemSource] = [.kv, .`default`]
 }
 
+/// `HandleAppStoreNotificationRequest` model.
+public struct HandleAppStoreNotificationRequest: Codable, Hashable, Sendable {
+    /// The notification, as Apple sends it: a compact JWS.
+    public var signedPayload: String
+
+    public init(signedPayload: String) {
+        self.signedPayload = signedPayload
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case signedPayload = "signedPayload"
+    }
+}
+
+/// `HandleAppStoreNotificationResponse` model.
+public struct HandleAppStoreNotificationResponse: Codable, Hashable, Sendable {
+    public var received: Bool
+    public var handled: Bool
+    public var action: HandleAppStoreNotificationResponseAction?
+    public var duplicate: Bool?
+
+    public init(received: Bool, handled: Bool, action: HandleAppStoreNotificationResponseAction? = nil, duplicate: Bool? = nil) {
+        self.received = received
+        self.handled = handled
+        self.action = action
+        self.duplicate = duplicate
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case received = "received"
+        case handled = "handled"
+        case action = "action"
+        case duplicate = "duplicate"
+    }
+}
+
+/// `HandleAppStoreNotificationResponseAction` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct HandleAppStoreNotificationResponseAction: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let planApplied = HandleAppStoreNotificationResponseAction(rawValue: "plan_applied")
+    public static let unchanged = HandleAppStoreNotificationResponseAction(rawValue: "unchanged")
+    public static let stripeActive = HandleAppStoreNotificationResponseAction(rawValue: "stripe_active")
+    public static let refused = HandleAppStoreNotificationResponseAction(rawValue: "refused")
+    public static let downgradedToFree = HandleAppStoreNotificationResponseAction(rawValue: "downgraded_to_free")
+    public static let notAppStorePlan = HandleAppStoreNotificationResponseAction(rawValue: "not_app_store_plan")
+    public static let supersededSubscription = HandleAppStoreNotificationResponseAction(rawValue: "superseded_subscription")
+    public static let planWriteRefused = HandleAppStoreNotificationResponseAction(rawValue: "plan_write_refused")
+    public static let gracePeriod = HandleAppStoreNotificationResponseAction(rawValue: "grace_period")
+    public static let unknownProduct = HandleAppStoreNotificationResponseAction(rawValue: "unknown_product")
+    public static let revokedTransaction = HandleAppStoreNotificationResponseAction(rawValue: "revoked_transaction")
+    public static let noTransaction = HandleAppStoreNotificationResponseAction(rawValue: "no_transaction")
+    public static let orphanNoTenant = HandleAppStoreNotificationResponseAction(rawValue: "orphan_no_tenant")
+    public static let missing = HandleAppStoreNotificationResponseAction(rawValue: "missing")
+    public static let ignored = HandleAppStoreNotificationResponseAction(rawValue: "ignored")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [HandleAppStoreNotificationResponseAction] = [.planApplied, .unchanged, .stripeActive, .refused, .downgradedToFree, .notAppStorePlan, .supersededSubscription, .planWriteRefused, .gracePeriod, .unknownProduct, .revokedTransaction, .noTransaction, .orphanNoTenant, .missing, .ignored]
+}
+
 /// `HandleStripeWebhookRequest` model.
 public struct HandleStripeWebhookRequest: Codable, Hashable, Sendable {
     public var type: String
@@ -24945,8 +25905,8 @@ public struct HandleStripeWebhookResponse: Codable, Hashable, Sendable {
     }
 }
 
-/// `HealthCheckV1aliasResponse` model.
-public struct HealthCheckV1aliasResponse: Codable, Hashable, Sendable {
+/// `HealthCheckV1AliasResponse` model.
+public struct HealthCheckV1AliasResponse: Codable, Hashable, Sendable {
     public var status: GetHealthResponseStatus?
     public var timestamp: String?
     public var kvConnected: Bool?
@@ -24961,25 +25921,27 @@ public struct HealthCheckV1aliasResponse: Codable, Hashable, Sendable {
     /// `run_revise`, `run_sources`, `mission_schedules`, `mission_analytics`, `company_profile`,
     /// `company_pause`, `company_blueprint`, `company_pause_preview`, `company_proposals`,
     /// `company_launch`, `company_overview`, `company_fit`, `company_templates`, `company_export`,
-    /// `company_import`, `company_versions` (since 2026-10-12). A NAME ALONE DOES NOT SAY WHAT IT
-    /// COVERS, so here is the coverage — added 2026-10-13 because a client asked which name gates
-    /// `POST /tenants/me/company/restore` and the answer existed only in prose no client can read:
-    /// `initiatives` = `/initiatives/*` (`/companies` is its deprecated old name);
-    /// `initiative_pause` = pausing an initiative; `mission_review` = objectives with
-    /// `review_required` and `POST /missions/{id}/objectives/{oid}/review`; `run_revise` = `POST
-    /// /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`; `mission_schedules` =
-    /// `/missions/schedules`; `mission_analytics` = `GET /analytics/missions` and the inbox
-    /// `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and `/company/changes`;
-    /// `company_pause` = `POST /company/pause` and `/resume`; `company_blueprint` = `GET
-    /// /tenants/me/blueprint`; `company_pause_preview` = `GET /company/pause-scope`;
-    /// `company_proposals` = `/tenants/me/proposals` with apply and reject; `company_launch` =
-    /// `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET /tenants/me/overview`;
-    /// `company_fit` = `GET /tenants/me/fit` (template fit is `company_templates`);
-    /// `company_templates` = `/company-templates`, `/company-templates/{id}/fit`, `POST
-    /// /company/apply-template`, `POST /me/tenants/create` with `template_id`; `company_export` =
-    /// `GET /company/export`; `company_import` = `POST /company/import`; `company_versions` = `GET
-    /// /company/versions` AND `POST /company/restore` — there is deliberately no separate
-    /// `company_restore`, since a snapshot and the rollback to it ship together.
+    /// `company_import`, `company_versions` (since 2026-10-12), `run_review` (since 2026-10-19). A
+    /// NAME ALONE DOES NOT SAY WHAT IT COVERS, so here is the coverage — added 2026-10-13 because a
+    /// client asked which name gates `POST /tenants/me/company/restore` and the answer existed only
+    /// in prose no client can read: `initiatives` = `/initiatives/*` (`/companies` is its
+    /// deprecated old name); `initiative_pause` = pausing an initiative; `mission_review` =
+    /// objectives with `review_required` and `POST /missions/{id}/objectives/{oid}/review`;
+    /// `run_revise` = `POST /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`;
+    /// `mission_schedules` = `/missions/schedules`; `mission_analytics` = `GET /analytics/missions`
+    /// and the inbox `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and
+    /// `/company/changes`; `company_pause` = `POST /company/pause` and `/resume`;
+    /// `company_blueprint` = `GET /tenants/me/blueprint`; `company_pause_preview` = `GET
+    /// /company/pause-scope`; `company_proposals` = `/tenants/me/proposals` with apply and reject;
+    /// `company_launch` = `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET
+    /// /tenants/me/overview`; `company_fit` = `GET /tenants/me/fit` (template fit is
+    /// `company_templates`); `company_templates` = `/company-templates`,
+    /// `/company-templates/{id}/fit`, `POST /company/apply-template`, `POST /me/tenants/create`
+    /// with `template_id`; `company_export` = `GET /company/export`; `company_import` = `POST
+    /// /company/import`; `company_versions` = `GET /company/versions` AND `POST /company/restore` —
+    /// there is deliberately no separate `company_restore`, since a snapshot and the rollback to it
+    /// ship together. `run_review` = `POST` and `GET /runs/{id}/review`, and `anchor`/`target` on
+    /// session annotations.
     public var capabilities: [String]?
 
     public init(status: GetHealthResponseStatus? = nil, timestamp: String? = nil, kvConnected: Bool? = nil, uptimeSeconds: Double? = nil, version: String? = nil, buildSha: String? = nil, buildTime: String? = nil, pendingResumes: Int? = nil, runsQueued: Int? = nil, capabilities: [String]? = nil) {
@@ -25059,31 +26021,39 @@ public struct HealthzAliasResponse: Codable, Hashable, Sendable {
     /// `run_revise`, `run_sources`, `mission_schedules`, `mission_analytics`, `company_profile`,
     /// `company_pause`, `company_blueprint`, `company_pause_preview`, `company_proposals`,
     /// `company_launch`, `company_overview`, `company_fit`, `company_templates`, `company_export`,
-    /// `company_import`, `company_versions` (since 2026-10-12). A NAME ALONE DOES NOT SAY WHAT IT
-    /// COVERS, so here is the coverage — added 2026-10-13 because a client asked which name gates
-    /// `POST /tenants/me/company/restore` and the answer existed only in prose no client can read:
-    /// `initiatives` = `/initiatives/*` (`/companies` is its deprecated old name);
-    /// `initiative_pause` = pausing an initiative; `mission_review` = objectives with
-    /// `review_required` and `POST /missions/{id}/objectives/{oid}/review`; `run_revise` = `POST
-    /// /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`; `mission_schedules` =
-    /// `/missions/schedules`; `mission_analytics` = `GET /analytics/missions` and the inbox
-    /// `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and `/company/changes`;
-    /// `company_pause` = `POST /company/pause` and `/resume`; `company_blueprint` = `GET
-    /// /tenants/me/blueprint`; `company_pause_preview` = `GET /company/pause-scope`;
-    /// `company_proposals` = `/tenants/me/proposals` with apply and reject; `company_launch` =
-    /// `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET /tenants/me/overview`;
-    /// `company_fit` = `GET /tenants/me/fit` (template fit is `company_templates`);
-    /// `company_templates` = `/company-templates`, `/company-templates/{id}/fit`, `POST
-    /// /company/apply-template`, `POST /me/tenants/create` with `template_id`; `company_export` =
-    /// `GET /company/export`; `company_import` = `POST /company/import`; `company_versions` = `GET
-    /// /company/versions` AND `POST /company/restore` — there is deliberately no separate
-    /// `company_restore`, since a snapshot and the rollback to it ship together.
+    /// `company_import`, `company_versions` (since 2026-10-12), `run_review` (since 2026-10-19). A
+    /// NAME ALONE DOES NOT SAY WHAT IT COVERS, so here is the coverage — added 2026-10-13 because a
+    /// client asked which name gates `POST /tenants/me/company/restore` and the answer existed only
+    /// in prose no client can read: `initiatives` = `/initiatives/*` (`/companies` is its
+    /// deprecated old name); `initiative_pause` = pausing an initiative; `mission_review` =
+    /// objectives with `review_required` and `POST /missions/{id}/objectives/{oid}/review`;
+    /// `run_revise` = `POST /runs/{id}/revise`; `run_sources` = `GET /runs/{id}/sources`;
+    /// `mission_schedules` = `/missions/schedules`; `mission_analytics` = `GET /analytics/missions`
+    /// and the inbox `reviews[]`; `company_profile` = `GET`/`PATCH /tenants/me/company` and
+    /// `/company/changes`; `company_pause` = `POST /company/pause` and `/resume`;
+    /// `company_blueprint` = `GET /tenants/me/blueprint`; `company_pause_preview` = `GET
+    /// /company/pause-scope`; `company_proposals` = `/tenants/me/proposals` with apply and reject;
+    /// `company_launch` = `/readiness`, `/test-run`, `/launch`; `company_overview` = `GET
+    /// /tenants/me/overview`; `company_fit` = `GET /tenants/me/fit` (template fit is
+    /// `company_templates`); `company_templates` = `/company-templates`,
+    /// `/company-templates/{id}/fit`, `POST /company/apply-template`, `POST /me/tenants/create`
+    /// with `template_id`; `company_export` = `GET /company/export`; `company_import` = `POST
+    /// /company/import`; `company_versions` = `GET /company/versions` AND `POST /company/restore` —
+    /// there is deliberately no separate `company_restore`, since a snapshot and the rollback to it
+    /// ship together. `run_review` = `POST` and `GET /runs/{id}/review`, and `anchor`/`target` on
+    /// session annotations.
     public var capabilities: [String]?
     /// Runs currently queued. After a restart this includes runs reconciliation re-queued, so it
     /// falls as they are picked up — but it is a queue depth, not a count of recoveries.
     public var runsQueued: Int?
+    /// Runs in flight in THIS process right now — the scheduler's own live count, the same field
+    /// that answers `degraded` at 90% of its ceiling. This is the number to read when you want to
+    /// know whether work is happening: `runs_queued` is zero whenever everything is running rather
+    /// than waiting, and `pending_resumes` is a constant zero. It counts runs, not users — one run
+    /// may serve many turns.
+    public var runsActive: Int?
 
-    public init(status: GetHealthResponseStatus? = nil, timestamp: String? = nil, kvConnected: Bool? = nil, uptimeSeconds: Double? = nil, version: String? = nil, buildSha: String? = nil, buildTime: String? = nil, pendingResumes: Int? = nil, capabilities: [String]? = nil, runsQueued: Int? = nil) {
+    public init(status: GetHealthResponseStatus? = nil, timestamp: String? = nil, kvConnected: Bool? = nil, uptimeSeconds: Double? = nil, version: String? = nil, buildSha: String? = nil, buildTime: String? = nil, pendingResumes: Int? = nil, capabilities: [String]? = nil, runsQueued: Int? = nil, runsActive: Int? = nil) {
         self.status = status
         self.timestamp = timestamp
         self.kvConnected = kvConnected
@@ -25094,6 +26064,7 @@ public struct HealthzAliasResponse: Codable, Hashable, Sendable {
         self.pendingResumes = pendingResumes
         self.capabilities = capabilities
         self.runsQueued = runsQueued
+        self.runsActive = runsActive
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -25107,6 +26078,7 @@ public struct HealthzAliasResponse: Codable, Hashable, Sendable {
         case pendingResumes = "pending_resumes"
         case capabilities = "capabilities"
         case runsQueued = "runs_queued"
+        case runsActive = "runs_active"
     }
 }
 
@@ -25239,6 +26211,57 @@ public struct HireConnect: Codable, Hashable, Sendable {
     }
 }
 
+/// `HiredAgentPermissionRequest` model.
+public struct HiredAgentPermissionRequest: Codable, Hashable, Sendable {
+    /// The tool Claude Code wants to use, e.g. `Bash`.
+    public var toolName: String?
+    /// Its arguments, shown to the person as stored (up to 2 000 characters).
+    public var toolInput: JSONObject?
+    /// Properties the server returned that this SDK does not model.
+    public var additionalProperties: [String: JSONValue]
+
+    public init(toolName: String? = nil, toolInput: JSONObject? = nil, additionalProperties: [String: JSONValue] = [:]) {
+        self.toolName = toolName
+        self.toolInput = toolInput
+        self.additionalProperties = additionalProperties
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toolName = "tool_name"
+        case toolInput = "tool_input"
+    }
+
+    private struct DynamicKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
+        self.toolInput = try container.decodeIfPresent(JSONObject.self, forKey: .toolInput)
+        let dynamic = try decoder.container(keyedBy: DynamicKey.self)
+        let known: Set<String> = ["tool_name", "tool_input"]
+        var extra: [String: JSONValue] = [:]
+        for key in dynamic.allKeys where !known.contains(key.stringValue) {
+            extra[key.stringValue] = try dynamic.decode(JSONValue.self, forKey: key)
+        }
+        self.additionalProperties = extra
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(toolName, forKey: .toolName)
+        try container.encodeIfPresent(toolInput, forKey: .toolInput)
+        var dynamic = encoder.container(keyedBy: DynamicKey.self)
+        for (key, value) in additionalProperties {
+            try dynamic.encode(value, forKey: DynamicKey(stringValue: key))
+        }
+    }
+}
+
 /// `HostDroplet` model.
 public struct HostDroplet: Codable, Hashable, Sendable {
     public var id: Int
@@ -25280,6 +26303,56 @@ public struct HostDroplet: Codable, Hashable, Sendable {
         case diskGb = "disk_gb"
         case createdAt = "created_at"
     }
+}
+
+/// A point (`x`, `y`) or a box (`x`, `y` its top-left corner, plus `w`, `h`) on an image, every
+/// value a fraction of the image's width or height, 0–1, from the top-left. `w` and `h` come
+/// together or not at all, and the box must stay inside the image: `x + w <= 1`, `y + h <= 1`
+/// (`422` otherwise).
+public struct ImageAnchor: Codable, Hashable, Sendable {
+    public var kind: ImageAnchorKind
+    public var x: Double
+    public var y: Double
+    public var w: Double?
+    public var h: Double?
+
+    public init(kind: ImageAnchorKind, x: Double, y: Double, w: Double? = nil, h: Double? = nil) {
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case x = "x"
+        case y = "y"
+        case w = "w"
+        case h = "h"
+    }
+}
+
+/// `ImageAnchorKind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ImageAnchorKind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let image = ImageAnchorKind(rawValue: "image")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ImageAnchorKind] = [.image]
 }
 
 /// `ImageProviderList` model.
@@ -27857,6 +28930,70 @@ public struct ListAgentScorersResponse: Codable, Hashable, Sendable {
     }
 }
 
+/// `ListAgentSessionsGroupBy` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ListAgentSessionsGroupBy: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let day = ListAgentSessionsGroupBy(rawValue: "day")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ListAgentSessionsGroupBy] = [.day]
+}
+
+/// `ListAgentSessionsResponse` model.
+public struct ListAgentSessionsResponse: Codable, Hashable, Sendable {
+    public var items: [Session]?
+    public var days: [ListAgentSessionsResponseDay]?
+    public var cursor: String?
+    public var hasMore: Bool
+
+    public init(items: [Session]? = nil, days: [ListAgentSessionsResponseDay]? = nil, cursor: String? = nil, hasMore: Bool) {
+        self.items = items
+        self.days = days
+        self.cursor = cursor
+        self.hasMore = hasMore
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case items = "items"
+        case days = "days"
+        case cursor = "cursor"
+        case hasMore = "has_more"
+    }
+}
+
+/// `ListAgentSessionsResponseDay` model.
+public struct ListAgentSessionsResponseDay: Codable, Hashable, Sendable {
+    public var date: String
+    /// IANA zone the date is read in.
+    public var tz: String
+    public var sessions: [Session]
+
+    public init(date: String, tz: String, sessions: [Session]) {
+        self.date = date
+        self.tz = tz
+        self.sessions = sessions
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case date = "date"
+        case tz = "tz"
+        case sessions = "sessions"
+    }
+}
+
 /// `ListAgentsResponse` model.
 public struct ListAgentsResponse: Codable, Hashable, Sendable {
     public var items: [Agent]
@@ -28161,6 +29298,10 @@ public struct ListBillingPlansResponsePlan: Codable, Hashable, Sendable {
     public var limits: JSONObject?
     public var current: Bool?
     public var checkoutAvailable: Bool?
+    /// The App Store auto-renewable product that buys this plan in the iOS app. Present on starter
+    /// and pro only. Its App Store price is the web price grossed up for Apple's commission (web
+    /// net / (1 − Apple rate)).
+    public var appStoreProductId: ListBillingPlansResponsePlanAppStoreProductId?
     public var priceAmountCents: Int?
     public var priceCurrency: String?
     /// How often `price_amount_cents` bills, read from the Stripe price wired to the plan: show it
@@ -28172,12 +29313,13 @@ public struct ListBillingPlansResponsePlan: Codable, Hashable, Sendable {
     /// is null or `one_time`.
     public var priceIntervalCount: Int?
 
-    public init(id: String? = nil, name: String? = nil, limits: JSONObject? = nil, current: Bool? = nil, checkoutAvailable: Bool? = nil, priceAmountCents: Int? = nil, priceCurrency: String? = nil, priceInterval: String? = nil, priceIntervalCount: Int? = nil) {
+    public init(id: String? = nil, name: String? = nil, limits: JSONObject? = nil, current: Bool? = nil, checkoutAvailable: Bool? = nil, appStoreProductId: ListBillingPlansResponsePlanAppStoreProductId? = nil, priceAmountCents: Int? = nil, priceCurrency: String? = nil, priceInterval: String? = nil, priceIntervalCount: Int? = nil) {
         self.id = id
         self.name = name
         self.limits = limits
         self.current = current
         self.checkoutAvailable = checkoutAvailable
+        self.appStoreProductId = appStoreProductId
         self.priceAmountCents = priceAmountCents
         self.priceCurrency = priceCurrency
         self.priceInterval = priceInterval
@@ -28190,11 +29332,37 @@ public struct ListBillingPlansResponsePlan: Codable, Hashable, Sendable {
         case limits = "limits"
         case current = "current"
         case checkoutAvailable = "checkout_available"
+        case appStoreProductId = "app_store_product_id"
         case priceAmountCents = "price_amount_cents"
         case priceCurrency = "price_currency"
         case priceInterval = "price_interval"
         case priceIntervalCount = "price_interval_count"
     }
+}
+
+/// The App Store auto-renewable product that buys this plan in the iOS app. Present on starter
+/// and pro only. Its App Store price is the web price grossed up for Apple's commission (web
+/// net / (1 − Apple rate)).
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct ListBillingPlansResponsePlanAppStoreProductId: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let aiSnagaStarterMonthly = ListBillingPlansResponsePlanAppStoreProductId(rawValue: "ai.snaga.starter.monthly")
+    public static let aiSnagaProMonthly = ListBillingPlansResponsePlanAppStoreProductId(rawValue: "ai.snaga.pro.monthly")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [ListBillingPlansResponsePlanAppStoreProductId] = [.aiSnagaStarterMonthly, .aiSnagaProMonthly]
 }
 
 /// `ListBillingSpecPackagesResponse` model.
@@ -29046,13 +30214,18 @@ public struct ListNotificationsResponse: Codable, Hashable, Sendable {
 
 /// `ListNotificationTargetsResponse` model.
 public struct ListNotificationTargetsResponse: Codable, Hashable, Sendable {
+    /// Server capability only. This does not acknowledge a device; ownership is acknowledged by a
+    /// successful POST target response.
+    public var deviceOwnershipVersion: Int?
     public var targets: [NotificationTarget]
 
-    public init(targets: [NotificationTarget]) {
+    public init(deviceOwnershipVersion: Int? = nil, targets: [NotificationTarget]) {
+        self.deviceOwnershipVersion = deviceOwnershipVersion
         self.targets = targets
     }
 
     private enum CodingKeys: String, CodingKey {
+        case deviceOwnershipVersion = "device_ownership_version"
         case targets = "targets"
     }
 }
@@ -29679,14 +30852,18 @@ public struct ListSessionAnnotationsResponseItem: Codable, Hashable, Sendable {
     public var author: String?
     public var createdAt: String?
     public var resolved: Bool?
+    public var anchor: Anchor?
+    public var target: AnchorTarget?
 
-    public init(id: String? = nil, messageId: String? = nil, content: String? = nil, author: String? = nil, createdAt: String? = nil, resolved: Bool? = nil) {
+    public init(id: String? = nil, messageId: String? = nil, content: String? = nil, author: String? = nil, createdAt: String? = nil, resolved: Bool? = nil, anchor: Anchor? = nil, target: AnchorTarget? = nil) {
         self.id = id
         self.messageId = messageId
         self.content = content
         self.author = author
         self.createdAt = createdAt
         self.resolved = resolved
+        self.anchor = anchor
+        self.target = target
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -29696,6 +30873,8 @@ public struct ListSessionAnnotationsResponseItem: Codable, Hashable, Sendable {
         case author = "author"
         case createdAt = "created_at"
         case resolved = "resolved"
+        case anchor = "anchor"
+        case target = "target"
     }
 }
 
@@ -29844,6 +31023,17 @@ public struct ListSessionsResponseItem: Codable, Hashable, Sendable {
     public var pinned: Bool?
     /// When it was pinned; order the pinned group by it.
     public var pinnedAt: String?
+    /// The chat's name: the stored title, else the `metadata.title` clients wrote before the field
+    /// existed (2026-10-19), else `null`. A title the person cleared stays `null` even if that
+    /// legacy key is still there. At most 80 characters when a person sets it; a generated one is
+    /// at most 60, in the language of the first message. Present on every read — the list, the
+    /// detail, create and update.
+    public var title: String?
+    /// `user` when a person set or cleared the title (`PUT|PATCH /sessions/{id} {title}`) — a
+    /// generated title never replaces it; `generated` when the platform named the chat after its
+    /// first completed run. Absent when no title was ever stored as a field (none, or only the
+    /// legacy `metadata.title`).
+    public var titleSource: SessionTitleSource?
     public var createdBy: String?
     public var sessionId: String
     public var tenantId: String
@@ -29875,11 +31065,13 @@ public struct ListSessionsResponseItem: Codable, Hashable, Sendable {
     public var lastMessage: String?
     public var messageCount: Int?
 
-    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: ListSessionsResponseItemModelOverride? = nil, agentName: String? = nil, firstUserMessage: String? = nil, lastMessage: String? = nil, messageCount: Int? = nil) {
+    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, title: String? = nil, titleSource: SessionTitleSource? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: ListSessionsResponseItemModelOverride? = nil, agentName: String? = nil, firstUserMessage: String? = nil, lastMessage: String? = nil, messageCount: Int? = nil) {
         self.archived = archived
         self.archivedAt = archivedAt
         self.pinned = pinned
         self.pinnedAt = pinnedAt
+        self.title = title
+        self.titleSource = titleSource
         self.createdBy = createdBy
         self.sessionId = sessionId
         self.tenantId = tenantId
@@ -29907,6 +31099,8 @@ public struct ListSessionsResponseItem: Codable, Hashable, Sendable {
         case archivedAt = "archived_at"
         case pinned = "pinned"
         case pinnedAt = "pinned_at"
+        case title = "title"
+        case titleSource = "title_source"
         case createdBy = "created_by"
         case sessionId = "session_id"
         case tenantId = "tenant_id"
@@ -30638,6 +31832,9 @@ public struct LLMSynthesizeSpeechRequest: Codable, Hashable, Sendable {
     public var model: String?
     public var input: String
     public var voice: String?
+    /// The agent being spoken for. The head agent's id selects the person's `chief_voice` when
+    /// `model` and `voice` are absent.
+    public var agentId: String?
     /// The spoken language as a tag (`uk`, `en`, `pt-BR`; the first two letters are sent). Absent:
     /// read from `input` — Ukrainian by its own letters (і ї є ґ), Russian by its own (ы э ъ ё),
     /// any other Cyrillic as Ukrainian — else left to the voice. Sent to the provider as
@@ -30652,10 +31849,11 @@ public struct LLMSynthesizeSpeechRequest: Codable, Hashable, Sendable {
     /// with a first byte at roughly 0.4s, which is what progressive playback needs.
     public var responseFormat: String?
 
-    public init(model: String? = nil, input: String, voice: String? = nil, language: String? = nil, responseFormat: String? = nil) {
+    public init(model: String? = nil, input: String, voice: String? = nil, agentId: String? = nil, language: String? = nil, responseFormat: String? = nil) {
         self.model = model
         self.input = input
         self.voice = voice
+        self.agentId = agentId
         self.language = language
         self.responseFormat = responseFormat
     }
@@ -30664,6 +31862,7 @@ public struct LLMSynthesizeSpeechRequest: Codable, Hashable, Sendable {
         case model = "model"
         case input = "input"
         case voice = "voice"
+        case agentId = "agent_id"
         case language = "language"
         case responseFormat = "response_format"
     }
@@ -32221,7 +33420,9 @@ public struct Mission: Codable, Hashable, Sendable {
     /// `all_objectives_verified` (details `verified`), `objectives_failed` (`failed`, `total`),
     /// `planning_failed`, `aborted_by_signal`, `aborted_by_operator` (the operator's reason, when
     /// given, is the summary), `watchdog_stuck` (`stuck_status`, `stuck_minutes`),
-    /// `paused_by_operator`, `resumed_by_operator`, `authorized_by_operator`.
+    /// `paused_by_operator`, `queued_walk_ceiling` (planned, then paused because the tenant was
+    /// already running its maximum concurrent missions — resumable with `POST
+    /// /missions/{id}/resume`), `resumed_by_operator`, `authorized_by_operator`.
     public var resultCode: MissionResultCode?
     /// The numbers `result_summary` carries, keyed per `result_code` (see there). Absent when the
     /// code carries none.
@@ -32368,7 +33569,9 @@ public struct MissionOutcome: RawRepresentable, Codable, Hashable, Sendable, Exp
 /// `all_objectives_verified` (details `verified`), `objectives_failed` (`failed`, `total`),
 /// `planning_failed`, `aborted_by_signal`, `aborted_by_operator` (the operator's reason, when
 /// given, is the summary), `watchdog_stuck` (`stuck_status`, `stuck_minutes`),
-/// `paused_by_operator`, `resumed_by_operator`, `authorized_by_operator`.
+/// `paused_by_operator`, `queued_walk_ceiling` (planned, then paused because the tenant was
+/// already running its maximum concurrent missions — resumable with `POST
+/// /missions/{id}/resume`), `resumed_by_operator`, `authorized_by_operator`.
 ///
 /// Values the API adds later decode into this type unchanged, so a new
 /// server-side case never breaks an existing client.
@@ -32391,11 +33594,12 @@ public struct MissionResultCode: RawRepresentable, Codable, Hashable, Sendable, 
     public static let abortedByOperator = MissionResultCode(rawValue: "aborted_by_operator")
     public static let watchdogStuck = MissionResultCode(rawValue: "watchdog_stuck")
     public static let pausedByOperator = MissionResultCode(rawValue: "paused_by_operator")
+    public static let queuedWalkCeiling = MissionResultCode(rawValue: "queued_walk_ceiling")
     public static let resumedByOperator = MissionResultCode(rawValue: "resumed_by_operator")
     public static let authorizedByOperator = MissionResultCode(rawValue: "authorized_by_operator")
 
     /// Every value the spec declared at generation time.
-    public static let knownValues: [MissionResultCode] = [.allObjectivesVerified, .objectivesFailed, .planningFailed, .abortedBySignal, .abortedByOperator, .watchdogStuck, .pausedByOperator, .resumedByOperator, .authorizedByOperator]
+    public static let knownValues: [MissionResultCode] = [.allObjectivesVerified, .objectivesFailed, .planningFailed, .abortedBySignal, .abortedByOperator, .watchdogStuck, .pausedByOperator, .queuedWalkCeiling, .resumedByOperator, .authorizedByOperator]
 }
 
 /// What POST /missions answers. `plan` is echoed back only when the server planned the mission
@@ -32615,7 +33819,9 @@ public struct Notification: Codable, Hashable, Sendable {
 }
 
 /// Delivery channel. `in_app` is always-on (bell drawer + SSE) and cannot be opted out of;
-/// `telegram`/`whatsapp` are reserved and have no adapter yet.
+/// `telegram`/`whatsapp` are reserved and have no adapter yet. `live_activity` holds iOS Live
+/// Activity push tokens: it is never a fan-out destination (naming it in preferences delivers
+/// nothing), only the run a token is registered for moves it.
 ///
 /// Values the API adds later decode into this type unchanged, so a new
 /// server-side case never breaks an existing client.
@@ -32636,11 +33842,12 @@ public struct NotificationChannel: RawRepresentable, Codable, Hashable, Sendable
     public static let webhook = NotificationChannel(rawValue: "webhook")
     public static let push = NotificationChannel(rawValue: "push")
     public static let webPush = NotificationChannel(rawValue: "web_push")
+    public static let liveActivity = NotificationChannel(rawValue: "live_activity")
     public static let telegram = NotificationChannel(rawValue: "telegram")
     public static let whatsapp = NotificationChannel(rawValue: "whatsapp")
 
     /// Every value the spec declared at generation time.
-    public static let knownValues: [NotificationChannel] = [.inApp, .email, .webhook, .push, .webPush, .telegram, .whatsapp]
+    public static let knownValues: [NotificationChannel] = [.inApp, .email, .webhook, .push, .webPush, .liveActivity, .telegram, .whatsapp]
 }
 
 /// `NotificationPreferences` model.
@@ -32655,16 +33862,24 @@ public struct NotificationPreferences: Codable, Hashable, Sendable {
     /// them — muting does not hide an event from the bell drawer, it only stops the outbound
     /// channels.
     public var mutedTypes: [NotificationType]?
+    /// Whose notifications are pushed to a phone or browser (`push` and `web_push`). `all` (the
+    /// default; an omitted field on PUT stores `all`) pushes every agent's; `chief_only` pushes
+    /// only those raised by the tenant's head agent (the Chief of Staff, `head_agent_id` on the
+    /// tenant). Other notifications still land in the in-app list, and email and webhooks are
+    /// unaffected; a notification no agent raised (budget, security, billing) keeps its push.
+    /// Anything else is `422`.
+    public var pushFrom: NotificationPreferencesInputPushFrom?
     /// Window during which non-critical messages are suppressed; critical always bypasses. Set both
     /// start_local and end_local to enable, empty disables.
     public var quietHours: NotificationPreferencesQuietHours?
     public var tenantId: String
     public var updatedAt: String
 
-    public init(priorityChannels: NotificationPreferencesPriorityChannels? = nil, typeOverrides: [String: [NotificationChannel]]? = nil, mutedTypes: [NotificationType]? = nil, quietHours: NotificationPreferencesQuietHours? = nil, tenantId: String, updatedAt: String) {
+    public init(priorityChannels: NotificationPreferencesPriorityChannels? = nil, typeOverrides: [String: [NotificationChannel]]? = nil, mutedTypes: [NotificationType]? = nil, pushFrom: NotificationPreferencesInputPushFrom? = nil, quietHours: NotificationPreferencesQuietHours? = nil, tenantId: String, updatedAt: String) {
         self.priorityChannels = priorityChannels
         self.typeOverrides = typeOverrides
         self.mutedTypes = mutedTypes
+        self.pushFrom = pushFrom
         self.quietHours = quietHours
         self.tenantId = tenantId
         self.updatedAt = updatedAt
@@ -32674,6 +33889,7 @@ public struct NotificationPreferences: Codable, Hashable, Sendable {
         case priorityChannels = "priority_channels"
         case typeOverrides = "type_overrides"
         case mutedTypes = "muted_types"
+        case pushFrom = "push_from"
         case quietHours = "quiet_hours"
         case tenantId = "tenant_id"
         case updatedAt = "updated_at"
@@ -32695,14 +33911,22 @@ public struct NotificationPreferencesInput: Codable, Hashable, Sendable {
     /// them — muting does not hide an event from the bell drawer, it only stops the outbound
     /// channels.
     public var mutedTypes: [NotificationType]?
+    /// Whose notifications are pushed to a phone or browser (`push` and `web_push`). `all` (the
+    /// default; an omitted field on PUT stores `all`) pushes every agent's; `chief_only` pushes
+    /// only those raised by the tenant's head agent (the Chief of Staff, `head_agent_id` on the
+    /// tenant). Other notifications still land in the in-app list, and email and webhooks are
+    /// unaffected; a notification no agent raised (budget, security, billing) keeps its push.
+    /// Anything else is `422`.
+    public var pushFrom: NotificationPreferencesInputPushFrom?
     /// Window during which non-critical messages are suppressed; critical always bypasses. Set both
     /// start_local and end_local to enable, empty disables.
     public var quietHours: NotificationPreferencesInputQuietHours?
 
-    public init(priorityChannels: NotificationPreferencesInputPriorityChannels? = nil, typeOverrides: [String: [NotificationChannel]]? = nil, mutedTypes: [NotificationType]? = nil, quietHours: NotificationPreferencesInputQuietHours? = nil) {
+    public init(priorityChannels: NotificationPreferencesInputPriorityChannels? = nil, typeOverrides: [String: [NotificationChannel]]? = nil, mutedTypes: [NotificationType]? = nil, pushFrom: NotificationPreferencesInputPushFrom? = nil, quietHours: NotificationPreferencesInputQuietHours? = nil) {
         self.priorityChannels = priorityChannels
         self.typeOverrides = typeOverrides
         self.mutedTypes = mutedTypes
+        self.pushFrom = pushFrom
         self.quietHours = quietHours
     }
 
@@ -32710,6 +33934,7 @@ public struct NotificationPreferencesInput: Codable, Hashable, Sendable {
         case priorityChannels = "priority_channels"
         case typeOverrides = "type_overrides"
         case mutedTypes = "muted_types"
+        case pushFrom = "push_from"
         case quietHours = "quiet_hours"
     }
 }
@@ -32735,6 +33960,34 @@ public struct NotificationPreferencesInputPriorityChannels: Codable, Hashable, S
         case info = "info"
         case success = "success"
     }
+}
+
+/// Whose notifications are pushed to a phone or browser (`push` and `web_push`). `all` (the
+/// default; an omitted field on PUT stores `all`) pushes every agent's; `chief_only` pushes
+/// only those raised by the tenant's head agent (the Chief of Staff, `head_agent_id` on the
+/// tenant). Other notifications still land in the in-app list, and email and webhooks are
+/// unaffected; a notification no agent raised (budget, security, billing) keeps its push.
+/// Anything else is `422`.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct NotificationPreferencesInputPushFrom: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let chiefOnly = NotificationPreferencesInputPushFrom(rawValue: "chief_only")
+    public static let all = NotificationPreferencesInputPushFrom(rawValue: "all")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [NotificationPreferencesInputPushFrom] = [.chiefOnly, .all]
 }
 
 /// Window during which non-critical messages are suppressed; critical always bypasses. Set both
@@ -32899,16 +34152,27 @@ public struct NotificationSourceKind: RawRepresentable, Codable, Hashable, Senda
 }
 
 /// Where outbound notifications go. **Secrets never leave the server**: a webhook's signing
-/// secret is reported only as `has_signing_secret`, a device token only by its last four
-/// characters, and a Web Push endpoint only by host — the path carries a subscription
-/// identifier.
+/// secret is reported only as `has_signing_secret`, a device token (or a Live Activity token)
+/// only by its last four characters, and a Web Push endpoint only by host — the path carries a
+/// subscription identifier.
 public struct NotificationTarget: Codable, Hashable, Sendable {
     public var id: String
     public var tenantId: String
+    /// Company membership that registered this personal device. Derived from authentication, never
+    /// from the request body; absent on shared email/webhook destinations and legacy unowned
+    /// registrations.
+    public var ownerUserId: String?
+    /// Returned with owner_user_id only after the server has persisted a device's membership
+    /// binding. Clients must re-register cached subscriptions until a successful response
+    /// acknowledges version 1; older servers omit this field.
+    public var ownershipVersion: Int?
     public var channel: NotificationTargetChannel
     /// Operator's own label — “Slack #ops”, “iPhone 15”.
     public var label: String
-    /// A disabled target is kept for audit and skipped at fan-out.
+    /// Whether delivery is enabled and membership remains eligible. Legacy device registrations
+    /// without an identifiable owner are preserved but disabled after a member is removed or
+    /// suspended; sign in and re-register the existing token or endpoint to restore delivery.
+    /// Shared email/webhook destinations are unaffected.
     public var enabled: Bool
     public var createdAt: String
     /// Last success — the field that tells a dead webhook from a quiet one.
@@ -32916,9 +34180,11 @@ public struct NotificationTarget: Codable, Hashable, Sendable {
     public var lastError: String?
     public var config: JSONValue
 
-    public init(id: String, tenantId: String, channel: NotificationTargetChannel, label: String, enabled: Bool, createdAt: String, lastDeliveredAt: String? = nil, lastError: String? = nil, config: JSONValue) {
+    public init(id: String, tenantId: String, ownerUserId: String? = nil, ownershipVersion: Int? = nil, channel: NotificationTargetChannel, label: String, enabled: Bool, createdAt: String, lastDeliveredAt: String? = nil, lastError: String? = nil, config: JSONValue) {
         self.id = id
         self.tenantId = tenantId
+        self.ownerUserId = ownerUserId
+        self.ownershipVersion = ownershipVersion
         self.channel = channel
         self.label = label
         self.enabled = enabled
@@ -32931,6 +34197,8 @@ public struct NotificationTarget: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id = "id"
         case tenantId = "tenant_id"
+        case ownerUserId = "owner_user_id"
+        case ownershipVersion = "ownership_version"
         case channel = "channel"
         case label = "label"
         case enabled = "enabled"
@@ -32961,9 +34229,10 @@ public struct NotificationTargetChannel: RawRepresentable, Codable, Hashable, Se
     public static let webhook = NotificationTargetChannel(rawValue: "webhook")
     public static let push = NotificationTargetChannel(rawValue: "push")
     public static let webPush = NotificationTargetChannel(rawValue: "web_push")
+    public static let liveActivity = NotificationTargetChannel(rawValue: "live_activity")
 
     /// Every value the spec declared at generation time.
-    public static let knownValues: [NotificationTargetChannel] = [.email, .webhook, .push, .webPush]
+    public static let knownValues: [NotificationTargetChannel] = [.email, .webhook, .push, .webPush, .liveActivity]
 }
 
 /// `NotificationTargetConfigVariant1` model.
@@ -33163,6 +34432,57 @@ public struct NotificationTargetConfigVariant4kind: RawRepresentable, Codable, H
 
     /// Every value the spec declared at generation time.
     public static let knownValues: [NotificationTargetConfigVariant4kind] = [.webPush]
+}
+
+/// An iOS Live Activity push token (channel `live_activity`). The token itself is never
+/// returned.
+public struct NotificationTargetConfigVariant5: Codable, Hashable, Sendable {
+    public var kind: NotificationTargetConfigVariant5kind
+    /// The ActivityAttributes type name, e.g. `RunActivityAttributes`.
+    public var activityType: String
+    /// The run whose progress drives the activity; null when none was given.
+    public var runId: String?
+    public var deviceLabel: String?
+    /// Last four characters of the token, for visual identification only.
+    public var tokenSuffix: String
+
+    public init(kind: NotificationTargetConfigVariant5kind, activityType: String, runId: String? = nil, deviceLabel: String? = nil, tokenSuffix: String) {
+        self.kind = kind
+        self.activityType = activityType
+        self.runId = runId
+        self.deviceLabel = deviceLabel
+        self.tokenSuffix = tokenSuffix
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case activityType = "activity_type"
+        case runId = "run_id"
+        case deviceLabel = "device_label"
+        case tokenSuffix = "token_suffix"
+    }
+}
+
+/// `NotificationTargetConfigVariant5kind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct NotificationTargetConfigVariant5kind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let apnsLiveactivity = NotificationTargetConfigVariant5kind(rawValue: "apns_liveactivity")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [NotificationTargetConfigVariant5kind] = [.apnsLiveactivity]
 }
 
 /// Fine-grained event type. There are no coarse buckets on the server — a UI that groups events
@@ -33466,6 +34786,8 @@ public struct OAuthLoginProviderItemId: RawRepresentable, Codable, Hashable, Sen
 /// Response from GET /api/v1/auth/oauth/providers
 public struct OAuthLoginProvidersList: Codable, Hashable, Sendable {
     public var providers: [OAuthLoginProviderItem]
+    /// Null until the operator configures Google One Tap; the login page reads it to decide whether
+    /// to render the one-tap prompt at all.
     public var googleOneTapClientId: String?
 
     public init(providers: [OAuthLoginProviderItem], googleOneTapClientId: String? = nil) {
@@ -34282,13 +35604,23 @@ public struct PatchMeRequest: Codable, Hashable, Sendable {
     /// `/api/v1/files/<file_id>/content` of an image uploaded with `POST /files`, or `null` to
     /// clear.
     public var avatarURL: String?
+    /// BCP-47 tag with a 2–3 letter primary language (`uk`, `en-US`); stored canonicalised. `null`
+    /// clears.
+    public var interfaceLanguage: String?
+    /// An entry of `GET /voices`, as `{model, voice: <entry id>}`. `null` clears (the deployment
+    /// default applies).
+    public var chiefVoice: ChiefVoice?
 
-    public init(avatarURL: String? = nil) {
+    public init(avatarURL: String? = nil, interfaceLanguage: String? = nil, chiefVoice: ChiefVoice? = nil) {
         self.avatarURL = avatarURL
+        self.interfaceLanguage = interfaceLanguage
+        self.chiefVoice = chiefVoice
     }
 
     private enum CodingKeys: String, CodingKey {
         case avatarURL = "avatar_url"
+        case interfaceLanguage = "interface_language"
+        case chiefVoice = "chief_voice"
     }
 }
 
@@ -34316,14 +35648,18 @@ public struct PatchMeResponseUser: Codable, Hashable, Sendable {
     public var role: String
     public var status: String
     public var avatarURL: String?
+    public var interfaceLanguage: String?
+    public var chiefVoice: ChiefVoice?
 
-    public init(userId: String, email: String, name: String? = nil, role: String, status: String, avatarURL: String? = nil) {
+    public init(userId: String, email: String, name: String? = nil, role: String, status: String, avatarURL: String? = nil, interfaceLanguage: String? = nil, chiefVoice: ChiefVoice? = nil) {
         self.userId = userId
         self.email = email
         self.name = name
         self.role = role
         self.status = status
         self.avatarURL = avatarURL
+        self.interfaceLanguage = interfaceLanguage
+        self.chiefVoice = chiefVoice
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -34333,6 +35669,76 @@ public struct PatchMeResponseUser: Codable, Hashable, Sendable {
         case role = "role"
         case status = "status"
         case avatarURL = "avatar_url"
+        case interfaceLanguage = "interface_language"
+        case chiefVoice = "chief_voice"
+    }
+}
+
+/// `PatchSessionRequest` model.
+public struct PatchSessionRequest: Codable, Hashable, Sendable {
+    /// MERGED into the stored bag, not replaced — a key this body omits keeps its value, and a key
+    /// it names is overwritten. The platform writes its own keys here (`project_id`, `_public`,
+    /// `temporary`, `_todo_id`, the preview fields), which is why replace semantics would be wrong.
+    /// `project_id` files the chat under a project: it must name a project that exists and that the
+    /// caller may edit — otherwise 404 (403 for a private project shared with the caller
+    /// view-only); `null` takes the chat out. Because it merges, the limits are measured on the
+    /// RESULT and so accumulate across calls: at most 100 keys, at most 64 KiB of JSON, and at most
+    /// 8 levels of nesting. Past any of them the request is refused with 422 and a `detail` naming
+    /// the number reached. Remove keys you no longer need; this is a label bag, not content.
+    public var metadata: JSONObject?
+    /// true archives the session: `GET /sessions` leaves it out unless `?archived=true|all`, it
+    /// stays readable by id, and the next message sent to it unarchives it. false unarchives.
+    public var archived: Bool?
+    /// true pins the session for every client (`GET /sessions?pinned=true`); pinning again keeps
+    /// the first `pinned_at`. false unpins.
+    public var pinned: Bool?
+    /// The chat's name. Trimmed, then 1–80 characters (`422` otherwise); `null` clears it. Either
+    /// way `title_source` becomes `user`, and a generated title never replaces it. Stored on the
+    /// session, never in `metadata`; `updated_at` is left alone.
+    public var title: String?
+    /// Per-conversation model override. Send null to clear (revert to agent default), or {
+    /// provider, model_ref, endpoint_url?, capabilities? } to set. The runtime governance allowlist
+    /// is still enforced at run time.
+    public var modelOverride: PatchSessionRequestModelOverride?
+
+    public init(metadata: JSONObject? = nil, archived: Bool? = nil, pinned: Bool? = nil, title: String? = nil, modelOverride: PatchSessionRequestModelOverride? = nil) {
+        self.metadata = metadata
+        self.archived = archived
+        self.pinned = pinned
+        self.title = title
+        self.modelOverride = modelOverride
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case metadata = "metadata"
+        case archived = "archived"
+        case pinned = "pinned"
+        case title = "title"
+        case modelOverride = "model_override"
+    }
+}
+
+/// Per-conversation model override. Send null to clear (revert to agent default), or {
+/// provider, model_ref, endpoint_url?, capabilities? } to set. The runtime governance allowlist
+/// is still enforced at run time.
+public struct PatchSessionRequestModelOverride: Codable, Hashable, Sendable {
+    public var provider: String
+    public var modelRef: String
+    public var endpointURL: String?
+    public var capabilities: JSONObject?
+
+    public init(provider: String, modelRef: String, endpointURL: String? = nil, capabilities: JSONObject? = nil) {
+        self.provider = provider
+        self.modelRef = modelRef
+        self.endpointURL = endpointURL
+        self.capabilities = capabilities
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider = "provider"
+        case modelRef = "model_ref"
+        case endpointURL = "endpoint_url"
+        case capabilities = "capabilities"
     }
 }
 
@@ -35498,7 +36904,7 @@ public struct PlatformLLMDefaults: Codable, Hashable, Sendable {
     public var defaultEndpoint: String?
     /// Stored model half. May be bare (`minimax-m3`) or already provider-qualified
     /// (`ollama/glm-5.2`) — production holds both shapes. Dial `default_model_ref` instead of
-    /// joining this yourself.
+    /// joining this yourself. Null until the operator sets a platform default.
     public var defaultModel: String?
     public var defaultProvider: String?
     /// Stored model half of the fallback. A vendor path (`MiniMaxAI/MiniMax-M3`) carries a slash
@@ -35587,6 +36993,26 @@ public struct PlaygroundTemplate: Codable, Hashable, Sendable {
         case category = "category"
         case nodes = "nodes"
         case edges = "edges"
+    }
+}
+
+/// `PostQualificationUsageCorrectionRequest` model.
+public struct PostQualificationUsageCorrectionRequest: Codable, Hashable, Sendable {
+    public var runId: String
+    /// The candidate's company. Optional: found from the run's grant.
+    public var tenantId: String?
+    public var dryRun: Bool
+
+    public init(runId: String, tenantId: String? = nil, dryRun: Bool) {
+        self.runId = runId
+        self.tenantId = tenantId
+        self.dryRun = dryRun
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case tenantId = "tenant_id"
+        case dryRun = "dry_run"
     }
 }
 
@@ -37234,6 +38660,8 @@ public struct PublicPlan: Codable, Hashable, Sendable {
 public struct PublicPlanOverage: Codable, Hashable, Sendable {
     public var available: Bool?
     public var requiresCap: Bool?
+    /// Per-million prices; null when the default model's price or the markup multiplier is not
+    /// resolvable — the handler sends null rather than inventing a number.
     public var pricePerMillionUsd: PublicPlanOveragePricePerMillionUsd?
 
     public init(available: Bool? = nil, requiresCap: Bool? = nil, pricePerMillionUsd: PublicPlanOveragePricePerMillionUsd? = nil) {
@@ -37249,7 +38677,8 @@ public struct PublicPlanOverage: Codable, Hashable, Sendable {
     }
 }
 
-/// `PublicPlanOveragePricePerMillionUsd` model.
+/// Per-million prices; null when the default model's price or the markup multiplier is not
+/// resolvable — the handler sends null rather than inventing a number.
 public struct PublicPlanOveragePricePerMillionUsd: Codable, Hashable, Sendable {
     public var input: Double?
     public var output: Double?
@@ -38076,6 +39505,25 @@ public struct PutQualificationSponsorKeyRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// `PutQualificationSponsorKeyResponse` model.
+public struct PutQualificationSponsorKeyResponse: Codable, Hashable, Sendable {
+    public var keyId: String
+    public var tenantId: String
+    public var programs: [String]
+
+    public init(keyId: String, tenantId: String, programs: [String]) {
+        self.keyId = keyId
+        self.tenantId = tenantId
+        self.programs = programs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case keyId = "key_id"
+        case tenantId = "tenant_id"
+        case programs = "programs"
+    }
+}
+
 /// Prepared Nestor message only. No files or attachments. Source is untrusted data and must not
 /// become instructions.
 public struct QualificationAssessmentInputMessage: Codable, Hashable, Sendable {
@@ -38803,6 +40251,12 @@ public struct QualificationIncompletePolicyResponseReadiness: RawRepresentable, 
 
 /// One private managed binding per tenant/purpose; immutable applied version and template,
 /// independent of personal agent/version caps. Readback with candidate credential required.
+/// Template revision 3 (2026-10-19) tells the model that every citation's location is exactly
+/// `source` or `explanation`; whatever the prompt says, a qualification run whose final answer
+/// carries a citation (any array named `citations`, at any depth) with a `location` — or
+/// `field` — outside that enum, or none, fails with `error_code: OUTPUT_CONTRACT_VIOLATION` and
+/// no output: the answer is refused, never rewritten, and the sponsor is charged what the calls
+/// measured.
 public struct QualificationManagedEvaluator: Codable, Hashable, Sendable {
     public var agentId: String
     public var agentVersionId: String
@@ -38886,6 +40340,31 @@ public struct QualificationMissingPolicyResponse: Codable, Hashable, Sendable {
 }
 
 public typealias QualificationPositiveMicrousd = String
+
+/// `QualificationPricingRevision` model.
+public struct QualificationPricingRevision: Codable, Hashable, Sendable {
+    public var pricingRevision: String
+    public var provider: String
+    public var model: String
+    public var inputMicrousdPerMillionTokens: QualificationPositiveMicrousd
+    public var outputMicrousdPerMillionTokens: QualificationPositiveMicrousd
+
+    public init(pricingRevision: String, provider: String, model: String, inputMicrousdPerMillionTokens: QualificationPositiveMicrousd, outputMicrousdPerMillionTokens: QualificationPositiveMicrousd) {
+        self.pricingRevision = pricingRevision
+        self.provider = provider
+        self.model = model
+        self.inputMicrousdPerMillionTokens = inputMicrousdPerMillionTokens
+        self.outputMicrousdPerMillionTokens = outputMicrousdPerMillionTokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case pricingRevision = "pricing_revision"
+        case provider = "provider"
+        case model = "model"
+        case inputMicrousdPerMillionTokens = "input_microusd_per_million_tokens"
+        case outputMicrousdPerMillionTokens = "output_microusd_per_million_tokens"
+    }
+}
 
 /// Immutable operator-confirmed policy snapshot. Expiry must be after observation and at most
 /// 86400 seconds later. recovery_window_seconds is the minimum durable client request
@@ -39264,6 +40743,14 @@ public struct QualificationSponsoredLimits: Codable, Hashable, Sendable {
     public var maxDurationMs: JSONValue
     public var maxSteps: JSONValue
     public var maxToolCalls: JSONValue
+    /// Input + output tokens summed over every model call of the run (since 2026-10-19 enforced
+    /// before each call, not only between steps): each call's `max_tokens` is what the cap leaves
+    /// after the tokens measured or still reserved in the run's attempt ledger and an estimate of
+    /// the call's own input, and a call with nothing left is refused unsent (`error_code:
+    /// QUALIFICATION_BUDGET_STOP`, `error_details.max_tokens_per_run`). The input estimate counts
+    /// the conversation already measured at its measured tokens and only bytes added since at the
+    /// densest tokens-per-byte the run has shown (never below one per three bytes), so a tokenizer
+    /// denser than that on new text is the one way past the cap.
     public var maxTokensPerRun: JSONValue
     /// Legacy run DTO unit. Must convert exactly to integer micro-USD and be <= grant cap. No
     /// rounding up or silently raising the grant.
@@ -39571,6 +41058,134 @@ public struct QualificationUnverifiableExecutionReceiptV2executionOrigin: RawRep
 
     /// Every value the spec declared at generation time.
     public static let knownValues: [QualificationUnverifiableExecutionReceiptV2executionOrigin] = [.cloudRuntime, .bridge, .unknown]
+}
+
+/// `QualificationUsageCorrection` model.
+public struct QualificationUsageCorrection: Codable, Hashable, Sendable {
+    public var status: QualificationUsageCorrectionStatus
+    public var dryRun: Bool
+    /// Null for a dry run and for `nothing_recorded`; the same on every call once applied.
+    public var correctionId: String?
+    public var runId: String
+    public var candidateTenantId: String
+    public var grantId: String
+    public var settlementId: String?
+    /// When and where the run's usage was booked: `completed_at`, the UTC `period` (YYYY-MM) and
+    /// `date`, `agent_id`, `model_key`.
+    public var basis: JSONObject?
+    /// The amounts taken back: `input_tokens`, `output_tokens`, `thinking_tokens`, `runs_count`,
+    /// `tool_calls_count`, `storage_bytes`, `total_cost_usd`, `provider_cost_usd`, `budget_usd`.
+    public var reversal: JSONObject?
+    /// What the run touched that this correction leaves as it is, and why.
+    public var notReversed: [String]
+    public var before: QualificationUsageCorrectionBeforeVariant1?
+    public var after: QualificationUsageCorrectionAfterVariant1?
+    public var appliedAt: String?
+
+    public init(status: QualificationUsageCorrectionStatus, dryRun: Bool, correctionId: String? = nil, runId: String, candidateTenantId: String, grantId: String, settlementId: String? = nil, basis: JSONObject? = nil, reversal: JSONObject? = nil, notReversed: [String], before: QualificationUsageCorrectionBeforeVariant1? = nil, after: QualificationUsageCorrectionAfterVariant1? = nil, appliedAt: String? = nil) {
+        self.status = status
+        self.dryRun = dryRun
+        self.correctionId = correctionId
+        self.runId = runId
+        self.candidateTenantId = candidateTenantId
+        self.grantId = grantId
+        self.settlementId = settlementId
+        self.basis = basis
+        self.reversal = reversal
+        self.notReversed = notReversed
+        self.before = before
+        self.after = after
+        self.appliedAt = appliedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status = "status"
+        case dryRun = "dry_run"
+        case correctionId = "correction_id"
+        case runId = "run_id"
+        case candidateTenantId = "candidate_tenant_id"
+        case grantId = "grant_id"
+        case settlementId = "settlement_id"
+        case basis = "basis"
+        case reversal = "reversal"
+        case notReversed = "not_reversed"
+        case before = "before"
+        case after = "after"
+        case appliedAt = "applied_at"
+    }
+}
+
+/// The candidate's counters for the day and period the run ended in.
+public struct QualificationUsageCorrectionAfterVariant1: Codable, Hashable, Sendable {
+    public var monthly: JSONObject?
+    /// `remaining` is the daily share left that day (`limit` − input − output tokens), null without
+    /// a daily cap.
+    public var daily: JSONObject?
+    public var budget: JSONObject?
+    public var workspacesCounted: Int?
+
+    public init(monthly: JSONObject? = nil, daily: JSONObject? = nil, budget: JSONObject? = nil, workspacesCounted: Int? = nil) {
+        self.monthly = monthly
+        self.daily = daily
+        self.budget = budget
+        self.workspacesCounted = workspacesCounted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case monthly = "monthly"
+        case daily = "daily"
+        case budget = "budget"
+        case workspacesCounted = "workspaces_counted"
+    }
+}
+
+/// The candidate's counters for the day and period the run ended in.
+public struct QualificationUsageCorrectionBeforeVariant1: Codable, Hashable, Sendable {
+    public var monthly: JSONObject?
+    /// `remaining` is the daily share left that day (`limit` − input − output tokens), null without
+    /// a daily cap.
+    public var daily: JSONObject?
+    public var budget: JSONObject?
+    public var workspacesCounted: Int?
+
+    public init(monthly: JSONObject? = nil, daily: JSONObject? = nil, budget: JSONObject? = nil, workspacesCounted: Int? = nil) {
+        self.monthly = monthly
+        self.daily = daily
+        self.budget = budget
+        self.workspacesCounted = workspacesCounted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case monthly = "monthly"
+        case daily = "daily"
+        case budget = "budget"
+        case workspacesCounted = "workspaces_counted"
+    }
+}
+
+/// `QualificationUsageCorrectionStatus` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct QualificationUsageCorrectionStatus: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let planned = QualificationUsageCorrectionStatus(rawValue: "planned")
+    public static let applied = QualificationUsageCorrectionStatus(rawValue: "applied")
+    public static let alreadyApplied = QualificationUsageCorrectionStatus(rawValue: "already_applied")
+    public static let nothingRecorded = QualificationUsageCorrectionStatus(rawValue: "nothing_recorded")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [QualificationUsageCorrectionStatus] = [.planned, .applied, .alreadyApplied, .nothingRecorded]
 }
 
 /// Immutable runtime evidence, never model output. Hashes are RFC8785 JCS + SHA-256. profile
@@ -41037,6 +42652,38 @@ public struct ReplaceConstitutionRequest: Codable, Hashable, Sendable {
     }
 }
 
+/// `ReplaceMyRailAgentsRequest` model.
+public struct ReplaceMyRailAgentsRequest: Codable, Hashable, Sendable {
+    public var agentIds: [String]
+
+    public init(agentIds: [String]) {
+        self.agentIds = agentIds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentIds = "agent_ids"
+    }
+}
+
+/// `ReplaceMyRailAgentsResponse` model.
+public struct ReplaceMyRailAgentsResponse: Codable, Hashable, Sendable {
+    public var agentIds: [String]?
+    public var updatedAt: String?
+    public var dropped: [String]?
+
+    public init(agentIds: [String]? = nil, updatedAt: String? = nil, dropped: [String]? = nil) {
+        self.agentIds = agentIds
+        self.updatedAt = updatedAt
+        self.dropped = dropped
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentIds = "agent_ids"
+        case updatedAt = "updated_at"
+        case dropped = "dropped"
+    }
+}
+
 /// runtime/execution/replay-executor.ts ReplayResult. camelCase on the wire, unlike the rest of
 /// the API; `divergencePoint`, `divergenceReason` and `stepComparisons` (execute mode only) are
 /// conditional.
@@ -41723,6 +43370,245 @@ public struct ResumeRunResponse: Codable, Hashable, Sendable {
     }
 }
 
+/// `RetirePlatformAgentsRequest` model.
+public struct RetirePlatformAgentsRequest: Codable, Hashable, Sendable {
+    public var dryRun: Bool?
+    public var newHeadAgentId: String?
+
+    public init(dryRun: Bool? = nil, newHeadAgentId: String? = nil) {
+        self.dryRun = dryRun
+        self.newHeadAgentId = newHeadAgentId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case newHeadAgentId = "new_head_agent_id"
+    }
+}
+
+/// `RetirePlatformAgentsResponse` model.
+public struct RetirePlatformAgentsResponse: Codable, Hashable, Sendable {
+    public var dryRun: Bool
+    public var superAdminTenantId: String?
+    public var agents: [RetirePlatformAgentsResponseAgent]
+    public var registryKeys: [RetirePlatformAgentsResponseRegistryKey]
+    public var head: RetirePlatformAgentsResponseHead
+    public var untouched: [String]
+    public var applied: RetirePlatformAgentsResponseApplied?
+    public var errors: [RetirePlatformAgentsResponseError]
+
+    public init(dryRun: Bool, superAdminTenantId: String? = nil, agents: [RetirePlatformAgentsResponseAgent], registryKeys: [RetirePlatformAgentsResponseRegistryKey], head: RetirePlatformAgentsResponseHead, untouched: [String], applied: RetirePlatformAgentsResponseApplied? = nil, errors: [RetirePlatformAgentsResponseError]) {
+        self.dryRun = dryRun
+        self.superAdminTenantId = superAdminTenantId
+        self.agents = agents
+        self.registryKeys = registryKeys
+        self.head = head
+        self.untouched = untouched
+        self.applied = applied
+        self.errors = errors
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case dryRun = "dry_run"
+        case superAdminTenantId = "super_admin_tenant_id"
+        case agents = "agents"
+        case registryKeys = "registry_keys"
+        case head = "head"
+        case untouched = "untouched"
+        case applied = "applied"
+        case errors = "errors"
+    }
+}
+
+/// `RetirePlatformAgentsResponseAgent` model.
+public struct RetirePlatformAgentsResponseAgent: Codable, Hashable, Sendable {
+    public var tenantId: String
+    public var agentId: String
+    public var name: String?
+    public var kind: RetirePlatformAgentsResponseAgentKind
+    public var foundBy: [RetirePlatformAgentsResponseAgentFoundByItem]
+    public var record: Bool
+    public var schedule: Bool
+    public var permissionSet: Bool
+    public var isHead: Bool
+
+    public init(tenantId: String, agentId: String, name: String? = nil, kind: RetirePlatformAgentsResponseAgentKind, foundBy: [RetirePlatformAgentsResponseAgentFoundByItem], record: Bool, schedule: Bool, permissionSet: Bool, isHead: Bool) {
+        self.tenantId = tenantId
+        self.agentId = agentId
+        self.name = name
+        self.kind = kind
+        self.foundBy = foundBy
+        self.record = record
+        self.schedule = schedule
+        self.permissionSet = permissionSet
+        self.isHead = isHead
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tenantId = "tenant_id"
+        case agentId = "agent_id"
+        case name = "name"
+        case kind = "kind"
+        case foundBy = "found_by"
+        case record = "record"
+        case schedule = "schedule"
+        case permissionSet = "permission_set"
+        case isHead = "is_head"
+    }
+}
+
+/// `RetirePlatformAgentsResponseAgentFoundByItem` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RetirePlatformAgentsResponseAgentFoundByItem: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let registryPointer = RetirePlatformAgentsResponseAgentFoundByItem(rawValue: "registry_pointer")
+    public static let metadataMarker = RetirePlatformAgentsResponseAgentFoundByItem(rawValue: "metadata_marker")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RetirePlatformAgentsResponseAgentFoundByItem] = [.registryPointer, .metadataMarker]
+}
+
+/// `RetirePlatformAgentsResponseAgentKind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RetirePlatformAgentsResponseAgentKind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let superAgent = RetirePlatformAgentsResponseAgentKind(rawValue: "super_agent")
+    public static let serverAgent = RetirePlatformAgentsResponseAgentKind(rawValue: "server_agent")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RetirePlatformAgentsResponseAgentKind] = [.superAgent, .serverAgent]
+}
+
+/// `RetirePlatformAgentsResponseApplied` model.
+public struct RetirePlatformAgentsResponseApplied: Codable, Hashable, Sendable {
+    public var agentsDeleted: Int?
+    public var schedulesRemoved: Int?
+    public var permissionSetsDeleted: Int?
+    public var registryKeysDeleted: Int?
+    public var headAgentId: String?
+    public var auditEntryIds: [String]?
+
+    public init(agentsDeleted: Int? = nil, schedulesRemoved: Int? = nil, permissionSetsDeleted: Int? = nil, registryKeysDeleted: Int? = nil, headAgentId: String? = nil, auditEntryIds: [String]? = nil) {
+        self.agentsDeleted = agentsDeleted
+        self.schedulesRemoved = schedulesRemoved
+        self.permissionSetsDeleted = permissionSetsDeleted
+        self.registryKeysDeleted = registryKeysDeleted
+        self.headAgentId = headAgentId
+        self.auditEntryIds = auditEntryIds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentsDeleted = "agents_deleted"
+        case schedulesRemoved = "schedules_removed"
+        case permissionSetsDeleted = "permission_sets_deleted"
+        case registryKeysDeleted = "registry_keys_deleted"
+        case headAgentId = "head_agent_id"
+        case auditEntryIds = "audit_entry_ids"
+    }
+}
+
+/// `RetirePlatformAgentsResponseError` model.
+public struct RetirePlatformAgentsResponseError: Codable, Hashable, Sendable {
+    public var agentId: String?
+    public var error: String?
+
+    public init(agentId: String? = nil, error: String? = nil) {
+        self.agentId = agentId
+        self.error = error
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
+        case error = "error"
+    }
+}
+
+/// `RetirePlatformAgentsResponseHead` model.
+public struct RetirePlatformAgentsResponseHead: Codable, Hashable, Sendable {
+    public var headAgentId: String?
+    public var isPlatformAgent: Bool
+    public var action: RetirePlatformAgentsResponseHeadAction
+    public var newHeadAgentId: String?
+
+    public init(headAgentId: String? = nil, isPlatformAgent: Bool, action: RetirePlatformAgentsResponseHeadAction, newHeadAgentId: String? = nil) {
+        self.headAgentId = headAgentId
+        self.isPlatformAgent = isPlatformAgent
+        self.action = action
+        self.newHeadAgentId = newHeadAgentId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case headAgentId = "head_agent_id"
+        case isPlatformAgent = "is_platform_agent"
+        case action = "action"
+        case newHeadAgentId = "new_head_agent_id"
+    }
+}
+
+/// `RetirePlatformAgentsResponseHeadAction` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RetirePlatformAgentsResponseHeadAction: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let keep = RetirePlatformAgentsResponseHeadAction(rawValue: "keep")
+    public static let rebind = RetirePlatformAgentsResponseHeadAction(rawValue: "rebind")
+    public static let provisionChief = RetirePlatformAgentsResponseHeadAction(rawValue: "provision_chief")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RetirePlatformAgentsResponseHeadAction] = [.keep, .rebind, .provisionChief]
+}
+
+/// `RetirePlatformAgentsResponseRegistryKey` model.
+public struct RetirePlatformAgentsResponseRegistryKey: Codable, Hashable, Sendable {
+    public var key: [String]
+    public var value: String
+
+    public init(key: [String], value: String) {
+        self.key = key
+        self.value = value
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case key = "key"
+        case value = "value"
+    }
+}
+
 /// `RetryPublicVideoOrderResponse` model.
 public struct RetryPublicVideoOrderResponse: Codable, Hashable, Sendable {
     public var id: String
@@ -41907,6 +43793,71 @@ public struct RetryPublicVideoOrderResponseVideo: Codable, Hashable, Sendable {
     }
 }
 
+/// An `Anchor` with two optional fields more: `target`, what the place is on (default: the
+/// reviewed run's own answer), and `note`, what to change there. The same rules as `Anchor`
+/// apply — every kind is a closed object and a coordinate that does not fit is refused with
+/// `422`.
+public typealias ReviewAnchor = JSONValue
+
+/// `CodeAnchor` plus `target` and `note`.
+public struct ReviewCodeAnchor: Codable, Hashable, Sendable {
+    public var kind: CodeAnchorKind
+    public var path: String?
+    public var lineStart: Int
+    public var lineEnd: Int
+    public var target: AnchorTarget?
+    public var note: String?
+
+    public init(kind: CodeAnchorKind, path: String? = nil, lineStart: Int, lineEnd: Int, target: AnchorTarget? = nil, note: String? = nil) {
+        self.kind = kind
+        self.path = path
+        self.lineStart = lineStart
+        self.lineEnd = lineEnd
+        self.target = target
+        self.note = note
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case path = "path"
+        case lineStart = "line_start"
+        case lineEnd = "line_end"
+        case target = "target"
+        case note = "note"
+    }
+}
+
+/// `ImageAnchor` plus `target` and `note`.
+public struct ReviewImageAnchor: Codable, Hashable, Sendable {
+    public var kind: ImageAnchorKind
+    public var x: Double
+    public var y: Double
+    public var w: Double?
+    public var h: Double?
+    public var target: AnchorTarget?
+    public var note: String?
+
+    public init(kind: ImageAnchorKind, x: Double, y: Double, w: Double? = nil, h: Double? = nil, target: AnchorTarget? = nil, note: String? = nil) {
+        self.kind = kind
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.target = target
+        self.note = note
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case x = "x"
+        case y = "y"
+        case w = "w"
+        case h = "h"
+        case target = "target"
+        case note = "note"
+    }
+}
+
 /// `ReviewMissionObjectiveRequest` model.
 public struct ReviewMissionObjectiveRequest: Codable, Hashable, Sendable {
     public var decision: ObjectiveReviewDecision
@@ -41921,6 +43872,56 @@ public struct ReviewMissionObjectiveRequest: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case decision = "decision"
         case feedback = "feedback"
+    }
+}
+
+/// `ReviewRunRequest` model.
+public struct ReviewRunRequest: Codable, Hashable, Sendable {
+    public var verdict: RunReviewVerdict
+    /// What the person says about the result. On `redo`, what to change; required unless `anchors`
+    /// says it.
+    public var comment: String?
+    /// The places in the result the comment is about.
+    public var anchors: [ReviewAnchor]?
+
+    public init(verdict: RunReviewVerdict, comment: String? = nil, anchors: [ReviewAnchor]? = nil) {
+        self.verdict = verdict
+        self.comment = comment
+        self.anchors = anchors
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case verdict = "verdict"
+        case comment = "comment"
+        case anchors = "anchors"
+    }
+}
+
+/// `TextAnchor` plus `target` and `note`.
+public struct ReviewTextAnchor: Codable, Hashable, Sendable {
+    public var kind: TextAnchorKind
+    public var quote: String
+    public var start: Int
+    public var end: Int
+    public var target: AnchorTarget?
+    public var note: String?
+
+    public init(kind: TextAnchorKind, quote: String, start: Int, end: Int, target: AnchorTarget? = nil, note: String? = nil) {
+        self.kind = kind
+        self.quote = quote
+        self.start = start
+        self.end = end
+        self.target = target
+        self.note = note
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case quote = "quote"
+        case start = "start"
+        case end = "end"
+        case target = "target"
+        case note = "note"
     }
 }
 
@@ -42226,6 +44227,10 @@ public struct Run: Codable, Hashable, Sendable {
     /// run never waited for one. Recorded since 2026-09-22; before that an approved call left no
     /// trace on the run.
     public var approvals: [RunApproval]?
+    /// The latest person's verdict on this run's RESULT (`POST /runs/{runId}/review`, since
+    /// 2026-10-19) — not a tool approval, which is `approvals`. Absent until the result is
+    /// reviewed. The full record, with the comment and anchors, is `GET /runs/{runId}/review`.
+    public var review: RunReview2?
     public var createdAt: String
     public var startedAt: String?
     public var completedAt: String?
@@ -42240,7 +44245,7 @@ public struct Run: Codable, Hashable, Sendable {
     /// Resource limits for the run
     public var resourceLimits: RunResourceLimits?
 
-    public init(executionRequirements: QualificationExecutionRequirementsV2? = nil, recoveryExpiresAtUnix: Int? = nil, sponsorshipGrantId: String? = nil, executionMode: RunExecutionMode? = nil, runId: String, tenantId: String, agentId: String, sessionId: String? = nil, status: RunStatus, input: JSONObject? = nil, output: RunOutput? = nil, metrics: RunMetrics? = nil, error: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil, approvals: [RunApproval]? = nil, createdAt: String, startedAt: String? = nil, completedAt: String? = nil, teamRunId: String? = nil, metadata: JSONObject? = nil, stepSeq: Int? = nil, artifacts: [Artifact]? = nil, resourceLimits: RunResourceLimits? = nil) {
+    public init(executionRequirements: QualificationExecutionRequirementsV2? = nil, recoveryExpiresAtUnix: Int? = nil, sponsorshipGrantId: String? = nil, executionMode: RunExecutionMode? = nil, runId: String, tenantId: String, agentId: String, sessionId: String? = nil, status: RunStatus, input: JSONObject? = nil, output: RunOutput? = nil, metrics: RunMetrics? = nil, error: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil, approvals: [RunApproval]? = nil, review: RunReview2? = nil, createdAt: String, startedAt: String? = nil, completedAt: String? = nil, teamRunId: String? = nil, metadata: JSONObject? = nil, stepSeq: Int? = nil, artifacts: [Artifact]? = nil, resourceLimits: RunResourceLimits? = nil) {
         self.executionRequirements = executionRequirements
         self.recoveryExpiresAtUnix = recoveryExpiresAtUnix
         self.sponsorshipGrantId = sponsorshipGrantId
@@ -42257,6 +44262,7 @@ public struct Run: Codable, Hashable, Sendable {
         self.errorCode = errorCode
         self.errorDetails = errorDetails
         self.approvals = approvals
+        self.review = review
         self.createdAt = createdAt
         self.startedAt = startedAt
         self.completedAt = completedAt
@@ -42284,6 +44290,7 @@ public struct Run: Codable, Hashable, Sendable {
         case errorCode = "error_code"
         case errorDetails = "error_details"
         case approvals = "approvals"
+        case review = "review"
         case createdAt = "created_at"
         case startedAt = "started_at"
         case completedAt = "completed_at"
@@ -43022,6 +45029,2564 @@ public struct RunEventType: RawRepresentable, Codable, Hashable, Sendable, Expre
     public static let knownValues: [RunEventType] = [.runCreated, .runStarted, .runCompleted, .runFailed, .runCancelled, .runTimeout, .runGuardrailBlocked, .runAwaitingApproval, .runAwaitingInput, .runInputReceived, .runApproved, .runRejected, .runCheckpoint, .runPaused, .runResumed, .runRestored, .runAffect, .llmRequest, .llmResponse, .llmError, .llmThinking, .llmChunk, .llmTimeout, .llmFallback, .stepPlan, .stepAct, .stepEvaluate, .stepThinking, .toolCall, .toolResult, .toolError, .toolTimeout, .guardrailCheck, .guardrailViolation, .guardrailCustomCheck, .guardrailCustomViolation, .memoryRetrieval, .memoryExtraction, .memoryStored, .memoryEvicted, .sessionContextCompacted, .sessionContext, .sessionCreated, .sessionClosed, .teamMessage, .teamRoundStart, .teamRoundEnd, .teamDelegate, .teamBroadcast, .teamMerge, .teamHandoff, .childRunCompleted, .childRunFailed, .initiativeTickStart, .initiativeTickEnd, .initiativePaused, .initiativeResumed, .initiativeBudgetUpdated, .initiativeEscalation, .initiativeObjectiveUpdated, .circuitBreakerOpened, .circuitBreakerClosed, .circuitBreakerHalfOpen, .streamingStarted, .streamingCompleted, .streamingError, .streamingBufferTruncated, .runStepStarted, .runStepCompleted, .budgetSoftThresholdCrossed, .budgetHardLimitReached, .tenantCreated, .tenantSuspended, .tenantPurged, .configUpdated, .webhookDelivered, .webhookFailed, .cronFired, .agentVersionCreated, .agentRollback, .mcpServerLog, .orchestrationStarted, .orchestrationPlanned, .orchestrationReplanned, .orchestrationTaskStarted, .orchestrationTaskCompleted, .orchestrationTaskFailed, .orchestrationCheckpoint, .orchestrationPolicyViolation, .orchestrationQualityReport, .orchestrationCompleted, .orchestrationFailed, .graphAgentSpawned, .graphAgentTerminated, .graphTaskDelegated, .graphEdgeAdded, .graphEdgeRemoved, .planCreated, .planUpdated, .planSubGoalCompleted, .planSubGoalAbandoned, .mcpToolCalled, .mcpServerConnected, .mcpServerDisconnected, .a2aTaskSent, .a2aTaskReceived, .memoryCompressed, .capabilityBestAgentSelected, .identityCreated, .identityRotated, .messageSigned, .messageVerified, .messageReplayBlocked, .constitutionBootstrapped, .constitutionAmended, .constitutionCheckPassed, .constitutionCheckBlocked, .constitutionViolation, .ledgerAppended, .ledgerIntegrityChecked, .permissionChecked, .permissionDenied, .permissionSpawnBlocked, .attestationCreated, .attestationVerified, .attestationInvalid, .arbitrationCaseOpened, .arbitrationRulingSubmitted, .arbitrationAppealFiled, .votingProposalCreated, .votingBallotCast, .votingTallied, .votingVetoed, .resourceSpent, .resourceEarned, .resourceTransferred, .resourceInsufficient, .ambassadorVetoIssued, .ambassadorRequestSubmitted, .builderDesignSubmitted, .builderDesignApproved, .builderDesignSpawned, .emergencySafeModeActivated, .emergencySafeModeDeactivated, .emergencyDeadlockDetected, .goalSelfFormulated, .goalApproved, .improvementProposed, .improvementSandboxTested, .improvementApplied, .collectiveInsightPublished, .collectiveInsightsRetrieved, .collectiveReviewRequested, .collectivePollCreated, .collectiveAgentRated, .collectiveFeedbackRequested, .collectiveReflectionCompleted, .collectiveApproachesCompared, .collectiveLessonLogged, .collectiveTeamFormed, .collectiveTeamJoined, .collectiveTeamLeft, .collectiveTeamBroadcast, .collectiveSpecialistRequested, .collectiveBudgetRequested, .collectiveTokensTransferred, .collectiveTaskPosted, .collectiveBidPlaced, .collectiveBidAccepted, .collectiveCostReported, .sensorURLWatchCreated, .sensorRssWatchCreated, .sensorWebhookListenerCreated, .sensorCheckScheduled, .sensorEventSubscriptionCreated, .sensorTriggered, .collectiveReportPresented, .collectiveEscalation, .collectiveAnomalyReported, .collectiveHumanOverride, .collectiveCollectivePaused, .collectiveVerificationRequested, .strategyCreated, .strategyKpiUpdated, .documentEditStart, .documentEditChunk, .documentEditComplete]
 }
 
+/// A run event as `event_schema=1` sends it, on GET /runs/{runId}/events and GET
+/// /sessions/{sessionId}/events. Closed: a strict parser may refuse any field or value not
+/// declared here, because none is ever sent. A type this version does not list is not sent to a
+/// v1 client, and neither is an event whose discriminant value (`chunk_type`, `topology`, …)
+/// the version does not list. Bridge runs arrive in the native shape.
+public typealias RunEventV1 = JSONValue
+
+/// `RunEventV1ChildRunCompleted` model.
+public struct RunEventV1ChildRunCompleted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1ChildRunCompletedType
+    public var seq: Int
+    public var payload: RunEventV1ChildRunCompletedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1ChildRunCompletedType, seq: Int, payload: RunEventV1ChildRunCompletedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1ChildRunCompletedPayload` model.
+public struct RunEventV1ChildRunCompletedPayload: Codable, Hashable, Sendable {
+    public var childRunId: String
+    public var agentId: String
+    public var agentName: String?
+    public var status: String
+    public var outputPreview: String?
+    public var durationMs: Int?
+    public var executionMode: String?
+    public var costUsd: Double?
+
+    public init(childRunId: String, agentId: String, agentName: String? = nil, status: String, outputPreview: String? = nil, durationMs: Int? = nil, executionMode: String? = nil, costUsd: Double? = nil) {
+        self.childRunId = childRunId
+        self.agentId = agentId
+        self.agentName = agentName
+        self.status = status
+        self.outputPreview = outputPreview
+        self.durationMs = durationMs
+        self.executionMode = executionMode
+        self.costUsd = costUsd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case childRunId = "child_run_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case status = "status"
+        case outputPreview = "output_preview"
+        case durationMs = "duration_ms"
+        case executionMode = "execution_mode"
+        case costUsd = "cost_usd"
+    }
+}
+
+/// `RunEventV1ChildRunCompletedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1ChildRunCompletedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let childRunCompleted = RunEventV1ChildRunCompletedType(rawValue: "child_run.completed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1ChildRunCompletedType] = [.childRunCompleted]
+}
+
+/// `RunEventV1ChildRunFailed` model.
+public struct RunEventV1ChildRunFailed: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1ChildRunFailedType
+    public var seq: Int
+    public var payload: RunEventV1ChildRunFailedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1ChildRunFailedType, seq: Int, payload: RunEventV1ChildRunFailedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1ChildRunFailedPayload` model.
+public struct RunEventV1ChildRunFailedPayload: Codable, Hashable, Sendable {
+    public var childRunId: String
+    public var agentId: String
+    public var agentName: String?
+    public var status: String
+    public var error: String?
+    public var executionMode: String?
+
+    public init(childRunId: String, agentId: String, agentName: String? = nil, status: String, error: String? = nil, executionMode: String? = nil) {
+        self.childRunId = childRunId
+        self.agentId = agentId
+        self.agentName = agentName
+        self.status = status
+        self.error = error
+        self.executionMode = executionMode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case childRunId = "child_run_id"
+        case agentId = "agent_id"
+        case agentName = "agent_name"
+        case status = "status"
+        case error = "error"
+        case executionMode = "execution_mode"
+    }
+}
+
+/// `RunEventV1ChildRunFailedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1ChildRunFailedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let childRunFailed = RunEventV1ChildRunFailedType(rawValue: "child_run.failed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1ChildRunFailedType] = [.childRunFailed]
+}
+
+/// `RunEventV1LLMChunk` model.
+public struct RunEventV1LLMChunk: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1LLMChunkType
+    public var seq: Int
+    public var payload: RunEventV1LLMChunkPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1LLMChunkType, seq: Int, payload: RunEventV1LLMChunkPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1LLMChunkPayload` model.
+public struct RunEventV1LLMChunkPayload: Codable, Hashable, Sendable {
+    public var chunkType: RunEventV1LLMChunkPayloadChunkType
+    public var delta: String
+    public var index: Int?
+
+    public init(chunkType: RunEventV1LLMChunkPayloadChunkType, delta: String, index: Int? = nil) {
+        self.chunkType = chunkType
+        self.delta = delta
+        self.index = index
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case chunkType = "chunk_type"
+        case delta = "delta"
+        case index = "index"
+    }
+}
+
+/// `RunEventV1LLMChunkPayloadChunkType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1LLMChunkPayloadChunkType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let content = RunEventV1LLMChunkPayloadChunkType(rawValue: "content")
+    public static let thinking = RunEventV1LLMChunkPayloadChunkType(rawValue: "thinking")
+    public static let toolCall = RunEventV1LLMChunkPayloadChunkType(rawValue: "tool_call")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1LLMChunkPayloadChunkType] = [.content, .thinking, .toolCall]
+}
+
+/// `RunEventV1LLMChunkType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1LLMChunkType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let llmChunk = RunEventV1LLMChunkType(rawValue: "llm.chunk")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1LLMChunkType] = [.llmChunk]
+}
+
+/// `RunEventV1LLMError` model.
+public struct RunEventV1LLMError: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1LLMErrorType
+    public var seq: Int
+    public var payload: RunEventV1LLMErrorPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1LLMErrorType, seq: Int, payload: RunEventV1LLMErrorPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1LLMErrorPayload` model.
+public struct RunEventV1LLMErrorPayload: Codable, Hashable, Sendable {
+    public var error: String
+    public var chunksBeforeError: Int?
+
+    public init(error: String, chunksBeforeError: Int? = nil) {
+        self.error = error
+        self.chunksBeforeError = chunksBeforeError
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case chunksBeforeError = "chunks_before_error"
+    }
+}
+
+/// `RunEventV1LLMErrorType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1LLMErrorType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let llmError = RunEventV1LLMErrorType(rawValue: "llm.error")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1LLMErrorType] = [.llmError]
+}
+
+/// `RunEventV1RunAwaitingApproval` model.
+public struct RunEventV1RunAwaitingApproval: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunAwaitingApprovalType
+    public var seq: Int
+    public var payload: RunEventV1RunAwaitingApprovalPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunAwaitingApprovalType, seq: Int, payload: RunEventV1RunAwaitingApprovalPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunAwaitingApprovalPayload` model.
+public struct RunEventV1RunAwaitingApprovalPayload: Codable, Hashable, Sendable {
+    public var toolCalls: [RunEventV1RunAwaitingApprovalPayloadToolCall]
+
+    public init(toolCalls: [RunEventV1RunAwaitingApprovalPayloadToolCall]) {
+        self.toolCalls = toolCalls
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toolCalls = "tool_calls"
+    }
+}
+
+/// `RunEventV1RunAwaitingApprovalPayloadToolCall` model.
+public struct RunEventV1RunAwaitingApprovalPayloadToolCall: Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String
+    public var args: JSONObject
+    public var options: [String]?
+    public var kind: String?
+
+    public init(id: String, name: String, args: JSONObject, options: [String]? = nil, kind: String? = nil) {
+        self.id = id
+        self.name = name
+        self.args = args
+        self.options = options
+        self.kind = kind
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "id"
+        case name = "name"
+        case args = "args"
+        case options = "options"
+        case kind = "kind"
+    }
+}
+
+/// `RunEventV1RunAwaitingApprovalType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunAwaitingApprovalType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runAwaitingApproval = RunEventV1RunAwaitingApprovalType(rawValue: "run.awaiting_approval")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunAwaitingApprovalType] = [.runAwaitingApproval]
+}
+
+/// `RunEventV1RunAwaitingInput` model.
+public struct RunEventV1RunAwaitingInput: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunAwaitingInputType
+    public var seq: Int
+    public var payload: RunEventV1RunAwaitingInputPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunAwaitingInputType, seq: Int, payload: RunEventV1RunAwaitingInputPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunAwaitingInputPayload` model.
+public struct RunEventV1RunAwaitingInputPayload: Codable, Hashable, Sendable {
+    public var toolCallId: String
+    public var question: String?
+    public var options: [String]?
+    public var context: String?
+    public var toolName: String?
+    public var arguments: JSONObject?
+
+    public init(toolCallId: String, question: String? = nil, options: [String]? = nil, context: String? = nil, toolName: String? = nil, arguments: JSONObject? = nil) {
+        self.toolCallId = toolCallId
+        self.question = question
+        self.options = options
+        self.context = context
+        self.toolName = toolName
+        self.arguments = arguments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toolCallId = "tool_call_id"
+        case question = "question"
+        case options = "options"
+        case context = "context"
+        case toolName = "tool_name"
+        case arguments = "arguments"
+    }
+}
+
+/// `RunEventV1RunAwaitingInputType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunAwaitingInputType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runAwaitingInput = RunEventV1RunAwaitingInputType(rawValue: "run.awaiting_input")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunAwaitingInputType] = [.runAwaitingInput]
+}
+
+/// `RunEventV1RunCancelled` model.
+public struct RunEventV1RunCancelled: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunCancelledType
+    public var seq: Int
+    public var payload: RunEventV1RunCancelledPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunCancelledType, seq: Int, payload: RunEventV1RunCancelledPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunCancelledPayload` model.
+public struct RunEventV1RunCancelledPayload: Codable, Hashable, Sendable {
+    public var error: String?
+    public var errorCode: String?
+    public var errorDetails: JSONObject?
+    public var message: String?
+    public var reason: String?
+    public var endReason: String?
+    public var source: String?
+    public var rejected: Bool?
+    public var previousStatus: String?
+    public var teamRunId: String?
+    public var was: String?
+
+    public init(error: String? = nil, errorCode: String? = nil, errorDetails: JSONObject? = nil, message: String? = nil, reason: String? = nil, endReason: String? = nil, source: String? = nil, rejected: Bool? = nil, previousStatus: String? = nil, teamRunId: String? = nil, was: String? = nil) {
+        self.error = error
+        self.errorCode = errorCode
+        self.errorDetails = errorDetails
+        self.message = message
+        self.reason = reason
+        self.endReason = endReason
+        self.source = source
+        self.rejected = rejected
+        self.previousStatus = previousStatus
+        self.teamRunId = teamRunId
+        self.was = was
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case errorCode = "error_code"
+        case errorDetails = "error_details"
+        case message = "message"
+        case reason = "reason"
+        case endReason = "end_reason"
+        case source = "source"
+        case rejected = "rejected"
+        case previousStatus = "previous_status"
+        case teamRunId = "team_run_id"
+        case was = "was"
+    }
+}
+
+/// `RunEventV1RunCancelledType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunCancelledType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runCancelled = RunEventV1RunCancelledType(rawValue: "run.cancelled")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunCancelledType] = [.runCancelled]
+}
+
+/// `RunEventV1RunCompleted` model.
+public struct RunEventV1RunCompleted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunCompletedType
+    public var seq: Int
+    public var payload: RunEventV1RunCompletedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunCompletedType, seq: Int, payload: RunEventV1RunCompletedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunCompletedPayload` model.
+public struct RunEventV1RunCompletedPayload: Codable, Hashable, Sendable {
+    public var status: RunEventV1RunCompletedPayloadStatus
+    public var output: JSONObject
+    public var metrics: RunEventV1RunCompletedPayloadMetrics?
+    public var costUsd: Double?
+
+    public init(status: RunEventV1RunCompletedPayloadStatus, output: JSONObject, metrics: RunEventV1RunCompletedPayloadMetrics? = nil, costUsd: Double? = nil) {
+        self.status = status
+        self.output = output
+        self.metrics = metrics
+        self.costUsd = costUsd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status = "status"
+        case output = "output"
+        case metrics = "metrics"
+        case costUsd = "cost_usd"
+    }
+}
+
+/// `RunEventV1RunCompletedPayloadMetrics` model.
+public struct RunEventV1RunCompletedPayloadMetrics: Codable, Hashable, Sendable {
+    public var durationMs: Int?
+    public var stepsCount: Int?
+    public var inputTokens: Int?
+    public var outputTokens: Int?
+    public var thinkingTokens: Int?
+    public var cachedTokens: Int?
+    public var toolCallsCount: Int?
+    public var llmCallsCount: Int?
+    public var guardrailChecks: Int?
+    public var guardrailViolations: Int?
+    public var memoryRetrievals: Int?
+    public var memoryExtractions: Int?
+    public var totalCostUsd: Double?
+    public var fallbackUsed: Bool?
+    public var pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence?
+    public var costAttribution: RunMetricsCostAttribution?
+    public var filesModified: Int?
+    public var commandsExecuted: Int?
+
+    public init(durationMs: Int? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil, fallbackUsed: Bool? = nil, pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence? = nil, costAttribution: RunMetricsCostAttribution? = nil, filesModified: Int? = nil, commandsExecuted: Int? = nil) {
+        self.durationMs = durationMs
+        self.stepsCount = stepsCount
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.thinkingTokens = thinkingTokens
+        self.cachedTokens = cachedTokens
+        self.toolCallsCount = toolCallsCount
+        self.llmCallsCount = llmCallsCount
+        self.guardrailChecks = guardrailChecks
+        self.guardrailViolations = guardrailViolations
+        self.memoryRetrievals = memoryRetrievals
+        self.memoryExtractions = memoryExtractions
+        self.totalCostUsd = totalCostUsd
+        self.fallbackUsed = fallbackUsed
+        self.pricingConfidence = pricingConfidence
+        self.costAttribution = costAttribution
+        self.filesModified = filesModified
+        self.commandsExecuted = commandsExecuted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case durationMs = "duration_ms"
+        case stepsCount = "steps_count"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case thinkingTokens = "thinking_tokens"
+        case cachedTokens = "cached_tokens"
+        case toolCallsCount = "tool_calls_count"
+        case llmCallsCount = "llm_calls_count"
+        case guardrailChecks = "guardrail_checks"
+        case guardrailViolations = "guardrail_violations"
+        case memoryRetrievals = "memory_retrievals"
+        case memoryExtractions = "memory_extractions"
+        case totalCostUsd = "total_cost_usd"
+        case fallbackUsed = "fallback_used"
+        case pricingConfidence = "pricing_confidence"
+        case costAttribution = "cost_attribution"
+        case filesModified = "files_modified"
+        case commandsExecuted = "commands_executed"
+    }
+}
+
+/// `RunEventV1RunCompletedPayloadMetricsPricingConfidence` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunCompletedPayloadMetricsPricingConfidence: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let known = RunEventV1RunCompletedPayloadMetricsPricingConfidence(rawValue: "known")
+    public static let inferred = RunEventV1RunCompletedPayloadMetricsPricingConfidence(rawValue: "inferred")
+    public static let fallback = RunEventV1RunCompletedPayloadMetricsPricingConfidence(rawValue: "fallback")
+    public static let unknown = RunEventV1RunCompletedPayloadMetricsPricingConfidence(rawValue: "unknown")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunCompletedPayloadMetricsPricingConfidence] = [.known, .inferred, .fallback, .unknown]
+}
+
+/// `RunEventV1RunCompletedPayloadStatus` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunCompletedPayloadStatus: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let completed = RunEventV1RunCompletedPayloadStatus(rawValue: "completed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunCompletedPayloadStatus] = [.completed]
+}
+
+/// `RunEventV1RunCompletedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunCompletedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runCompleted = RunEventV1RunCompletedType(rawValue: "run.completed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunCompletedType] = [.runCompleted]
+}
+
+/// `RunEventV1RunFailed` model.
+public struct RunEventV1RunFailed: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunFailedType
+    public var seq: Int
+    public var payload: RunEventV1RunFailedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunFailedType, seq: Int, payload: RunEventV1RunFailedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunFailedPayload` model.
+public struct RunEventV1RunFailedPayload: Codable, Hashable, Sendable {
+    public var error: String
+    public var errorCode: String?
+    public var errorDetails: JSONObject?
+    public var message: String?
+    public var reason: String?
+    public var endReason: String?
+    public var source: String?
+    public var rejected: Bool?
+
+    public init(error: String, errorCode: String? = nil, errorDetails: JSONObject? = nil, message: String? = nil, reason: String? = nil, endReason: String? = nil, source: String? = nil, rejected: Bool? = nil) {
+        self.error = error
+        self.errorCode = errorCode
+        self.errorDetails = errorDetails
+        self.message = message
+        self.reason = reason
+        self.endReason = endReason
+        self.source = source
+        self.rejected = rejected
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case errorCode = "error_code"
+        case errorDetails = "error_details"
+        case message = "message"
+        case reason = "reason"
+        case endReason = "end_reason"
+        case source = "source"
+        case rejected = "rejected"
+    }
+}
+
+/// `RunEventV1RunFailedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunFailedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runFailed = RunEventV1RunFailedType(rawValue: "run.failed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunFailedType] = [.runFailed]
+}
+
+/// `RunEventV1RunGuardrailBlocked` model.
+public struct RunEventV1RunGuardrailBlocked: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunGuardrailBlockedType
+    public var seq: Int
+    public var payload: RunEventV1RunGuardrailBlockedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunGuardrailBlockedType, seq: Int, payload: RunEventV1RunGuardrailBlockedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunGuardrailBlockedPayload` model.
+public struct RunEventV1RunGuardrailBlockedPayload: Codable, Hashable, Sendable {
+    public var error: String
+    public var errorCode: String?
+    public var errorDetails: JSONObject?
+    public var message: String?
+    public var reason: String?
+    public var endReason: String?
+    public var source: String?
+    public var rejected: Bool?
+
+    public init(error: String, errorCode: String? = nil, errorDetails: JSONObject? = nil, message: String? = nil, reason: String? = nil, endReason: String? = nil, source: String? = nil, rejected: Bool? = nil) {
+        self.error = error
+        self.errorCode = errorCode
+        self.errorDetails = errorDetails
+        self.message = message
+        self.reason = reason
+        self.endReason = endReason
+        self.source = source
+        self.rejected = rejected
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case errorCode = "error_code"
+        case errorDetails = "error_details"
+        case message = "message"
+        case reason = "reason"
+        case endReason = "end_reason"
+        case source = "source"
+        case rejected = "rejected"
+    }
+}
+
+/// `RunEventV1RunGuardrailBlockedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunGuardrailBlockedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runGuardrailBlocked = RunEventV1RunGuardrailBlockedType(rawValue: "run.guardrail_blocked")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunGuardrailBlockedType] = [.runGuardrailBlocked]
+}
+
+/// `RunEventV1RunInputReceived` model.
+public struct RunEventV1RunInputReceived: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunInputReceivedType
+    public var seq: Int
+    public var payload: RunEventV1RunInputReceivedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunInputReceivedType, seq: Int, payload: RunEventV1RunInputReceivedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunInputReceivedPayload` model.
+public struct RunEventV1RunInputReceivedPayload: Codable, Hashable, Sendable {
+    public var responseLength: Int
+
+    public init(responseLength: Int) {
+        self.responseLength = responseLength
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case responseLength = "response_length"
+    }
+}
+
+/// `RunEventV1RunInputReceivedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunInputReceivedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runInputReceived = RunEventV1RunInputReceivedType(rawValue: "run.input_received")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunInputReceivedType] = [.runInputReceived]
+}
+
+/// `RunEventV1RunPaused` model.
+public struct RunEventV1RunPaused: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunPausedType
+    public var seq: Int
+    public var payload: RunEventV1RunPausedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunPausedType, seq: Int, payload: RunEventV1RunPausedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunPausedPayload` model.
+public struct RunEventV1RunPausedPayload: Codable, Hashable, Sendable {
+    public var reason: String
+    public var step: Int?
+    public var resumable: Bool?
+    public var heldOutput: Bool?
+
+    public init(reason: String, step: Int? = nil, resumable: Bool? = nil, heldOutput: Bool? = nil) {
+        self.reason = reason
+        self.step = step
+        self.resumable = resumable
+        self.heldOutput = heldOutput
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reason = "reason"
+        case step = "step"
+        case resumable = "resumable"
+        case heldOutput = "held_output"
+    }
+}
+
+/// `RunEventV1RunPausedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunPausedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runPaused = RunEventV1RunPausedType(rawValue: "run.paused")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunPausedType] = [.runPaused]
+}
+
+/// `RunEventV1RunStarted` model.
+public struct RunEventV1RunStarted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunStartedType
+    public var seq: Int
+    public var payload: RunEventV1RunStartedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunStartedType, seq: Int, payload: RunEventV1RunStartedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunStartedPayload` model.
+public struct RunEventV1RunStartedPayload: Codable, Hashable, Sendable {
+    public var agentId: String?
+    public var executionMode: RunEventV1RunStartedPayloadExecutionMode?
+    public var source: String?
+    public var priority: String?
+    public var resumedFrom: RunEventV1RunStartedPayloadResumedFrom?
+    public var approved: Bool?
+    public var revised: Bool?
+    public var input: JSONValue?
+
+    public init(agentId: String? = nil, executionMode: RunEventV1RunStartedPayloadExecutionMode? = nil, source: String? = nil, priority: String? = nil, resumedFrom: RunEventV1RunStartedPayloadResumedFrom? = nil, approved: Bool? = nil, revised: Bool? = nil, input: JSONValue? = nil) {
+        self.agentId = agentId
+        self.executionMode = executionMode
+        self.source = source
+        self.priority = priority
+        self.resumedFrom = resumedFrom
+        self.approved = approved
+        self.revised = revised
+        self.input = input
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agentId = "agent_id"
+        case executionMode = "execution_mode"
+        case source = "source"
+        case priority = "priority"
+        case resumedFrom = "resumed_from"
+        case approved = "approved"
+        case revised = "revised"
+        case input = "input"
+    }
+}
+
+/// `RunEventV1RunStartedPayloadExecutionMode` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunStartedPayloadExecutionMode: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let bridge = RunEventV1RunStartedPayloadExecutionMode(rawValue: "bridge")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunStartedPayloadExecutionMode] = [.bridge]
+}
+
+/// `RunEventV1RunStartedPayloadResumedFrom` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunStartedPayloadResumedFrom: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let awaitingApproval = RunEventV1RunStartedPayloadResumedFrom(rawValue: "awaiting_approval")
+    public static let paused = RunEventV1RunStartedPayloadResumedFrom(rawValue: "paused")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunStartedPayloadResumedFrom] = [.awaitingApproval, .paused]
+}
+
+/// `RunEventV1RunStartedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunStartedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runStarted = RunEventV1RunStartedType(rawValue: "run.started")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunStartedType] = [.runStarted]
+}
+
+/// `RunEventV1RunStepCompleted` model.
+public struct RunEventV1RunStepCompleted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunStepCompletedType
+    public var seq: Int
+    public var payload: RunEventV1RunStepCompletedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunStepCompletedType, seq: Int, payload: RunEventV1RunStepCompletedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunStepCompletedPayload` model.
+public struct RunEventV1RunStepCompletedPayload: Codable, Hashable, Sendable {
+    public var stepIndex: Int
+    public var stepId: String?
+    public var hasToolCalls: Bool?
+    public var toolNames: [String]?
+    public var done: Bool?
+    public var durationMs: Int?
+    public var inputTokens: Int?
+    public var outputTokens: Int?
+    public var thinkingTokens: Int?
+    public var llmCallsCount: Int?
+
+    public init(stepIndex: Int, stepId: String? = nil, hasToolCalls: Bool? = nil, toolNames: [String]? = nil, done: Bool? = nil, durationMs: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, llmCallsCount: Int? = nil) {
+        self.stepIndex = stepIndex
+        self.stepId = stepId
+        self.hasToolCalls = hasToolCalls
+        self.toolNames = toolNames
+        self.done = done
+        self.durationMs = durationMs
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.thinkingTokens = thinkingTokens
+        self.llmCallsCount = llmCallsCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stepIndex = "step_index"
+        case stepId = "step_id"
+        case hasToolCalls = "has_tool_calls"
+        case toolNames = "tool_names"
+        case done = "done"
+        case durationMs = "duration_ms"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case thinkingTokens = "thinking_tokens"
+        case llmCallsCount = "llm_calls_count"
+    }
+}
+
+/// `RunEventV1RunStepCompletedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunStepCompletedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runStepCompleted = RunEventV1RunStepCompletedType(rawValue: "run.step_completed")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunStepCompletedType] = [.runStepCompleted]
+}
+
+/// `RunEventV1RunStepStarted` model.
+public struct RunEventV1RunStepStarted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1RunStepStartedType
+    public var seq: Int
+    public var payload: RunEventV1RunStepStartedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1RunStepStartedType, seq: Int, payload: RunEventV1RunStepStartedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1RunStepStartedPayload` model.
+public struct RunEventV1RunStepStartedPayload: Codable, Hashable, Sendable {
+    public var stepIndex: Int
+    public var streaming: Bool?
+    public var stepId: String?
+
+    public init(stepIndex: Int, streaming: Bool? = nil, stepId: String? = nil) {
+        self.stepIndex = stepIndex
+        self.streaming = streaming
+        self.stepId = stepId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stepIndex = "step_index"
+        case streaming = "streaming"
+        case stepId = "step_id"
+    }
+}
+
+/// `RunEventV1RunStepStartedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1RunStepStartedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runStepStarted = RunEventV1RunStepStartedType(rawValue: "run.step_started")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1RunStepStartedType] = [.runStepStarted]
+}
+
+/// `RunEventV1SessionContext` model.
+public struct RunEventV1SessionContext: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1SessionContextType
+    public var seq: Int
+    public var payload: RunEventV1SessionContextPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1SessionContextType, seq: Int, payload: RunEventV1SessionContextPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1SessionContextCompacted` model.
+public struct RunEventV1SessionContextCompacted: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1SessionContextCompactedType
+    public var seq: Int
+    public var payload: RunEventV1SessionContextCompactedPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1SessionContextCompactedType, seq: Int, payload: RunEventV1SessionContextCompactedPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1SessionContextCompactedPayload` model.
+public struct RunEventV1SessionContextCompactedPayload: Codable, Hashable, Sendable {
+    public var stepIndex: Int?
+    public var strategy: String?
+    public var removedCount: Int?
+    public var tokensSaved: Int?
+    public var contextTokensBefore: Int?
+    public var contextTokensAfter: Int?
+    public var maxContextTokens: Int?
+
+    public init(stepIndex: Int? = nil, strategy: String? = nil, removedCount: Int? = nil, tokensSaved: Int? = nil, contextTokensBefore: Int? = nil, contextTokensAfter: Int? = nil, maxContextTokens: Int? = nil) {
+        self.stepIndex = stepIndex
+        self.strategy = strategy
+        self.removedCount = removedCount
+        self.tokensSaved = tokensSaved
+        self.contextTokensBefore = contextTokensBefore
+        self.contextTokensAfter = contextTokensAfter
+        self.maxContextTokens = maxContextTokens
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case stepIndex = "step_index"
+        case strategy = "strategy"
+        case removedCount = "removed_count"
+        case tokensSaved = "tokens_saved"
+        case contextTokensBefore = "context_tokens_before"
+        case contextTokensAfter = "context_tokens_after"
+        case maxContextTokens = "max_context_tokens"
+    }
+}
+
+/// `RunEventV1SessionContextCompactedType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1SessionContextCompactedType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let sessionContextCompacted = RunEventV1SessionContextCompactedType(rawValue: "session.context_compacted")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1SessionContextCompactedType] = [.sessionContextCompacted]
+}
+
+/// `RunEventV1SessionContextPayload` model.
+public struct RunEventV1SessionContextPayload: Codable, Hashable, Sendable {
+    public var sessionId: String
+    public var windowTokens: Int?
+    public var usedTokens: Int?
+    public var percent: Double?
+    public var source: SessionContextSource
+    public var updatedAt: String
+
+    public init(sessionId: String, windowTokens: Int? = nil, usedTokens: Int? = nil, percent: Double? = nil, source: SessionContextSource, updatedAt: String) {
+        self.sessionId = sessionId
+        self.windowTokens = windowTokens
+        self.usedTokens = usedTokens
+        self.percent = percent
+        self.source = source
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case windowTokens = "window_tokens"
+        case usedTokens = "used_tokens"
+        case percent = "percent"
+        case source = "source"
+        case updatedAt = "updated_at"
+    }
+}
+
+/// `RunEventV1SessionContextType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1SessionContextType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let sessionContext = RunEventV1SessionContextType(rawValue: "session.context")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1SessionContextType] = [.sessionContext]
+}
+
+/// `RunEventV1StepAct` model.
+public struct RunEventV1StepAct: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1StepActType
+    public var seq: Int
+    public var payload: RunEventV1StepActPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1StepActType, seq: Int, payload: RunEventV1StepActPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1StepActPayload` model.
+public struct RunEventV1StepActPayload: Codable, Hashable, Sendable {
+    public var message: String?
+    public var code: String?
+    public var params: JSONObject?
+    public var inputTokens: Int?
+    public var outputTokens: Int?
+    public var metrics: JSONObject?
+
+    public init(message: String? = nil, code: String? = nil, params: JSONObject? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, metrics: JSONObject? = nil) {
+        self.message = message
+        self.code = code
+        self.params = params
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.metrics = metrics
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case message = "message"
+        case code = "code"
+        case params = "params"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case metrics = "metrics"
+    }
+}
+
+/// `RunEventV1StepActType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1StepActType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let stepAct = RunEventV1StepActType(rawValue: "step.act")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1StepActType] = [.stepAct]
+}
+
+/// `RunEventV1StepEvaluate` model.
+public struct RunEventV1StepEvaluate: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1StepEvaluateType
+    public var seq: Int
+    public var payload: RunEventV1StepEvaluatePayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1StepEvaluateType, seq: Int, payload: RunEventV1StepEvaluatePayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1StepEvaluatePayload` model.
+public struct RunEventV1StepEvaluatePayload: Codable, Hashable, Sendable {
+    public var passed: Bool
+    public var feedback: String?
+
+    public init(passed: Bool, feedback: String? = nil) {
+        self.passed = passed
+        self.feedback = feedback
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case passed = "passed"
+        case feedback = "feedback"
+    }
+}
+
+/// `RunEventV1StepEvaluateType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1StepEvaluateType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let stepEvaluate = RunEventV1StepEvaluateType(rawValue: "step.evaluate")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1StepEvaluateType] = [.stepEvaluate]
+}
+
+/// `RunEventV1StepPlan` model.
+public struct RunEventV1StepPlan: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1StepPlanType
+    public var seq: Int
+    public var payload: RunEventV1StepPlanPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1StepPlanType, seq: Int, payload: RunEventV1StepPlanPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1StepPlanPayload` model.
+public struct RunEventV1StepPlanPayload: Codable, Hashable, Sendable {
+    public var effort: String?
+    public var skipped: Bool?
+    public var skipReason: String?
+    public var planContent: String?
+
+    public init(effort: String? = nil, skipped: Bool? = nil, skipReason: String? = nil, planContent: String? = nil) {
+        self.effort = effort
+        self.skipped = skipped
+        self.skipReason = skipReason
+        self.planContent = planContent
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case effort = "effort"
+        case skipped = "skipped"
+        case skipReason = "skip_reason"
+        case planContent = "plan_content"
+    }
+}
+
+/// `RunEventV1StepPlanType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1StepPlanType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let stepPlan = RunEventV1StepPlanType(rawValue: "step.plan")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1StepPlanType] = [.stepPlan]
+}
+
+/// `RunEventV1TeamDelegate` model.
+public struct RunEventV1TeamDelegate: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1TeamDelegateType
+    public var seq: Int
+    public var payload: RunEventV1TeamDelegatePayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1TeamDelegateType, seq: Int, payload: RunEventV1TeamDelegatePayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1TeamDelegatePayload` model.
+public struct RunEventV1TeamDelegatePayload: Codable, Hashable, Sendable {
+    public var topology: RunEventV1TeamDelegatePayloadTopology
+    public var mode: String?
+    public var round: Int?
+    public var step: Int?
+    public var handoffIndex: Int?
+    public var from: String?
+    public var to: [String]
+    public var workerCount: Int?
+
+    public init(topology: RunEventV1TeamDelegatePayloadTopology, mode: String? = nil, round: Int? = nil, step: Int? = nil, handoffIndex: Int? = nil, from: String? = nil, to: [String], workerCount: Int? = nil) {
+        self.topology = topology
+        self.mode = mode
+        self.round = round
+        self.step = step
+        self.handoffIndex = handoffIndex
+        self.from = from
+        self.to = to
+        self.workerCount = workerCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case topology = "topology"
+        case mode = "mode"
+        case round = "round"
+        case step = "step"
+        case handoffIndex = "handoff_index"
+        case from = "from"
+        case to = "to"
+        case workerCount = "worker_count"
+    }
+}
+
+/// `RunEventV1TeamDelegatePayloadTopology` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1TeamDelegatePayloadTopology: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let addressed = RunEventV1TeamDelegatePayloadTopology(rawValue: "addressed")
+    public static let supervisor = RunEventV1TeamDelegatePayloadTopology(rawValue: "supervisor")
+    public static let pipeline = RunEventV1TeamDelegatePayloadTopology(rawValue: "pipeline")
+    public static let swarm = RunEventV1TeamDelegatePayloadTopology(rawValue: "swarm")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1TeamDelegatePayloadTopology] = [.addressed, .supervisor, .pipeline, .swarm]
+}
+
+/// `RunEventV1TeamDelegateType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1TeamDelegateType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let teamDelegate = RunEventV1TeamDelegateType(rawValue: "team.delegate")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1TeamDelegateType] = [.teamDelegate]
+}
+
+/// `RunEventV1ToolCall` model.
+public struct RunEventV1ToolCall: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1ToolCallType
+    public var seq: Int
+    public var payload: RunEventV1ToolCallPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1ToolCallType, seq: Int, payload: RunEventV1ToolCallPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1ToolCallPayload` model.
+public struct RunEventV1ToolCallPayload: Codable, Hashable, Sendable {
+    public var toolCall: RunEventV1ToolCallPayloadToolCall
+    public var builtin: Bool?
+    public var mcpServerId: String?
+    public var mcpSessionId: String?
+    public var transportType: String?
+    public var parentEventId: String?
+    public var eventId: String?
+
+    public init(toolCall: RunEventV1ToolCallPayloadToolCall, builtin: Bool? = nil, mcpServerId: String? = nil, mcpSessionId: String? = nil, transportType: String? = nil, parentEventId: String? = nil, eventId: String? = nil) {
+        self.toolCall = toolCall
+        self.builtin = builtin
+        self.mcpServerId = mcpServerId
+        self.mcpSessionId = mcpSessionId
+        self.transportType = transportType
+        self.parentEventId = parentEventId
+        self.eventId = eventId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toolCall = "tool_call"
+        case builtin = "builtin"
+        case mcpServerId = "mcp_server_id"
+        case mcpSessionId = "mcp_session_id"
+        case transportType = "transport_type"
+        case parentEventId = "parent_event_id"
+        case eventId = "_event_id"
+    }
+}
+
+/// `RunEventV1ToolCallPayloadToolCall` model.
+public struct RunEventV1ToolCallPayloadToolCall: Codable, Hashable, Sendable {
+    public var id: String
+    public var name: String
+    public var arguments: JSONObject
+    public var argumentsPreview: String?
+
+    public init(id: String, name: String, arguments: JSONObject, argumentsPreview: String? = nil) {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+        self.argumentsPreview = argumentsPreview
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "id"
+        case name = "name"
+        case arguments = "arguments"
+        case argumentsPreview = "arguments_preview"
+    }
+}
+
+/// `RunEventV1ToolCallType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1ToolCallType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let toolCall = RunEventV1ToolCallType(rawValue: "tool.call")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1ToolCallType] = [.toolCall]
+}
+
+/// `RunEventV1ToolError` model.
+public struct RunEventV1ToolError: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1ToolErrorType
+    public var seq: Int
+    public var payload: RunEventV1ToolErrorPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1ToolErrorType, seq: Int, payload: RunEventV1ToolErrorPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1ToolErrorPayload` model.
+public struct RunEventV1ToolErrorPayload: Codable, Hashable, Sendable {
+    public var error: String
+    public var toolName: String?
+    public var toolCallId: String?
+    public var governanceBlocked: Bool?
+    public var parseError: Bool?
+    public var builtin: Bool?
+    public var parentEventId: String?
+
+    public init(error: String, toolName: String? = nil, toolCallId: String? = nil, governanceBlocked: Bool? = nil, parseError: Bool? = nil, builtin: Bool? = nil, parentEventId: String? = nil) {
+        self.error = error
+        self.toolName = toolName
+        self.toolCallId = toolCallId
+        self.governanceBlocked = governanceBlocked
+        self.parseError = parseError
+        self.builtin = builtin
+        self.parentEventId = parentEventId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case toolName = "tool_name"
+        case toolCallId = "tool_call_id"
+        case governanceBlocked = "governance_blocked"
+        case parseError = "parse_error"
+        case builtin = "builtin"
+        case parentEventId = "parent_event_id"
+    }
+}
+
+/// `RunEventV1ToolErrorType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1ToolErrorType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let toolError = RunEventV1ToolErrorType(rawValue: "tool.error")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1ToolErrorType] = [.toolError]
+}
+
+/// `RunEventV1ToolResult` model.
+public struct RunEventV1ToolResult: Codable, Hashable, Sendable {
+    public var eventId: String
+    public var runId: String
+    public var sessionId: String?
+    public var type: RunEventV1ToolResultType
+    public var seq: Int
+    public var payload: RunEventV1ToolResultPayload
+    public var timestamp: String
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(eventId: String, runId: String, sessionId: String? = nil, type: RunEventV1ToolResultType, seq: Int, payload: RunEventV1ToolResultPayload, timestamp: String, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunEventV1ToolResultPayload` model.
+public struct RunEventV1ToolResultPayload: Codable, Hashable, Sendable {
+    public var toolCallId: String?
+    public var toolResult: RunEventV1ToolResultPayloadToolResult
+    public var latencyMs: Double?
+    public var builtin: Bool?
+    public var mcpServerId: String?
+    public var mcpSessionId: String?
+    public var transportType: String?
+    public var parentEventId: String?
+
+    public init(toolCallId: String? = nil, toolResult: RunEventV1ToolResultPayloadToolResult, latencyMs: Double? = nil, builtin: Bool? = nil, mcpServerId: String? = nil, mcpSessionId: String? = nil, transportType: String? = nil, parentEventId: String? = nil) {
+        self.toolCallId = toolCallId
+        self.toolResult = toolResult
+        self.latencyMs = latencyMs
+        self.builtin = builtin
+        self.mcpServerId = mcpServerId
+        self.mcpSessionId = mcpSessionId
+        self.transportType = transportType
+        self.parentEventId = parentEventId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case toolCallId = "tool_call_id"
+        case toolResult = "tool_result"
+        case latencyMs = "latency_ms"
+        case builtin = "builtin"
+        case mcpServerId = "mcp_server_id"
+        case mcpSessionId = "mcp_session_id"
+        case transportType = "transport_type"
+        case parentEventId = "parent_event_id"
+    }
+}
+
+/// `RunEventV1ToolResultPayloadToolResult` model.
+public struct RunEventV1ToolResultPayloadToolResult: Codable, Hashable, Sendable {
+    public var content: String
+
+    public init(content: String) {
+        self.content = content
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case content = "content"
+    }
+}
+
+/// `RunEventV1ToolResultType` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunEventV1ToolResultType: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let toolResult = RunEventV1ToolResultType(rawValue: "tool.result")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunEventV1ToolResultType] = [.toolResult]
+}
+
 /// Absent for platform-dispatched cloud runs. `bridge` is written by the platform when a local
 /// agent takes the run (run-dispatch.ts, bridge.ts); `async` is only ever an echo of a
 /// client-supplied value and has never been stored on production (measured 2026-09-10 over 8605
@@ -43171,10 +47736,18 @@ public struct RunMetrics: Codable, Hashable, Sendable {
     public var guardrailViolations: Int?
     public var memoryRetrievals: Int?
     public var memoryExtractions: Int?
-    /// Estimated total cost in USD
+    /// Estimated total cost in USD — the tenant's bill, except when `cost_attribution` says
+    /// otherwise.
     public var totalCostUsd: Double?
+    /// Present only on a sponsored qualification run (since 2026-10-19). `total_cost_usd` is then
+    /// execution telemetry at the platform's catalog rate: never billed to the company the run
+    /// executed in, and never counted in its usage, quotas, daily share, run count, spend budget or
+    /// overage. The sponsor's debit is the grant's `charged_microusd`, accounted at the program's
+    /// frozen pricing revision, and the two differ (production run 01a151cf…: telemetry $0.010312,
+    /// sponsor debit 5414 micro-USD). Absent on every other run.
+    public var costAttribution: RunMetricsCostAttribution?
 
-    public init(contextWindowTokens: Int? = nil, lastInputTokens: Int? = nil, pricingConfidence: String? = nil, durationMs: Double? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil) {
+    public init(contextWindowTokens: Int? = nil, lastInputTokens: Int? = nil, pricingConfidence: String? = nil, durationMs: Double? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil, costAttribution: RunMetricsCostAttribution? = nil) {
         self.contextWindowTokens = contextWindowTokens
         self.lastInputTokens = lastInputTokens
         self.pricingConfidence = pricingConfidence
@@ -43191,6 +47764,7 @@ public struct RunMetrics: Codable, Hashable, Sendable {
         self.memoryRetrievals = memoryRetrievals
         self.memoryExtractions = memoryExtractions
         self.totalCostUsd = totalCostUsd
+        self.costAttribution = costAttribution
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -43210,7 +47784,35 @@ public struct RunMetrics: Codable, Hashable, Sendable {
         case memoryRetrievals = "memory_retrievals"
         case memoryExtractions = "memory_extractions"
         case totalCostUsd = "total_cost_usd"
+        case costAttribution = "cost_attribution"
     }
+}
+
+/// Present only on a sponsored qualification run (since 2026-10-19). `total_cost_usd` is then
+/// execution telemetry at the platform's catalog rate: never billed to the company the run
+/// executed in, and never counted in its usage, quotas, daily share, run count, spend budget or
+/// overage. The sponsor's debit is the grant's `charged_microusd`, accounted at the program's
+/// frozen pricing revision, and the two differ (production run 01a151cf…: telemetry $0.010312,
+/// sponsor debit 5414 micro-USD). Absent on every other run.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunMetricsCostAttribution: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let sponsoredTelemetry = RunMetricsCostAttribution(rawValue: "sponsored_telemetry")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunMetricsCostAttribution] = [.sponsoredTelemetry]
 }
 
 /// `RunMissionResponse` model.
@@ -43381,6 +47983,12 @@ public struct RunResourceLimits: Codable, Hashable, Sendable {
     public var maxDurationMs: Int?
     public var maxSteps: Int?
     public var maxToolCalls: Int?
+    /// Input + output tokens summed over every model call of the run. Since 2026-10-19 it is held
+    /// before each call, not only after: each call is sent with `max_tokens` no more than the cap
+    /// minus what the run has spent minus the last call's input (which the next call resends), and
+    /// once that is nothing the run stops before sending, failing with `MAX_TOKENS_EXCEEDED` and
+    /// `used_tokens` at or under the limit. Before, the last call could spend past the cap by up to
+    /// a whole step.
     public var maxTokensPerRun: Int?
     /// In-run cost ceiling in USD; 0 or absent means no cap from this field. A run that crosses it
     /// fails with error_code BUDGET_EXCEEDED and error_details.cap_source "resource_limits".
@@ -43403,6 +48011,105 @@ public struct RunResourceLimits: Codable, Hashable, Sendable {
         case maxTokensPerRun = "max_tokens_per_run"
         case maxCostUsd = "max_cost_usd"
     }
+}
+
+/// routes/run-review.ts reviewView — the answer of both `POST` and `GET /runs/{runId}/review`.
+/// Every field is always present; one without a value is `null` (`anchors` is `[]`), so an
+/// unreviewed run answers `reviewed: false` with nulls rather than a `404`.
+public struct RunReview: Codable, Hashable, Sendable {
+    public var runId: String
+    /// Whether the result has a verdict.
+    public var reviewed: Bool
+    public var reviewId: String?
+    public var verdict: String?
+    /// True when the latest verdict is `approve`.
+    public var approved: Bool
+    public var comment: String?
+    public var anchors: [ReviewAnchor]
+    /// On `redo`: the run started in the same session for the same agent. Follow it with `GET
+    /// /runs/{runId}` or the session's events.
+    public var followUpRunId: String?
+    /// User id of the person who decided; the credential id when no person stands behind it.
+    public var decidedBy: String?
+    public var decidedAt: String?
+
+    public init(runId: String, reviewed: Bool, reviewId: String? = nil, verdict: String? = nil, approved: Bool, comment: String? = nil, anchors: [ReviewAnchor], followUpRunId: String? = nil, decidedBy: String? = nil, decidedAt: String? = nil) {
+        self.runId = runId
+        self.reviewed = reviewed
+        self.reviewId = reviewId
+        self.verdict = verdict
+        self.approved = approved
+        self.comment = comment
+        self.anchors = anchors
+        self.followUpRunId = followUpRunId
+        self.decidedBy = decidedBy
+        self.decidedAt = decidedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case reviewed = "reviewed"
+        case reviewId = "review_id"
+        case verdict = "verdict"
+        case approved = "approved"
+        case comment = "comment"
+        case anchors = "anchors"
+        case followUpRunId = "follow_up_run_id"
+        case decidedBy = "decided_by"
+        case decidedAt = "decided_at"
+    }
+}
+
+/// The latest person's verdict on this run's RESULT (`POST /runs/{runId}/review`, since
+/// 2026-10-19) — not a tool approval, which is `approvals`. Absent until the result is
+/// reviewed. The full record, with the comment and anchors, is `GET /runs/{runId}/review`.
+public struct RunReview2: Codable, Hashable, Sendable {
+    public var reviewId: String
+    public var verdict: RunReviewVerdict
+    public var decidedAt: String
+    /// User id of the person who decided; the credential id when no person stands behind it.
+    public var decidedBy: String?
+    /// On `redo`: the run started to do the work again.
+    public var followUpRunId: String?
+
+    public init(reviewId: String, verdict: RunReviewVerdict, decidedAt: String, decidedBy: String? = nil, followUpRunId: String? = nil) {
+        self.reviewId = reviewId
+        self.verdict = verdict
+        self.decidedAt = decidedAt
+        self.decidedBy = decidedBy
+        self.followUpRunId = followUpRunId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case reviewId = "review_id"
+        case verdict = "verdict"
+        case decidedAt = "decided_at"
+        case decidedBy = "decided_by"
+        case followUpRunId = "follow_up_run_id"
+    }
+}
+
+/// `RunReviewVerdict` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunReviewVerdict: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let approve = RunReviewVerdict(rawValue: "approve")
+    public static let redo = RunReviewVerdict(rawValue: "redo")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunReviewVerdict] = [.approve, .redo]
 }
 
 /// `RunStatus` values.
@@ -43706,6 +48413,335 @@ public struct RunStreamEventTraceContext: Codable, Hashable, Sendable {
         case traceparent = "traceparent"
         case tracestate = "tracestate"
     }
+}
+
+/// `RunStreamFrameV1Connected` model.
+public struct RunStreamFrameV1Connected: Codable, Hashable, Sendable {
+    public var runId: String
+    public var status: String
+    public var connectedAt: String?
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(runId: String, status: String, connectedAt: String? = nil, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.runId = runId
+        self.status = status
+        self.connectedAt = connectedAt
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case status = "status"
+        case connectedAt = "connected_at"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunStreamFrameV1Done` model.
+public struct RunStreamFrameV1Done: Codable, Hashable, Sendable {
+    public var runId: String
+    public var status: String
+    public var metrics: RunStreamFrameV1DoneMetrics?
+    public var output: JSONObject?
+    public var error: String?
+    public var costUsd: Double?
+    public var guardrailBlocked: Bool?
+    public var guardrailViolation: JSONObject?
+    public var streamType: RunStreamDoneStreamType?
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(runId: String, status: String, metrics: RunStreamFrameV1DoneMetrics? = nil, output: JSONObject? = nil, error: String? = nil, costUsd: Double? = nil, guardrailBlocked: Bool? = nil, guardrailViolation: JSONObject? = nil, streamType: RunStreamDoneStreamType? = nil, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.runId = runId
+        self.status = status
+        self.metrics = metrics
+        self.output = output
+        self.error = error
+        self.costUsd = costUsd
+        self.guardrailBlocked = guardrailBlocked
+        self.guardrailViolation = guardrailViolation
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case status = "status"
+        case metrics = "metrics"
+        case output = "output"
+        case error = "error"
+        case costUsd = "cost_usd"
+        case guardrailBlocked = "guardrail_blocked"
+        case guardrailViolation = "_guardrail_violation"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunStreamFrameV1DoneMetrics` model.
+public struct RunStreamFrameV1DoneMetrics: Codable, Hashable, Sendable {
+    public var durationMs: Int?
+    public var stepsCount: Int?
+    public var inputTokens: Int?
+    public var outputTokens: Int?
+    public var thinkingTokens: Int?
+    public var cachedTokens: Int?
+    public var toolCallsCount: Int?
+    public var llmCallsCount: Int?
+    public var guardrailChecks: Int?
+    public var guardrailViolations: Int?
+    public var memoryRetrievals: Int?
+    public var memoryExtractions: Int?
+    public var totalCostUsd: Double?
+    public var fallbackUsed: Bool?
+    public var pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence?
+    public var costAttribution: RunMetricsCostAttribution?
+    public var filesModified: Int?
+    public var commandsExecuted: Int?
+
+    public init(durationMs: Int? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil, fallbackUsed: Bool? = nil, pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence? = nil, costAttribution: RunMetricsCostAttribution? = nil, filesModified: Int? = nil, commandsExecuted: Int? = nil) {
+        self.durationMs = durationMs
+        self.stepsCount = stepsCount
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.thinkingTokens = thinkingTokens
+        self.cachedTokens = cachedTokens
+        self.toolCallsCount = toolCallsCount
+        self.llmCallsCount = llmCallsCount
+        self.guardrailChecks = guardrailChecks
+        self.guardrailViolations = guardrailViolations
+        self.memoryRetrievals = memoryRetrievals
+        self.memoryExtractions = memoryExtractions
+        self.totalCostUsd = totalCostUsd
+        self.fallbackUsed = fallbackUsed
+        self.pricingConfidence = pricingConfidence
+        self.costAttribution = costAttribution
+        self.filesModified = filesModified
+        self.commandsExecuted = commandsExecuted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case durationMs = "duration_ms"
+        case stepsCount = "steps_count"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case thinkingTokens = "thinking_tokens"
+        case cachedTokens = "cached_tokens"
+        case toolCallsCount = "tool_calls_count"
+        case llmCallsCount = "llm_calls_count"
+        case guardrailChecks = "guardrail_checks"
+        case guardrailViolations = "guardrail_violations"
+        case memoryRetrievals = "memory_retrievals"
+        case memoryExtractions = "memory_extractions"
+        case totalCostUsd = "total_cost_usd"
+        case fallbackUsed = "fallback_used"
+        case pricingConfidence = "pricing_confidence"
+        case costAttribution = "cost_attribution"
+        case filesModified = "files_modified"
+        case commandsExecuted = "commands_executed"
+    }
+}
+
+public typealias RunStreamFrameV1Error = JSONValue
+
+/// `RunStreamFrameV1ErrorVariant1` model.
+public struct RunStreamFrameV1ErrorVariant1: Codable, Hashable, Sendable {
+    public var error: String
+    public var code: RunStreamFrameV1ErrorVariant1code
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(error: String, code: RunStreamFrameV1ErrorVariant1code, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.error = error
+        self.code = code
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case code = "code"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunStreamFrameV1ErrorVariant1code` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunStreamFrameV1ErrorVariant1code: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let runNotFound = RunStreamFrameV1ErrorVariant1code(rawValue: "RUN_NOT_FOUND")
+    public static let streamError = RunStreamFrameV1ErrorVariant1code(rawValue: "STREAM_ERROR")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunStreamFrameV1ErrorVariant1code] = [.runNotFound, .streamError]
+}
+
+/// `RunStreamFrameV1ErrorVariant2` model.
+public struct RunStreamFrameV1ErrorVariant2: Codable, Hashable, Sendable {
+    public var type: RunStreamFrameV1ErrorVariant2type
+    public var message: String
+    public var code: RunStreamFrameV1ErrorVariant2code
+
+    public init(type: RunStreamFrameV1ErrorVariant2type, message: String, code: RunStreamFrameV1ErrorVariant2code) {
+        self.type = type
+        self.message = message
+        self.code = code
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type = "type"
+        case message = "message"
+        case code = "code"
+    }
+}
+
+/// `RunStreamFrameV1ErrorVariant2code` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunStreamFrameV1ErrorVariant2code: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let streamBufferExceeded = RunStreamFrameV1ErrorVariant2code(rawValue: "STREAM_BUFFER_EXCEEDED")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunStreamFrameV1ErrorVariant2code] = [.streamBufferExceeded]
+}
+
+/// `RunStreamFrameV1ErrorVariant2type` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunStreamFrameV1ErrorVariant2type: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let error = RunStreamFrameV1ErrorVariant2type(rawValue: "error")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunStreamFrameV1ErrorVariant2type] = [.error]
+}
+
+/// `RunStreamFrameV1Gap` model.
+public struct RunStreamFrameV1Gap: Codable, Hashable, Sendable {
+    public var message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case message = "message"
+    }
+}
+
+/// `RunStreamFrameV1GuardrailViolation` model.
+public struct RunStreamFrameV1GuardrailViolation: Codable, Hashable, Sendable {
+    public var guardrailViolation: JSONObject?
+    public var violationSource: RunStreamFrameV1GuardrailViolationViolationSource
+    public var eventId: String?
+    public var runId: String?
+    public var sessionId: String?
+    public var type: String?
+    public var seq: Int?
+    public var payload: JSONObject?
+    public var timestamp: String?
+    public var stepId: String?
+    public var parentEventId: String?
+    public var streamType: RunStreamEventStreamType?
+    public var chunkId: String?
+    public var chunkIndex: Int?
+
+    public init(guardrailViolation: JSONObject? = nil, violationSource: RunStreamFrameV1GuardrailViolationViolationSource, eventId: String? = nil, runId: String? = nil, sessionId: String? = nil, type: String? = nil, seq: Int? = nil, payload: JSONObject? = nil, timestamp: String? = nil, stepId: String? = nil, parentEventId: String? = nil, streamType: RunStreamEventStreamType? = nil, chunkId: String? = nil, chunkIndex: Int? = nil) {
+        self.guardrailViolation = guardrailViolation
+        self.violationSource = violationSource
+        self.eventId = eventId
+        self.runId = runId
+        self.sessionId = sessionId
+        self.type = type
+        self.seq = seq
+        self.payload = payload
+        self.timestamp = timestamp
+        self.stepId = stepId
+        self.parentEventId = parentEventId
+        self.streamType = streamType
+        self.chunkId = chunkId
+        self.chunkIndex = chunkIndex
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case guardrailViolation = "_guardrail_violation"
+        case violationSource = "violation_source"
+        case eventId = "event_id"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case type = "type"
+        case seq = "seq"
+        case payload = "payload"
+        case timestamp = "timestamp"
+        case stepId = "step_id"
+        case parentEventId = "parent_event_id"
+        case streamType = "stream_type"
+        case chunkId = "_chunk_id"
+        case chunkIndex = "_chunk_index"
+    }
+}
+
+/// `RunStreamFrameV1GuardrailViolationViolationSource` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct RunStreamFrameV1GuardrailViolationViolationSource: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let stream = RunStreamFrameV1GuardrailViolationViolationSource(rawValue: "stream")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [RunStreamFrameV1GuardrailViolationViolationSource] = [.stream]
 }
 
 /// `RunWorkspaceCommandRequest` model.
@@ -44638,6 +49674,17 @@ public struct Session: Codable, Hashable, Sendable {
     public var pinned: Bool?
     /// When it was pinned; order the pinned group by it.
     public var pinnedAt: String?
+    /// The chat's name: the stored title, else the `metadata.title` clients wrote before the field
+    /// existed (2026-10-19), else `null`. A title the person cleared stays `null` even if that
+    /// legacy key is still there. At most 80 characters when a person sets it; a generated one is
+    /// at most 60, in the language of the first message. Present on every read — the list, the
+    /// detail, create and update.
+    public var title: String?
+    /// `user` when a person set or cleared the title (`PUT|PATCH /sessions/{id} {title}`) — a
+    /// generated title never replaces it; `generated` when the platform named the chat after its
+    /// first completed run. Absent when no title was ever stored as a field (none, or only the
+    /// legacy `metadata.title`).
+    public var titleSource: SessionTitleSource?
     public var createdBy: String?
     public var sessionId: String
     public var tenantId: String
@@ -44665,11 +49712,13 @@ public struct Session: Codable, Hashable, Sendable {
     /// resolve their LLM from this config instead of the agent's default. Absent → agent default.
     public var modelOverride: SessionModelOverride?
 
-    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: SessionModelOverride? = nil) {
+    public init(archived: Bool? = nil, archivedAt: String? = nil, pinned: Bool? = nil, pinnedAt: String? = nil, title: String? = nil, titleSource: SessionTitleSource? = nil, createdBy: String? = nil, sessionId: String, tenantId: String, agentId: String, status: PublicSessionViewStatus, conversationHistory: [ConversationEntry]? = nil, metadata: JSONObject? = nil, runs: [String]? = nil, createdAt: String? = nil, updatedAt: String? = nil, expiresAt: String? = nil, teamId: String? = nil, branches: [SessionBranch]? = nil, activeBranch: String? = nil, queueMode: SessionQueueMode? = nil, modelOverride: SessionModelOverride? = nil) {
         self.archived = archived
         self.archivedAt = archivedAt
         self.pinned = pinned
         self.pinnedAt = pinnedAt
+        self.title = title
+        self.titleSource = titleSource
         self.createdBy = createdBy
         self.sessionId = sessionId
         self.tenantId = tenantId
@@ -44693,6 +49742,8 @@ public struct Session: Codable, Hashable, Sendable {
         case archivedAt = "archived_at"
         case pinned = "pinned"
         case pinnedAt = "pinned_at"
+        case title = "title"
+        case titleSource = "title_source"
         case createdBy = "created_by"
         case sessionId = "session_id"
         case tenantId = "tenant_id"
@@ -44712,8 +49763,9 @@ public struct Session: Codable, Hashable, Sendable {
     }
 }
 
-/// sessions.ts AnnotationRecord — the six-field projection create, list and PATCH all answer
-/// with.
+/// sessions.ts AnnotationRecord — the projection create, list and PATCH all answer with: six
+/// fields always, plus `anchor` and `target` only on a note that was created with them (since
+/// 2026-10-19).
 public struct SessionAnnotation: Codable, Hashable, Sendable {
     public var id: String
     public var messageId: String
@@ -44721,14 +49773,18 @@ public struct SessionAnnotation: Codable, Hashable, Sendable {
     public var author: String
     public var createdAt: String
     public var resolved: Bool
+    public var anchor: Anchor?
+    public var target: AnchorTarget?
 
-    public init(id: String, messageId: String, content: String, author: String, createdAt: String, resolved: Bool) {
+    public init(id: String, messageId: String, content: String, author: String, createdAt: String, resolved: Bool, anchor: Anchor? = nil, target: AnchorTarget? = nil) {
         self.id = id
         self.messageId = messageId
         self.content = content
         self.author = author
         self.createdAt = createdAt
         self.resolved = resolved
+        self.anchor = anchor
+        self.target = target
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -44738,6 +49794,8 @@ public struct SessionAnnotation: Codable, Hashable, Sendable {
         case author = "author"
         case createdAt = "created_at"
         case resolved = "resolved"
+        case anchor = "anchor"
+        case target = "target"
     }
 }
 
@@ -44983,6 +50041,202 @@ public struct SessionQueueMode: RawRepresentable, Codable, Hashable, Sendable, E
 
     /// Every value the spec declared at generation time.
     public static let knownValues: [SessionQueueMode] = [.allow, .reject]
+}
+
+/// `SessionStreamFrameV1Connected` model.
+public struct SessionStreamFrameV1Connected: Codable, Hashable, Sendable {
+    public var sessionId: String
+    public var connectedAt: String?
+    public var runs: [String]?
+
+    public init(sessionId: String, connectedAt: String? = nil, runs: [String]? = nil) {
+        self.sessionId = sessionId
+        self.connectedAt = connectedAt
+        self.runs = runs
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+        case connectedAt = "connected_at"
+        case runs = "runs"
+    }
+}
+
+/// `SessionStreamFrameV1Error` model.
+public struct SessionStreamFrameV1Error: Codable, Hashable, Sendable {
+    public var error: String
+    public var code: SessionStreamFrameV1ErrorCode
+
+    public init(error: String, code: SessionStreamFrameV1ErrorCode) {
+        self.error = error
+        self.code = code
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case error = "error"
+        case code = "code"
+    }
+}
+
+/// `SessionStreamFrameV1ErrorCode` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct SessionStreamFrameV1ErrorCode: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let sessionNotFound = SessionStreamFrameV1ErrorCode(rawValue: "SESSION_NOT_FOUND")
+    public static let streamError = SessionStreamFrameV1ErrorCode(rawValue: "STREAM_ERROR")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [SessionStreamFrameV1ErrorCode] = [.sessionNotFound, .streamError]
+}
+
+/// `SessionStreamFrameV1RunAdded` model.
+public struct SessionStreamFrameV1RunAdded: Codable, Hashable, Sendable {
+    public var runId: String
+
+    public init(runId: String) {
+        self.runId = runId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+    }
+}
+
+/// `SessionStreamFrameV1RunDone` model.
+public struct SessionStreamFrameV1RunDone: Codable, Hashable, Sendable {
+    public var runId: String
+    public var status: String
+    public var metrics: SessionStreamFrameV1RunDoneMetrics?
+    public var costUsd: Double?
+
+    public init(runId: String, status: String, metrics: SessionStreamFrameV1RunDoneMetrics? = nil, costUsd: Double? = nil) {
+        self.runId = runId
+        self.status = status
+        self.metrics = metrics
+        self.costUsd = costUsd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case status = "status"
+        case metrics = "metrics"
+        case costUsd = "cost_usd"
+    }
+}
+
+/// `SessionStreamFrameV1RunDoneMetrics` model.
+public struct SessionStreamFrameV1RunDoneMetrics: Codable, Hashable, Sendable {
+    public var durationMs: Int?
+    public var stepsCount: Int?
+    public var inputTokens: Int?
+    public var outputTokens: Int?
+    public var thinkingTokens: Int?
+    public var cachedTokens: Int?
+    public var toolCallsCount: Int?
+    public var llmCallsCount: Int?
+    public var guardrailChecks: Int?
+    public var guardrailViolations: Int?
+    public var memoryRetrievals: Int?
+    public var memoryExtractions: Int?
+    public var totalCostUsd: Double?
+    public var fallbackUsed: Bool?
+    public var pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence?
+    public var costAttribution: RunMetricsCostAttribution?
+    public var filesModified: Int?
+    public var commandsExecuted: Int?
+
+    public init(durationMs: Int? = nil, stepsCount: Int? = nil, inputTokens: Int? = nil, outputTokens: Int? = nil, thinkingTokens: Int? = nil, cachedTokens: Int? = nil, toolCallsCount: Int? = nil, llmCallsCount: Int? = nil, guardrailChecks: Int? = nil, guardrailViolations: Int? = nil, memoryRetrievals: Int? = nil, memoryExtractions: Int? = nil, totalCostUsd: Double? = nil, fallbackUsed: Bool? = nil, pricingConfidence: RunEventV1RunCompletedPayloadMetricsPricingConfidence? = nil, costAttribution: RunMetricsCostAttribution? = nil, filesModified: Int? = nil, commandsExecuted: Int? = nil) {
+        self.durationMs = durationMs
+        self.stepsCount = stepsCount
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.thinkingTokens = thinkingTokens
+        self.cachedTokens = cachedTokens
+        self.toolCallsCount = toolCallsCount
+        self.llmCallsCount = llmCallsCount
+        self.guardrailChecks = guardrailChecks
+        self.guardrailViolations = guardrailViolations
+        self.memoryRetrievals = memoryRetrievals
+        self.memoryExtractions = memoryExtractions
+        self.totalCostUsd = totalCostUsd
+        self.fallbackUsed = fallbackUsed
+        self.pricingConfidence = pricingConfidence
+        self.costAttribution = costAttribution
+        self.filesModified = filesModified
+        self.commandsExecuted = commandsExecuted
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case durationMs = "duration_ms"
+        case stepsCount = "steps_count"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case thinkingTokens = "thinking_tokens"
+        case cachedTokens = "cached_tokens"
+        case toolCallsCount = "tool_calls_count"
+        case llmCallsCount = "llm_calls_count"
+        case guardrailChecks = "guardrail_checks"
+        case guardrailViolations = "guardrail_violations"
+        case memoryRetrievals = "memory_retrievals"
+        case memoryExtractions = "memory_extractions"
+        case totalCostUsd = "total_cost_usd"
+        case fallbackUsed = "fallback_used"
+        case pricingConfidence = "pricing_confidence"
+        case costAttribution = "cost_attribution"
+        case filesModified = "files_modified"
+        case commandsExecuted = "commands_executed"
+    }
+}
+
+/// `SessionStreamFrameV1SessionClosed` model.
+public struct SessionStreamFrameV1SessionClosed: Codable, Hashable, Sendable {
+    public var sessionId: String
+
+    public init(sessionId: String) {
+        self.sessionId = sessionId
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId = "session_id"
+    }
+}
+
+/// `user` when a person set or cleared the title (`PUT|PATCH /sessions/{id} {title}`) — a
+/// generated title never replaces it; `generated` when the platform named the chat after its
+/// first completed run. Absent when no title was ever stored as a field (none, or only the
+/// legacy `metadata.title`).
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct SessionTitleSource: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let generated = SessionTitleSource(rawValue: "generated")
+    public static let user = SessionTitleSource(rawValue: "user")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [SessionTitleSource] = [.generated, .user]
 }
 
 /// `SetAdminIntegrationOAuthProviderRequest` model.
@@ -47900,12 +53154,25 @@ public struct TenantBilling: Codable, Hashable, Sendable {
     public var stripeSubscriptionId: String?
     public var cancelAtPeriodEnd: Bool?
     public var currentPeriodEndMs: Int?
+    /// Which system owns the paid plan. Absent means stripe. While the plan is paid, only that
+    /// system's plan writes land; other writers are refused (an admin grant answers 409).
+    public var planSource: TenantBillingPlanSource?
+    /// StoreKit originalTransactionId of the App Store subscription.
+    public var appStoreOriginalTransactionId: String?
+    /// App Store product id of that subscription.
+    public var appStoreProductId: String?
+    /// Unix ms the App Store subscription is paid up to.
+    public var appStoreExpiresMs: Int?
 
-    public init(stripeCustomerId: String? = nil, stripeSubscriptionId: String? = nil, cancelAtPeriodEnd: Bool? = nil, currentPeriodEndMs: Int? = nil) {
+    public init(stripeCustomerId: String? = nil, stripeSubscriptionId: String? = nil, cancelAtPeriodEnd: Bool? = nil, currentPeriodEndMs: Int? = nil, planSource: TenantBillingPlanSource? = nil, appStoreOriginalTransactionId: String? = nil, appStoreProductId: String? = nil, appStoreExpiresMs: Int? = nil) {
         self.stripeCustomerId = stripeCustomerId
         self.stripeSubscriptionId = stripeSubscriptionId
         self.cancelAtPeriodEnd = cancelAtPeriodEnd
         self.currentPeriodEndMs = currentPeriodEndMs
+        self.planSource = planSource
+        self.appStoreOriginalTransactionId = appStoreOriginalTransactionId
+        self.appStoreProductId = appStoreProductId
+        self.appStoreExpiresMs = appStoreExpiresMs
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -47913,7 +53180,36 @@ public struct TenantBilling: Codable, Hashable, Sendable {
         case stripeSubscriptionId = "stripe_subscription_id"
         case cancelAtPeriodEnd = "cancel_at_period_end"
         case currentPeriodEndMs = "current_period_end_ms"
+        case planSource = "plan_source"
+        case appStoreOriginalTransactionId = "app_store_original_transaction_id"
+        case appStoreProductId = "app_store_product_id"
+        case appStoreExpiresMs = "app_store_expires_ms"
     }
+}
+
+/// Which system owns the paid plan. Absent means stripe. While the plan is paid, only that
+/// system's plan writes land; other writers are refused (an admin grant answers 409).
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct TenantBillingPlanSource: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let stripe = TenantBillingPlanSource(rawValue: "stripe")
+    public static let appStore = TenantBillingPlanSource(rawValue: "app_store")
+    public static let `operator` = TenantBillingPlanSource(rawValue: "operator")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [TenantBillingPlanSource] = [.stripe, .appStore, .`operator`]
 }
 
 /// `TenantBillingStatus` values.
@@ -48081,9 +53377,10 @@ public struct TenantCustomDomainVerificationMethod: RawRepresentable, Codable, H
 /// they are asking.
 public struct TenantInbox: Codable, Hashable, Sendable {
     public var generatedAt: String
-    /// Counted over the whole scan, NOT over `items` — so `limit` truncating the list does not move
-    /// them. The SCAN is capped too, though, and that cap they cannot see past: when `truncated` is
-    /// true these are a floor, not a total.
+    /// Counted over the page's scan window, NOT over `items` — so `limit` truncating the list does
+    /// not move them. The window is capped at 500 runs, though, and that cap they cannot see past:
+    /// when `truncated` is true these are a floor, not a total. On a continuation page (`?cursor=`)
+    /// they cover that page's span only, and `review`/`proposal` are 0.
     public var counts: TenantInboxCounts
     public var items: [InboxItem]
     /// Mission objectives held at `awaiting_review`, oldest first — answer each with `POST
@@ -48095,14 +53392,20 @@ public struct TenantInbox: Codable, Hashable, Sendable {
     /// Company changes waiting for a person, newest first — open with `GET
     /// /tenants/me/proposals/{proposal_id}`, decide with `…/apply` or `…/reject`. Since 2026-10-12.
     public var proposals: [TenantInboxProposal]?
-    /// Run records inspected; the scan is capped.
+    /// Run records inspected by this page — at most 500 for a first page, at most 2 000 for a
+    /// continuation page that read past empty windows.
     public var scanned: Int
-    /// The scan hit its cap, so `counts` is a floor rather than a total. `scanned` alone cannot
-    /// tell you this — the number only means something to a caller who already knows what the cap
-    /// is.
+    /// Older runs exist past the ones this page read, so `counts` is a floor rather than a total.
+    /// `scanned` alone cannot tell you this — the number only means something to a caller who
+    /// already knows what the cap is. Follow `cursor` to read them.
     public var truncated: Bool?
+    /// More waiting runs may follow: the rest of this window, or older windows. Since 2026-10-19.
+    public var hasMore: Bool?
+    /// Present exactly when `has_more` is true: pass it as `?cursor=` for the next page. Opaque.
+    /// Since 2026-10-19.
+    public var cursor: String?
 
-    public init(generatedAt: String, counts: TenantInboxCounts, items: [InboxItem], reviews: [TenantInboxReview]? = nil, proposals: [TenantInboxProposal]? = nil, scanned: Int, truncated: Bool? = nil) {
+    public init(generatedAt: String, counts: TenantInboxCounts, items: [InboxItem], reviews: [TenantInboxReview]? = nil, proposals: [TenantInboxProposal]? = nil, scanned: Int, truncated: Bool? = nil, hasMore: Bool? = nil, cursor: String? = nil) {
         self.generatedAt = generatedAt
         self.counts = counts
         self.items = items
@@ -48110,6 +53413,8 @@ public struct TenantInbox: Codable, Hashable, Sendable {
         self.proposals = proposals
         self.scanned = scanned
         self.truncated = truncated
+        self.hasMore = hasMore
+        self.cursor = cursor
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -48120,12 +53425,15 @@ public struct TenantInbox: Codable, Hashable, Sendable {
         case proposals = "proposals"
         case scanned = "scanned"
         case truncated = "truncated"
+        case hasMore = "has_more"
+        case cursor = "cursor"
     }
 }
 
-/// Counted over the whole scan, NOT over `items` — so `limit` truncating the list does not move
-/// them. The SCAN is capped too, though, and that cap they cannot see past: when `truncated` is
-/// true these are a floor, not a total.
+/// Counted over the page's scan window, NOT over `items` — so `limit` truncating the list does
+/// not move them. The window is capped at 500 runs, though, and that cap they cannot see past:
+/// when `truncated` is true these are a floor, not a total. On a continuation page (`?cursor=`)
+/// they cover that page's span only, and `review`/`proposal` are 0.
 public struct TenantInboxCounts: Codable, Hashable, Sendable {
     public var total: Int
     public var approval: Int
@@ -49109,6 +54417,18 @@ public struct TenantTrial: Codable, Hashable, Sendable {
 /// `TenantUser` model.
 public struct TenantUser: Codable, Hashable, Sendable {
     public var avatarURL: String?
+    /// Canonical BCP-47 tag; absent when the person has not set one.
+    public var interfaceLanguage: String?
+    /// Absent when the person has not chosen one. Normally a `ChiefVoice`; read it through `GET
+    /// /me`, which reports any other stored shape as null.
+    public var chiefVoice: JSONValue?
+    /// Present on `GET /users` items only. Derived, never written: `last_seen_at` is the newest
+    /// `last_used_at` over the member's non-revoked login-session rows in THIS tenant — stamped by
+    /// every authenticated request already — or their `last_login_at` when it is newer or no
+    /// session row exists; `online` is true when that moment is within the last 5 minutes. A member
+    /// working here through `X-Active-Tenant` from a session minted in another tenant reads as last
+    /// seen at their last login; operator API keys never make a person look online.
+    public var presence: TenantUserPresence?
     public var lastLoginAt: String?
     public var createdAt: String?
     public var email: String?
@@ -49119,8 +54439,11 @@ public struct TenantUser: Codable, Hashable, Sendable {
     public var tenantId: String?
     public var updatedAt: String?
 
-    public init(avatarURL: String? = nil, lastLoginAt: String? = nil, createdAt: String? = nil, email: String? = nil, id: String? = nil, name: String? = nil, role: String? = nil, status: String? = nil, tenantId: String? = nil, updatedAt: String? = nil) {
+    public init(avatarURL: String? = nil, interfaceLanguage: String? = nil, chiefVoice: JSONValue? = nil, presence: TenantUserPresence? = nil, lastLoginAt: String? = nil, createdAt: String? = nil, email: String? = nil, id: String? = nil, name: String? = nil, role: String? = nil, status: String? = nil, tenantId: String? = nil, updatedAt: String? = nil) {
         self.avatarURL = avatarURL
+        self.interfaceLanguage = interfaceLanguage
+        self.chiefVoice = chiefVoice
+        self.presence = presence
         self.lastLoginAt = lastLoginAt
         self.createdAt = createdAt
         self.email = email
@@ -49134,6 +54457,9 @@ public struct TenantUser: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case avatarURL = "avatar_url"
+        case interfaceLanguage = "interface_language"
+        case chiefVoice = "chief_voice"
+        case presence = "presence"
         case lastLoginAt = "last_login_at"
         case createdAt = "created_at"
         case email = "email"
@@ -49143,6 +54469,27 @@ public struct TenantUser: Codable, Hashable, Sendable {
         case status = "status"
         case tenantId = "tenant_id"
         case updatedAt = "updated_at"
+    }
+}
+
+/// Present on `GET /users` items only. Derived, never written: `last_seen_at` is the newest
+/// `last_used_at` over the member's non-revoked login-session rows in THIS tenant — stamped by
+/// every authenticated request already — or their `last_login_at` when it is newer or no
+/// session row exists; `online` is true when that moment is within the last 5 minutes. A member
+/// working here through `X-Active-Tenant` from a session minted in another tenant reads as last
+/// seen at their last login; operator API keys never make a person look online.
+public struct TenantUserPresence: Codable, Hashable, Sendable {
+    public var online: Bool
+    public var lastSeenAt: String?
+
+    public init(online: Bool, lastSeenAt: String? = nil) {
+        self.online = online
+        self.lastSeenAt = lastSeenAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case online = "online"
+        case lastSeenAt = "last_seen_at"
     }
 }
 
@@ -49348,15 +54695,21 @@ public struct TestLLMProviderKeyResponse: Codable, Hashable, Sendable {
 public struct TestNotificationTargetResponse: Codable, Hashable, Sendable {
     public var ok: Bool
     public var message: String
+    public var notificationId: String
+    public var targetId: String
 
-    public init(ok: Bool, message: String) {
+    public init(ok: Bool, message: String, notificationId: String, targetId: String) {
         self.ok = ok
         self.message = message
+        self.notificationId = notificationId
+        self.targetId = targetId
     }
 
     private enum CodingKeys: String, CodingKey {
         case ok = "ok"
         case message = "message"
+        case notificationId = "notification_id"
+        case targetId = "target_id"
     }
 }
 
@@ -49378,6 +54731,53 @@ public struct TestWebhookResponse: Codable, Hashable, Sendable {
         case webhookId = "webhook_id"
         case eventType = "event_type"
     }
+}
+
+/// A character range in a text result. Offsets are half-open: `start` is the first character,
+/// `end` is one past the last, so `end` must be greater than `start` (`422` otherwise). For a
+/// paragraph, send the paragraph's range. `quote` is the text the person saw — it is what the
+/// agent is shown on a redo.
+public struct TextAnchor: Codable, Hashable, Sendable {
+    public var kind: TextAnchorKind
+    public var quote: String
+    public var start: Int
+    public var end: Int
+
+    public init(kind: TextAnchorKind, quote: String, start: Int, end: Int) {
+        self.kind = kind
+        self.quote = quote
+        self.start = start
+        self.end = end
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case quote = "quote"
+        case start = "start"
+        case end = "end"
+    }
+}
+
+/// `TextAnchorKind` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct TextAnchorKind: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let text = TextAnchorKind(rawValue: "text")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [TextAnchorKind] = [.text]
 }
 
 /// `Todo` model.
@@ -49982,15 +55382,15 @@ public struct UpdateAdminAgentMemoryConfigResponseAgentMemory: Codable, Hashable
     public var extractionMaxTokens: Int
     /// The model memory extraction calls after a run. On PUT, `null` clears the stored override so
     /// the platform default applies again; GET then omits the field. Added 2026-09-23.
-    public var extractionModel: String
+    public var extractionModel: String?
     public var evictionThreshold: Int
     public var embeddingDimensions: Int
-    public var embeddingProvider: String
-    public var embeddingModel: String
+    public var embeddingProvider: String?
+    public var embeddingModel: String?
     /// On PUT, `null` clears the stored override; GET then omits the field. Added 2026-09-23.
-    public var compressionModel: String
+    public var compressionModel: String?
 
-    public init(enabled: Bool, useSharedStore: Bool, defaultMaxEntries: Int, defaultRetrievalLimit: Int, defaultRetrievalStrategy: String, decayEnabled: Bool, decayHalfLifeDays: Int, decayJobIntervalMs: Int, extractionMaxTokens: Int, extractionModel: String, evictionThreshold: Int, embeddingDimensions: Int, embeddingProvider: String, embeddingModel: String, compressionModel: String) {
+    public init(enabled: Bool, useSharedStore: Bool, defaultMaxEntries: Int, defaultRetrievalLimit: Int, defaultRetrievalStrategy: String, decayEnabled: Bool, decayHalfLifeDays: Int, decayJobIntervalMs: Int, extractionMaxTokens: Int, extractionModel: String? = nil, evictionThreshold: Int, embeddingDimensions: Int, embeddingProvider: String? = nil, embeddingModel: String? = nil, compressionModel: String? = nil) {
         self.enabled = enabled
         self.useSharedStore = useSharedStore
         self.defaultMaxEntries = defaultMaxEntries
@@ -52620,6 +58020,9 @@ public struct UpdateMCPServerRequest: Codable, Hashable, Sendable {
     public var args: [String]?
     /// Re-encrypted on write. `{}` clears it.
     public var env: JSONObject?
+    /// Optional replacement authentication (none or api_key). Omit to preserve the stored grant,
+    /// including broker-owned OAuth. Client-supplied OAuth is refused.
+    public var auth: MCPServerAuth?
     public var enabled: Bool?
     public var capabilities: JSONObject?
     public var status: MCPServerStatus?
@@ -52632,12 +58035,13 @@ public struct UpdateMCPServerRequest: Codable, Hashable, Sendable {
     public var apiKeyRef: String?
     public var egressAllowlist: [String]?
 
-    public init(name: String? = nil, url: String? = nil, command: String? = nil, args: [String]? = nil, env: JSONObject? = nil, enabled: Bool? = nil, capabilities: JSONObject? = nil, status: MCPServerStatus? = nil, apiKeyRef: String? = nil, egressAllowlist: [String]? = nil) {
+    public init(name: String? = nil, url: String? = nil, command: String? = nil, args: [String]? = nil, env: JSONObject? = nil, auth: MCPServerAuth? = nil, enabled: Bool? = nil, capabilities: JSONObject? = nil, status: MCPServerStatus? = nil, apiKeyRef: String? = nil, egressAllowlist: [String]? = nil) {
         self.name = name
         self.url = url
         self.command = command
         self.args = args
         self.env = env
+        self.auth = auth
         self.enabled = enabled
         self.capabilities = capabilities
         self.status = status
@@ -52651,6 +58055,7 @@ public struct UpdateMCPServerRequest: Codable, Hashable, Sendable {
         case command = "command"
         case args = "args"
         case env = "env"
+        case auth = "auth"
         case enabled = "enabled"
         case capabilities = "capabilities"
         case status = "status"
@@ -52917,6 +58322,7 @@ public struct UpdateRuntimeConfigRequest: Codable, Hashable, Sendable {
     public var maxCostUsdCeiling: Double?
     public var costPerImageUsd: Double?
     public var costPerVideoSecondUsd: Double?
+    public var memoryRetrieveTimeoutMs: Int?
     public var visionMaxTokens: Int?
     public var mediaEndpoint: String?
     public var defaultTeamBudgetUsd: Double?
@@ -52934,7 +58340,7 @@ public struct UpdateRuntimeConfigRequest: Codable, Hashable, Sendable {
     public var spawnAgentRateLimitWindowMs: Int?
     public var modelToolCaps: JSONObject?
 
-    public init(maxSteps: Int? = nil, maxTokensPerRun: Int? = nil, maxToolCalls: Int? = nil, maxContextTokens: Int? = nil, historyTokenBudgetRatio: Double? = nil, perRunTokenCeilingRatio: Double? = nil, conversationalFastPath: Bool? = nil, toolGating: Bool? = nil, specSkillTokenBudget: Int? = nil, coreMemoryTokenBudget: Int? = nil, readFileMaxBytes: Int? = nil, fetchMaxRedirects: Int? = nil, fetchResponseMaxChars: Int? = nil, toolRetryMaxAttempts: Int? = nil, toolRetryBaseDelayMs: Int? = nil, planHighEffortMaxTokens: Int? = nil, planLowEffortMaxTokens: Int? = nil, planThinkingBudgetRatio: Double? = nil, maxDurationMs: Int? = nil, maxDurationCeilingMs: Int? = nil, toolTimeoutMs: Int? = nil, fetchTimeoutSec: Int? = nil, webSearchTimeoutSec: Int? = nil, runCommandTimeoutMs: Int? = nil, imageGenTimeoutMs: Int? = nil, videoGenTimeoutMs: Int? = nil, continuationMaxAgeMs: Int? = nil, checkpointTtlMs: Int? = nil, resumeTimeoutMs: Int? = nil, maxResumeAttempts: Int? = nil, temperatureWithTools: Double? = nil, temperatureWithoutTools: Double? = nil, toolResultMaxChars: Int? = nil, toolArgsMaxChars: Int? = nil, commandMaxOutputBytes: Int? = nil, compactionReserveTokens: Int? = nil, loopDetectionThreshold: Int? = nil, auxiliaryModel: String? = nil, defaultVideoModel: String? = nil, visionModel: String? = nil, visionTimeoutMs: Int? = nil, maxCostUsdCeiling: Double? = nil, costPerImageUsd: Double? = nil, costPerVideoSecondUsd: Double? = nil, visionMaxTokens: Int? = nil, mediaEndpoint: String? = nil, defaultTeamBudgetUsd: Double? = nil, votingTimeoutMs: Int? = nil, checkpointMaxBytes: Int? = nil, emergencyCacheMaxEntries: Int? = nil, runStartTimesMax: Int? = nil, a2aFetchTimeoutMs: Int? = nil, sensorFetchTimeoutMs: Int? = nil, sseIdleTimeoutMs: Int? = nil, sseMaxConnectionsPerTenant: Int? = nil, bridgeShellGcAfterMs: Int? = nil, maxAmendmentsPerAgent: Int? = nil, spawnAgentRateLimitMax: Int? = nil, spawnAgentRateLimitWindowMs: Int? = nil, modelToolCaps: JSONObject? = nil) {
+    public init(maxSteps: Int? = nil, maxTokensPerRun: Int? = nil, maxToolCalls: Int? = nil, maxContextTokens: Int? = nil, historyTokenBudgetRatio: Double? = nil, perRunTokenCeilingRatio: Double? = nil, conversationalFastPath: Bool? = nil, toolGating: Bool? = nil, specSkillTokenBudget: Int? = nil, coreMemoryTokenBudget: Int? = nil, readFileMaxBytes: Int? = nil, fetchMaxRedirects: Int? = nil, fetchResponseMaxChars: Int? = nil, toolRetryMaxAttempts: Int? = nil, toolRetryBaseDelayMs: Int? = nil, planHighEffortMaxTokens: Int? = nil, planLowEffortMaxTokens: Int? = nil, planThinkingBudgetRatio: Double? = nil, maxDurationMs: Int? = nil, maxDurationCeilingMs: Int? = nil, toolTimeoutMs: Int? = nil, fetchTimeoutSec: Int? = nil, webSearchTimeoutSec: Int? = nil, runCommandTimeoutMs: Int? = nil, imageGenTimeoutMs: Int? = nil, videoGenTimeoutMs: Int? = nil, continuationMaxAgeMs: Int? = nil, checkpointTtlMs: Int? = nil, resumeTimeoutMs: Int? = nil, maxResumeAttempts: Int? = nil, temperatureWithTools: Double? = nil, temperatureWithoutTools: Double? = nil, toolResultMaxChars: Int? = nil, toolArgsMaxChars: Int? = nil, commandMaxOutputBytes: Int? = nil, compactionReserveTokens: Int? = nil, loopDetectionThreshold: Int? = nil, auxiliaryModel: String? = nil, defaultVideoModel: String? = nil, visionModel: String? = nil, visionTimeoutMs: Int? = nil, maxCostUsdCeiling: Double? = nil, costPerImageUsd: Double? = nil, costPerVideoSecondUsd: Double? = nil, memoryRetrieveTimeoutMs: Int? = nil, visionMaxTokens: Int? = nil, mediaEndpoint: String? = nil, defaultTeamBudgetUsd: Double? = nil, votingTimeoutMs: Int? = nil, checkpointMaxBytes: Int? = nil, emergencyCacheMaxEntries: Int? = nil, runStartTimesMax: Int? = nil, a2aFetchTimeoutMs: Int? = nil, sensorFetchTimeoutMs: Int? = nil, sseIdleTimeoutMs: Int? = nil, sseMaxConnectionsPerTenant: Int? = nil, bridgeShellGcAfterMs: Int? = nil, maxAmendmentsPerAgent: Int? = nil, spawnAgentRateLimitMax: Int? = nil, spawnAgentRateLimitWindowMs: Int? = nil, modelToolCaps: JSONObject? = nil) {
         self.maxSteps = maxSteps
         self.maxTokensPerRun = maxTokensPerRun
         self.maxToolCalls = maxToolCalls
@@ -52979,6 +58385,7 @@ public struct UpdateRuntimeConfigRequest: Codable, Hashable, Sendable {
         self.maxCostUsdCeiling = maxCostUsdCeiling
         self.costPerImageUsd = costPerImageUsd
         self.costPerVideoSecondUsd = costPerVideoSecondUsd
+        self.memoryRetrieveTimeoutMs = memoryRetrieveTimeoutMs
         self.visionMaxTokens = visionMaxTokens
         self.mediaEndpoint = mediaEndpoint
         self.defaultTeamBudgetUsd = defaultTeamBudgetUsd
@@ -53042,6 +58449,7 @@ public struct UpdateRuntimeConfigRequest: Codable, Hashable, Sendable {
         case maxCostUsdCeiling = "max_cost_usd_ceiling"
         case costPerImageUsd = "cost_per_image_usd"
         case costPerVideoSecondUsd = "cost_per_video_second_usd"
+        case memoryRetrieveTimeoutMs = "memory_retrieve_timeout_ms"
         case visionMaxTokens = "vision_max_tokens"
         case mediaEndpoint = "media_endpoint"
         case defaultTeamBudgetUsd = "default_team_budget_usd"
@@ -53180,15 +58588,20 @@ public struct UpdateSessionRequest: Codable, Hashable, Sendable {
     /// true pins the session for every client (`GET /sessions?pinned=true`); pinning again keeps
     /// the first `pinned_at`. false unpins.
     public var pinned: Bool?
+    /// The chat's name. Trimmed, then 1–80 characters (`422` otherwise); `null` clears it. Either
+    /// way `title_source` becomes `user`, and a generated title never replaces it. Stored on the
+    /// session, never in `metadata`; `updated_at` is left alone.
+    public var title: String?
     /// Per-conversation model override. Send null to clear (revert to agent default), or {
     /// provider, model_ref, endpoint_url?, capabilities? } to set. The runtime governance allowlist
     /// is still enforced at run time.
     public var modelOverride: UpdateSessionRequestModelOverride?
 
-    public init(metadata: JSONObject? = nil, archived: Bool? = nil, pinned: Bool? = nil, modelOverride: UpdateSessionRequestModelOverride? = nil) {
+    public init(metadata: JSONObject? = nil, archived: Bool? = nil, pinned: Bool? = nil, title: String? = nil, modelOverride: UpdateSessionRequestModelOverride? = nil) {
         self.metadata = metadata
         self.archived = archived
         self.pinned = pinned
+        self.title = title
         self.modelOverride = modelOverride
     }
 
@@ -53196,6 +58609,7 @@ public struct UpdateSessionRequest: Codable, Hashable, Sendable {
         case metadata = "metadata"
         case archived = "archived"
         case pinned = "pinned"
+        case title = "title"
         case modelOverride = "model_override"
     }
 }
@@ -53541,9 +58955,15 @@ public struct UploadFileResponse: Codable, Hashable, Sendable {
     public var sizeBytes: Int
     public var sha256: String
     public var createdAt: String
+    /// The agent whose run wrote this file (since 2026-10-19). Absent for a person's or an API
+    /// caller's upload and for every older record, which is not attributed after the fact.
+    public var agentId: String?
+    /// The run that wrote it; present only with `agent_id`, and only when the write happened inside
+    /// a run.
+    public var runId: String?
     public var url: String
 
-    public init(fileId: String, tenantId: String, filename: String, mimeType: String, sizeBytes: Int, sha256: String, createdAt: String, url: String) {
+    public init(fileId: String, tenantId: String, filename: String, mimeType: String, sizeBytes: Int, sha256: String, createdAt: String, agentId: String? = nil, runId: String? = nil, url: String) {
         self.fileId = fileId
         self.tenantId = tenantId
         self.filename = filename
@@ -53551,6 +58971,8 @@ public struct UploadFileResponse: Codable, Hashable, Sendable {
         self.sizeBytes = sizeBytes
         self.sha256 = sha256
         self.createdAt = createdAt
+        self.agentId = agentId
+        self.runId = runId
         self.url = url
     }
 
@@ -53562,6 +58984,8 @@ public struct UploadFileResponse: Codable, Hashable, Sendable {
         case sizeBytes = "size_bytes"
         case sha256 = "sha256"
         case createdAt = "created_at"
+        case agentId = "agent_id"
+        case runId = "run_id"
         case url = "url"
     }
 }
@@ -53649,6 +59073,11 @@ public struct UpsertCustomPlanResponse: Codable, Hashable, Sendable {
 
 /// `UpsertNotificationTargetRequest` model.
 public struct UpsertNotificationTargetRequest: Codable, Hashable, Sendable {
+    /// Bind an existing device token/endpoint without changing its label, enabled state, creation
+    /// or delivery history. Missing matching registrations return 404; this never replaces a
+    /// removed destination. Read device_ownership_version before migration, since older servers
+    /// ignore this flag.
+    public var registrationOnly: Bool?
     /// Rewrites this target when it exists.
     public var id: String?
     /// Defaults to something channel-specific when omitted.
@@ -53657,7 +59086,8 @@ public struct UpsertNotificationTargetRequest: Codable, Hashable, Sendable {
     public var enabled: Bool?
     public var config: JSONValue
 
-    public init(id: String? = nil, label: String? = nil, enabled: Bool? = nil, config: JSONValue) {
+    public init(registrationOnly: Bool? = nil, id: String? = nil, label: String? = nil, enabled: Bool? = nil, config: JSONValue) {
+        self.registrationOnly = registrationOnly
         self.id = id
         self.label = label
         self.enabled = enabled
@@ -53665,6 +59095,7 @@ public struct UpsertNotificationTargetRequest: Codable, Hashable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case registrationOnly = "registration_only"
         case id = "id"
         case label = "label"
         case enabled = "enabled"
@@ -53771,6 +59202,34 @@ public struct UpsertNotificationTargetRequestConfigVariant4keys: Codable, Hashab
     private enum CodingKeys: String, CodingKey {
         case p256dh = "p256dh"
         case auth = "auth"
+    }
+}
+
+/// An iOS Live Activity push token — see the operation description.
+public struct UpsertNotificationTargetRequestConfigVariant5: Codable, Hashable, Sendable {
+    public var kind: NotificationTargetConfigVariant5kind
+    /// Hex APNs token for this one activity (16–512 hex characters).
+    public var token: String
+    /// The ActivityAttributes type name, e.g. `RunActivityAttributes`.
+    public var activityType: String
+    /// The run whose progress drives this activity.
+    public var runId: String?
+    public var deviceLabel: String?
+
+    public init(kind: NotificationTargetConfigVariant5kind, token: String, activityType: String, runId: String? = nil, deviceLabel: String? = nil) {
+        self.kind = kind
+        self.token = token
+        self.activityType = activityType
+        self.runId = runId
+        self.deviceLabel = deviceLabel
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind = "kind"
+        case token = "token"
+        case activityType = "activity_type"
+        case runId = "run_id"
+        case deviceLabel = "device_label"
     }
 }
 
@@ -55255,6 +60714,111 @@ public struct VideoTemplateTitle: Codable, Hashable, Sendable {
         case en = "en"
         case uk = "uk"
     }
+}
+
+/// `VoiceCatalog` model.
+public struct VoiceCatalog: Codable, Hashable, Sendable {
+    public var items: [VoiceCatalogItem]
+    /// `live`: fetched now; `cache`: from the 24-hour cache; `stale`: the refresh failed and this
+    /// is the last good catalog; `default`: nothing has been fetched yet, so only the configured
+    /// default voice is listed.
+    public var source: VoiceCatalogSource
+    public var fetchedAt: String?
+
+    public init(items: [VoiceCatalogItem], source: VoiceCatalogSource, fetchedAt: String? = nil) {
+        self.items = items
+        self.source = source
+        self.fetchedAt = fetchedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case items = "items"
+        case source = "source"
+        case fetchedAt = "fetched_at"
+    }
+}
+
+/// `VoiceCatalogItem` model.
+public struct VoiceCatalogItem: Codable, Hashable, Sendable {
+    /// The provider's voice id (its name when the provider lists none). `(model, id)` identifies
+    /// the entry; send `id` as `voice`.
+    public var id: String
+    public var model: String
+    /// Display name.
+    public var name: String
+    /// When the provider says.
+    public var language: String?
+    /// When the provider says.
+    public var gender: String?
+    public var qualityTier: VoiceCatalogItemQualityTier
+
+    public init(id: String, model: String, name: String, language: String? = nil, gender: String? = nil, qualityTier: VoiceCatalogItemQualityTier) {
+        self.id = id
+        self.model = model
+        self.name = name
+        self.language = language
+        self.gender = gender
+        self.qualityTier = qualityTier
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "id"
+        case model = "model"
+        case name = "name"
+        case language = "language"
+        case gender = "gender"
+        case qualityTier = "quality_tier"
+    }
+}
+
+/// `VoiceCatalogItemQualityTier` values.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct VoiceCatalogItemQualityTier: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let premium = VoiceCatalogItemQualityTier(rawValue: "premium")
+    public static let standard = VoiceCatalogItemQualityTier(rawValue: "standard")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [VoiceCatalogItemQualityTier] = [.premium, .standard]
+}
+
+/// `live`: fetched now; `cache`: from the 24-hour cache; `stale`: the refresh failed and this
+/// is the last good catalog; `default`: nothing has been fetched yet, so only the configured
+/// default voice is listed.
+///
+/// Values the API adds later decode into this type unchanged, so a new
+/// server-side case never breaks an existing client.
+public struct VoiceCatalogSource: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public init(from decoder: Decoder) throws {
+        self.rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    public static let live = VoiceCatalogSource(rawValue: "live")
+    public static let cache = VoiceCatalogSource(rawValue: "cache")
+    public static let stale = VoiceCatalogSource(rawValue: "stale")
+    public static let `default` = VoiceCatalogSource(rawValue: "default")
+
+    /// Every value the spec declared at generation time.
+    public static let knownValues: [VoiceCatalogSource] = [.live, .cache, .stale, .`default`]
 }
 
 /// `VoiceConfig` model.

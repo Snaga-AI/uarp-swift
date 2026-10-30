@@ -6,6 +6,130 @@ All six SDKs share one version, cut from one tag. Set it with
 The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/), and
 the project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.13.0 — 2026-10-30
+
+Build `3d07d69d`, canonical digest `fb3b20d469827b43`. Against 0.12.0: 653
+paths (+11), 871 operations (+14), 502 schemas (+49), 2317 named types (+188);
+nothing removed.
+
+### Added — closed event types for `event_schema=1`
+
+`GET /runs/{runId}/events` and `GET /sessions/{sessionId}/events` take
+`event_schema=1`; the server then sends every frame in exactly its v1 shape and
+drops any frame v1 does not know. The SDKs carry those shapes:
+
+- `RunEventV1`, a union of 24 closed members (`RunEventV1ToolCall`,
+  `RunEventV1RunCompleted`, …) discriminated by a literal `type`, each with its
+  own closed payload.
+- The streams' own frames: `RunStreamFrameV1Connected|Done|Error|Gap|GuardrailViolation`
+  and `SessionStreamFrameV1Connected|RunAdded|RunDone|SessionClosed|Error`. An
+  `error` frame carries a closed `code` (`RUN_NOT_FOUND`, `SESSION_NOT_FOUND`,
+  `STREAM_ERROR`, `STREAM_BUFFER_EXCEEDED`).
+- TypeScript only: `RunStreamFrameV1Map` and `SessionStreamFrameV1Map`, the type
+  each SSE `event:` name carries — the frame schemas are chosen by that name,
+  which the document states only in its `x-event-stream` extension. The
+  generator now refuses a document where a frame schema has no event name, or
+  an event name no schema.
+- `event_schema` on both stream methods.
+
+### Added — the rest of the document
+
+
+- **App Store billing**: `POST /billing/app-store/transactions` applies a
+  StoreKit 2 purchase to the tenant's plan; `POST /webhooks/app-store` receives
+  App Store Server Notifications V2. `TenantBilling` gains `plan_source` and the
+  `app_store_*` fields, `DeploymentFeatures` gains `app_store`, and a billing
+  plan names its `app_store_product_id`.
+- **Reviewing a run**: `GET`/`POST /runs/{runId}/review` approve a finished
+  result or send it back (`redo`) with comments anchored to text, an image
+  region or code lines (`RunReview`, `ReviewAnchor`). `Run` carries its latest
+  `review`; session annotations gain the same `anchor` and a `target`.
+- **Agents**: `GET /agents/overview` (every agent with what it needs from you),
+  `GET /agents/{agentId}/sessions` (paginated, optionally grouped by day), and
+  `GET`/`PUT /me/rail-agents` (the agents pinned to a person's rail).
+- **Sessions**: `PATCH /sessions/{sessionId}`; sessions gain `title` and
+  `title_source`.
+- `GET /voices`, the voice catalogue; a tenant user carries `chief_voice`,
+  `interface_language` and `presence`.
+- `POST /hire/permission`: a hired agent asking a person to allow one tool
+  call. `AgentHire` gains `online` and `last_seen_at`.
+- Admin: `retirePlatformAgents`, `backfillSessionTitles` and
+  `postQualificationUsageCorrection`.
+- A `live_activity` notification channel and its `apns_liveactivity` target
+  config; `push_from` in notification preferences; `cursor` and `has_more` on
+  the tenant inbox, which gets a paging helper; `agent_id` and `run_id` on
+  files; `cost_attribution` on run metrics; `failure_reason` on an AAR
+  objective; a `queued_walk_ceiling` mission result code.
+- **Device ownership on notification targets**: a personal device target is
+  bound to the signed-in membership and answers with `owner_user_id` and
+  `ownership_version: 1`; `GET /notifications/targets` advertises
+  `device_ownership_version`, and `POST` takes `registration_only` to bind an
+  existing token without touching anything else. `DELETE /me` reports what it
+  removed in `account_cleanup`. `SERVICE_UNAVAILABLE` joins the error codes.
+
+### Changed — may need a code change
+
+- **Companies**: `strategic_goals` is a list of objects (`title`, `kpis`,
+  `deadline`, …) rather than strings, `config` is typed (`review_interval_ms`,
+  `escalation_on`) rather than free-form, and on update `budget` is an object
+  (`total_usd`, `daily_limit_usd`, `alert_threshold_pct`) rather than a number.
+  Update also takes `status`, create takes `strategist_model`, and `name`,
+  `mission` and `description` are now length-bounded.
+- `DELETE /notifications/targets/{targetId}` answers 404 for an id that is
+  not there, where it used to answer 200 regardless — so the SDK call now
+  raises. `POST /notifications/targets` can answer 404 (`registration_only`
+  with no matching device), 409 `VERSION_CONFLICT`, and 422 `USER_REQUIRED`
+  for a device registered without a user-bound session.
+- **A 409 is no longer retried, in every SDK.** A conflict
+  (`CLIENT_REQUEST_CONFLICT`, `VERSION_CONFLICT`) is the server's answer about
+  the resource's state, and the same request meets the same state; a create
+  that conflicted was sent three more times. `is_retryable` / `isRetryable` is
+  false for it.
+- `healthCheckV1alias` is now `healthCheckV1Alias` (`health_check_v1_alias`,
+  `HealthCheckV1AliasResponse`, …). The word after a version tag had its
+  capital lost: every `RunEventV1…` name came out as `RunEventV1run…`.
+  The fix reaches this one existing name; names with a digit after a lowercase
+  word (`ContentVariant2item`) keep their spelling.
+- Now optional: `extraction_model`, `embedding_provider`, `embedding_model` and
+  `compression_model` in the agent-memory admin config.
+- Now nullable: the governance ledger's `head`, the platform LLM defaults, the
+  voice config's `stt`/`tts` model, provider and voice,
+  `google_one_tap_client_id` and a public plan's overage price. In the
+  strictly-typed SDKs these members change type (`String` becomes
+  `Option<String>` in Rust, `String?` in Swift and Kotlin).
+
+### Fixed — Python
+
+Found in review by a consuming session; each fix has a test that fails without it.
+
+- `with_options()` no longer takes `idempotency_key`. The key it took was put on
+  every write made through the copy, so the server answered each create after
+  the first as a replay of it. Pass the key per call in `RequestOptions`.
+- An event stream that is refused reconnects only on `408`, `429` and `5xx`. A
+  `404` for a wrong run id used to reconnect five times and surface after
+  twenty seconds or more.
+- A frame with no `event:` line is named by its top-level `type`, decoded
+  rather than searched for: `{"payload":{"type":"inner"},"type":"run.completed"}`
+  was named `inner`, and an OpenAI-compatible chunk was named `function` after
+  its tool call. `event_id` is unescaped the same way.
+- `sse_token_in_query=True` puts a 60-second token minted from
+  `POST /api/v1/auth/sse-tokens` in the URL, one per connection, never the API
+  key — a URL lands in proxy and access logs that mask no query string.
+- The sdist carries the shared SSE fixture, so its own tests pass (two failed
+  with `FileNotFoundError`).
+- The README says that three empty pages in a row end `list_all`, which a
+  rarely-matching filter can reach before its last match, and how to page by
+  hand instead.
+
+### Fixed — install lines in the READMEs follow the version
+
+At 0.12.0 the Rust README still asked for `"0.3"`, Kotlin for `0.3.0`, Ada for
+`^0.3.0` and Swift for `0.7.0`, and `PUBLISHING.md`, `RELEASE-CHECKLIST.md` and
+the docs kit quoted 0.3.0, while every registry served 0.12.0. None of those
+lines were ever touched by `scripts/set-version.sh`; now each one is, and a
+line its pattern no longer matches stops the script. The Python package also
+links its documentation (dev.snaga.ai) from PyPI.
+
 ## 0.12.0 — 2026-10-18
 
 Build `c65c901c`, digest `092f377d6340cec2`. The five existing SDKs change only

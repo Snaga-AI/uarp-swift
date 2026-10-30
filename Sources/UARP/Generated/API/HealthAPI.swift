@@ -13,11 +13,13 @@ public struct HealthAPI: Sendable {
     /// Probes KV with a single lightweight read and reports `status` (`healthy`, `degraded` or
     /// `unhealthy`), `kv_connected`, `uptime_seconds`, the API contract `version` (the
     /// `X-API-Version` value, not a release number), the `build_sha` and `build_time` baked in at
-    /// image build (`unknown` when the build arg was absent), and `runs_queued` taken from the
-    /// scheduler's own queue gauge. `status` is `degraded` when the scheduler is at 90% or more of
-    /// `maxConcurrentRuns`, and `unhealthy` (answered **503**) when the KV probe throws or the
-    /// process is shutting down. `pending_resumes` is a constant zero: nothing on this platform
-    /// ever waits to be resumed. No authentication — the path bypasses the auth middleware.
+    /// image build (`unknown` when the build arg was absent), `runs_queued` taken from the
+    /// scheduler's own queue gauge, and `runs_active` — the scheduler's live in-flight count, the
+    /// one number here that moves while the platform is working. `status` is `degraded` when the
+    /// scheduler is at 90% or more of `maxConcurrentRuns`, and `unhealthy` (answered **503**) when
+    /// the KV probe throws or the process is shutting down. `pending_resumes` is a constant zero:
+    /// nothing on this platform ever waits to be resumed. No authentication — the path bypasses the
+    /// auth middleware.
     ///
     /// `GET /health`
     public func get(options: RequestOptions = .init()) async throws -> GetHealthResponse {
@@ -70,7 +72,7 @@ public struct HealthAPI: Sendable {
     /// `/api/v1`; new callers should use `/health`.
     ///
     /// `GET /api/v1/health`
-    public func healthCheckV1alias(options: RequestOptions = .init()) async throws -> HealthCheckV1aliasResponse {
+    public func healthCheckV1Alias(options: RequestOptions = .init()) async throws -> HealthCheckV1AliasResponse {
         return try await client.send(RequestSpec(
             method: "GET",
             path: "/api/v1/health",
